@@ -26,6 +26,11 @@ pub fn default_config_dir() -> Option<PathBuf> {
     None
 }
 
+#[cfg(target_os = "ios")]
+pub fn default_config_dir() -> Option<PathBuf> {
+    None
+}
+
 #[cfg(target_os = "macos")]
 pub fn default_config_dir() -> Option<PathBuf> {
     // FIXME: use `config_dir()` ($HOME/Library/Preferences)

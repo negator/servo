@@ -118,6 +118,4 @@ webgpu = { path = "../webgpu" }
 webrender_api = { git = "https://github.com/servo/webrender" }
 webxr-api = { git = "https://github.com/servo/webxr", features = ["ipc"] }
 xml5ever = "0.16"
-
-[target.'cfg(not(target_os = "ios"))'.dependencies]
 mozangle = "0.2"

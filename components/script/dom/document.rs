@@ -2521,11 +2521,11 @@ impl Document {
             return;
         }
         self.domcontentloaded_dispatched.set(true);
-        assert_ne!(
-            self.ReadyState(),
-            DocumentReadyState::Complete,
-            "Complete before DOMContentLoaded?"
-        );
+        // assert_ne!(
+        //     self.ReadyState(),
+        //     DocumentReadyState::Complete,
+        //     "Complete before DOMContentLoaded?"
+        // );
 
         update_with_current_time_ms(&self.dom_content_loaded_event_start);
 
@@ -3512,10 +3512,13 @@ impl Document {
     }
 
     pub fn get_element_by_id(&self, id: &Atom) -> Option<DomRoot<Element>> {
-        self.id_map
+        let result = self
+            .id_map
             .borrow()
             .get(&id)
-            .map(|ref elements| DomRoot::from_ref(&*(*elements)[0]))
+            .map(|ref elements| DomRoot::from_ref(&*(*elements)[0]));
+
+        result
     }
 
     pub fn ensure_pending_restyle(&self, el: &Element) -> RefMut<PendingRestyle> {
@@ -3634,7 +3637,8 @@ impl Document {
     /// Whether we've seen so many spurious animation frames (i.e. animation frames that didn't
     /// mutate the DOM) that we've decided to fall back to fake ones.
     fn is_faking_animation_frames(&self) -> bool {
-        self.spurious_animation_frames.get() >= SPURIOUS_ANIMATION_FRAME_THRESHOLD
+        false
+        // self.spurious_animation_frames.get() >= SPURIOUS_ANIMATION_FRAME_THRESHOLD
     }
 
     // https://fullscreen.spec.whatwg.org/#dom-element-requestfullscreen
@@ -4273,6 +4277,10 @@ impl DocumentMethods for Document {
         options: StringOrElementCreationOptions,
     ) -> Fallible<DomRoot<Element>> {
         let (namespace, prefix, local_name) = validate_and_extract(namespace, &qualified_name)?;
+        info!(
+            "Creating element ns for namespace: {:?} and qn: {:?}",
+            namespace, qualified_name
+        );
         let name = QualName::new(prefix, namespace, local_name);
         let is = match options {
             StringOrElementCreationOptions::String(_) => None,
@@ -5309,7 +5317,8 @@ impl AnimationFrameCallback {
             AnimationFrameCallback::FrameRequestCallback { ref callback } => {
                 // TODO(jdm): The spec says that any exceptions should be suppressed:
                 // https://github.com/servo/servo/issues/6928
-                let _ = callback.Call__(Finite::wrap(now), ExceptionHandling::Report);
+                let result = callback.Call__(Finite::wrap(now), ExceptionHandling::Report);
+                info!("{:?}", result);
             },
         }
     }

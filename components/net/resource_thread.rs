@@ -129,7 +129,7 @@ struct ResourceChannelManager {
 fn create_http_states(
     config_dir: Option<&Path>,
     certificate_path: Option<String>,
-) -> (Arc<HttpState>, Arc<HttpState>) {
+) -> Arc<HttpState> {
     let mut hsts_list = HstsList::from_servo_preload();
     let mut auth_cache = AuthCache::new();
     let http_cache = HttpCache::new();
@@ -168,30 +168,7 @@ fn create_http_states(
         connection_certs,
     };
 
-    let extra_certs = ExtraCerts::new();
-    let connection_certs = ConnectionCerts::new();
-
-    let private_http_state = HttpState {
-        hsts_list: RwLock::new(HstsList::from_servo_preload()),
-        cookie_jar: RwLock::new(CookieStorage::new(150)),
-        auth_cache: RwLock::new(AuthCache::new()),
-        history_states: RwLock::new(HashMap::new()),
-        http_cache: RwLock::new(HttpCache::new()),
-        http_cache_state: Mutex::new(HashMap::new()),
-        client: create_http_client(
-            create_tls_config(
-                &certs,
-                ALPN_H2_H1,
-                extra_certs.clone(),
-                connection_certs.clone(),
-            ),
-            HANDLE.lock().unwrap().as_ref().unwrap().executor(),
-        ),
-        extra_certs,
-        connection_certs,
-    };
-
-    (Arc::new(http_state), Arc::new(private_http_state))
+    Arc::new(http_state)
 }
 
 impl ResourceChannelManager {
@@ -202,7 +179,7 @@ impl ResourceChannelManager {
         private_receiver: IpcReceiver<CoreResourceMsg>,
         memory_reporter: IpcReceiver<ReportsChan>,
     ) {
-        let (public_http_state, private_http_state) = create_http_states(
+        let public_http_state = create_http_states(
             self.config_dir.as_ref().map(Deref::deref),
             self.certificate_path.clone(),
         );
@@ -222,19 +199,20 @@ impl ResourceChannelManager {
                 let (id, data) = receiver.unwrap();
                 // If message is memory report, get the size_of of public and private http caches
                 if id == reporter_id {
-                    if let Ok(msg) = data.to() {
-                        self.process_report(msg, &private_http_state, &public_http_state);
-                        continue;
-                    }
+                    // if let Ok(msg) = data.to() {
+                    //     self.process_report(msg, &private_http_state, &public_http_state);
+                    //     continue;
+                    // }
+                    // noop
                 } else {
-                    let group = if id == private_id {
-                        &private_http_state
-                    } else {
-                        assert_eq!(id, public_id);
-                        &public_http_state
-                    };
+                    // let group = if id == private_id {
+                    //     &private_http_state
+                    // } else {
+                    //     assert_eq!(id, public_id);
+                    //     &public_http_state
+                    // };
                     if let Ok(msg) = data.to() {
-                        if !self.process_msg(msg, group) {
+                        if !self.process_msg(msg, &public_http_state) {
                             return;
                         }
                     }
@@ -249,23 +227,7 @@ impl ResourceChannelManager {
         public_http_state: &Arc<HttpState>,
         private_http_state: &Arc<HttpState>,
     ) {
-        let mut ops = MallocSizeOfOps::new(servo_allocator::usable_size, None, None);
-        let public_cache = public_http_state.http_cache.read().unwrap();
-        let private_cache = private_http_state.http_cache.read().unwrap();
-
-        let public_report = Report {
-            path: path!["memory-cache", "public"],
-            kind: ReportKind::ExplicitJemallocHeapSize,
-            size: public_cache.size_of(&mut ops),
-        };
-
-        let private_report = Report {
-            path: path!["memory-cache", "private"],
-            kind: ReportKind::ExplicitJemallocHeapSize,
-            size: private_cache.size_of(&mut ops),
-        };
-
-        msg.send(vec![public_report, private_report]);
+        // noop
     }
 
     /// Returns false if the thread should exit.
@@ -597,7 +559,7 @@ impl CoreResourceManager {
         embedder_proxy: EmbedderProxy,
         certificate_path: Option<String>,
     ) -> CoreResourceManager {
-        let pool = CoreResourceThreadPool::new(16);
+        let pool = CoreResourceThreadPool::new(1);
         let pool_handle = Arc::new(pool);
         CoreResourceManager {
             user_agent: user_agent,

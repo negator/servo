@@ -64,18 +64,15 @@ pub trait BluetoothThreadFactory {
 impl BluetoothThreadFactory for IpcSender<BluetoothRequest> {
     fn new(embedder_proxy: EmbedderProxy) -> IpcSender<BluetoothRequest> {
         let (sender, receiver) = ipc::channel().unwrap();
-        let adapter = if pref!(dom.bluetooth.enabled) {
-            BluetoothAdapter::init()
-        } else {
-            BluetoothAdapter::init_mock()
+        if pref!(dom.bluetooth.enabled) {
+            let adapter = BluetoothAdapter::init().ok();
+            thread::Builder::new()
+                .name("Bluetooth".to_owned())
+                .spawn(move || {
+                    BluetoothManager::new(receiver, adapter, embedder_proxy).start();
+                })
+                .expect("Thread spawning failed");
         }
-        .ok();
-        thread::Builder::new()
-            .name("Bluetooth".to_owned())
-            .spawn(move || {
-                BluetoothManager::new(receiver, adapter, embedder_proxy).start();
-            })
-            .expect("Thread spawning failed");
         sender
     }
 }

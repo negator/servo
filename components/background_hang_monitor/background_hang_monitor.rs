@@ -100,7 +100,12 @@ impl BackgroundHangMonitorRegister for HangMonitorRegister {
             not(any(target_arch = "arm", target_arch = "aarch64"))
         ))]
         let sampler = crate::sampler_linux::LinuxSampler::new();
-        #[cfg(any(target_os = "android", target_arch = "arm", target_arch = "aarch64"))]
+        #[cfg(any(
+            target_os = "ios",
+            target_os = "android",
+            target_arch = "arm",
+            target_arch = "aarch64"
+        ))]
         let sampler = crate::sampler::DummySampler::new();
 
         // When a component is registered, and there's an exit request that

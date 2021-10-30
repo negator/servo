@@ -49,7 +49,7 @@ use layout::traversal::RecalcStyle;
 use layout::{BoxTree, FragmentTree};
 use layout_traits::LayoutThreadFactory;
 use libc::c_void;
-use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
+// use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
 use metrics::{PaintTimeMetrics, ProfilerMetadataFactory, ProgressiveWebMetric};
 use msg::constellation_msg::{
     BackgroundHangMonitor, BackgroundHangMonitorRegister, HangAnnotation,
@@ -771,25 +771,6 @@ impl LayoutThread {
         possibly_locked_rw_data: &mut RwData<'a, 'b>,
     ) {
         let mut reports = vec![];
-        // Servo uses vanilla jemalloc, which doesn't have a
-        // malloc_enclosing_size_of function.
-        let mut ops = MallocSizeOfOps::new(servo_allocator::usable_size, None, None);
-
-        // FIXME(njn): Just measuring the display tree for now.
-        let rw_data = possibly_locked_rw_data.lock();
-        let display_list = rw_data.display_list.as_ref();
-        let formatted_url = &format!("url({})", self.url);
-        reports.push(Report {
-            path: path![formatted_url, "layout-thread", "display-list"],
-            kind: ReportKind::ExplicitJemallocHeapSize,
-            size: display_list.map_or(0, |sc| sc.size_of(&mut ops)),
-        });
-
-        reports.push(Report {
-            path: path![formatted_url, "layout-thread", "stylist"],
-            kind: ReportKind::ExplicitJemallocHeapSize,
-            size: self.stylist.size_of(&mut ops),
-        });
 
         reports_chan.send(reports);
     }

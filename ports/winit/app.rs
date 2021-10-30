@@ -232,6 +232,7 @@ fn get_default_url() -> ServoUrl {
     // or a blank page in case the homepage is not set either.
     let cwd = env::current_dir().unwrap();
     let cmdline_url = opts::get().url.clone();
+    
     let pref_url = {
         let homepage_url = pref!(shell.homepage);
         parse_url_or_filename(&cwd, &homepage_url).ok()

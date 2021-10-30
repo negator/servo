@@ -73,7 +73,7 @@ pub struct HttpConnector {
 
 impl HttpConnector {
     fn new() -> HttpConnector {
-        let mut inner = HyperHttpConnector::new(4);
+        let mut inner = HyperHttpConnector::new(1);
         inner.enforce_http(false);
         inner.set_happy_eyeballs_timeout(None);
         HttpConnector { inner }
@@ -165,7 +165,8 @@ pub fn create_tls_config(
             SslOptions::NO_SSLV3 |
             SslOptions::NO_TLSV1 |
             SslOptions::NO_TLSV1_1 |
-            SslOptions::NO_COMPRESSION,
+            SslOptions::NO_COMPRESSION |
+            SslOptions::ALLOW_UNSAFE_LEGACY_RENEGOTIATION,
     );
 
     cfg.set_ex_data(*EXTRA_INDEX, extra_certs);

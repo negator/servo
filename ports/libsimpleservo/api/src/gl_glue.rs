@@ -91,6 +91,36 @@ pub mod gl {
     }
 }
 
+#[cfg(target_os = "ios")]
+pub mod gl {
+    use core_foundation::base::TCFType;
+    use core_foundation::bundle::{
+        CFBundleGetBundleWithIdentifier, CFBundleGetFunctionPointerForName,
+    };
+    use core_foundation::string::CFString;
+    use servo::gl::GlFns;
+    use std::os::raw::c_void;
+    use std::str;
+
+    pub fn init() -> Result<crate::gl_glue::ServoGl, &'static str> {
+        info!("Loading OpenGLES...");
+        let gl = unsafe {
+            GlFns::load_with(|addr| {
+                let symbol_name: CFString = str::FromStr::from_str(addr).unwrap();
+                let framework_name: CFString =
+                    str::FromStr::from_str("com.apple.opengles").unwrap();
+                let framework =
+                    CFBundleGetBundleWithIdentifier(framework_name.as_concrete_TypeRef());
+                let symbol =
+                    CFBundleGetFunctionPointerForName(framework, symbol_name.as_concrete_TypeRef());
+                symbol as *const c_void
+            })
+        };
+        info!("OpenGLES loaded");
+        Ok(gl)
+    }
+}
+
 #[cfg(any(
     target_os = "linux",
     target_os = "dragonfly",

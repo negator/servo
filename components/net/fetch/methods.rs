@@ -810,10 +810,14 @@ fn scheme_fetch(
 
         "ftp" => {
             debug!("ftp is not implemented");
-            Response::network_error(NetworkError::Internal("Unexpected scheme".into()))
+            let msg = format!("Unexpected scheme for url: {:?}", url);
+            Response::network_error(NetworkError::Internal(msg.into()))
         },
 
-        _ => Response::network_error(NetworkError::Internal("Unexpected scheme".into())),
+        _ => {
+            let msg = format!("Unexpected scheme for url: {:?}", url);
+            Response::network_error(NetworkError::Internal(msg.into()))
+        },
     }
 }
 

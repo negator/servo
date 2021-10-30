@@ -1614,7 +1614,7 @@ impl ScriptThread {
         // Process the gathered events.
         debug!("Processing events.");
         for msg in sequential {
-            debug!("Processing event {:?}.", msg);
+            trace!("Processing event {:?}.", msg);
 
             let category = self.categorize_msg(&msg);
             let pipeline_id = self.message_to_pipeline(&msg);
@@ -3227,7 +3227,7 @@ impl ScriptThread {
                 ))
                 .unwrap();
         }
-        debug!(
+        info!(
             "ScriptThread: loading {} on pipeline {:?}",
             incomplete.url, incomplete.pipeline_id
         );

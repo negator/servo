@@ -966,14 +966,17 @@ impl HTMLScriptElement {
                 .clone()
                 .unwrap(),
         );
-        path = path.join(&script.url[url::Position::BeforeHost..]);
-        debug!("Attempting to read script stored at: {:?}", path);
+        path = path.join(&script.url[url::Position::BeforeHost..url::Position::AfterPath]);
+        info!("Attempting to read script stored at: {:?}", path);
         match read_to_string(path.clone()) {
             Ok(local_script) => {
-                debug!("Found script stored at: {:?}", path);
+                info!("Found script stored at: {:?}", path);
                 script.code = SourceCode::Text(Rc::new(DOMString::from(local_script)));
             },
-            Err(why) => warn!("Could not restore script from file {:?}", why),
+            Err(why) => warn!(
+                "Could not restore script from file: [{:?}], reason: {:?}",
+                path, why
+            ),
         }
     }
 

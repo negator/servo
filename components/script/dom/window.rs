@@ -1084,6 +1084,7 @@ impl WindowMethods for Window {
 
     #[allow(unsafe_code)]
     fn Js_backtrace(&self) {
+        #[cfg(feature = "js_backtrace")]
         unsafe {
             capture_stack!(in(*self.get_cx()) let stack);
             let js_stack = stack.and_then(|s| s.as_string(None, StackFormat::SpiderMonkey));
@@ -2635,8 +2636,8 @@ unsafe_no_jsmanaged_fields!(CSSErrorReporter);
 
 impl ParseErrorReporter for CSSErrorReporter {
     fn report_error(&self, url: &ServoUrl, location: SourceLocation, error: ContextualParseError) {
-        if log_enabled!(log::Level::Info) {
-            info!(
+        if log_enabled!(log::Level::Debug) {
+            debug!(
                 "Url:\t{}\n{}:{} {}",
                 url.as_str(),
                 location.line,

@@ -73,7 +73,6 @@ use js::rust::IntoHandle;
 use js::rust::ParentRuntime;
 use js::rust::Runtime as RustRuntime;
 use js::rust::{JSEngine, JSEngineHandle};
-use malloc_size_of::MallocSizeOfOps;
 use msg::constellation_msg::PipelineId;
 use profile_traits::mem::{Report, ReportKind, ReportsChan};
 use servo_config::opts;
@@ -680,84 +679,9 @@ fn in_range<T: PartialOrd + Copy>(val: T, min: T, max: T) -> Option<T> {
     }
 }
 
-#[allow(unsafe_code)]
-unsafe extern "C" fn get_size(obj: *mut JSObject) -> usize {
-    match get_dom_class(obj) {
-        Ok(v) => {
-            let dom_object = private_from_object(obj) as *const c_void;
-
-            if dom_object.is_null() {
-                return 0;
-            }
-            let mut ops = MallocSizeOfOps::new(servo_allocator::usable_size, None, None);
-            (v.malloc_size_of)(&mut ops, dom_object)
-        },
-        Err(_e) => {
-            return 0;
-        },
-    }
-}
-
-#[allow(unsafe_code)]
 pub fn get_reports(cx: *mut RawJSContext, path_seg: String) -> Vec<Report> {
-    let mut reports = vec![];
-
-    unsafe {
-        let mut stats = ::std::mem::zeroed();
-        if CollectServoSizes(cx, &mut stats, Some(get_size)) {
-            let mut report = |mut path_suffix, kind, size| {
-                let mut path = path![path_seg, "js"];
-                path.append(&mut path_suffix);
-                reports.push(Report {
-                    path: path,
-                    kind: kind,
-                    size: size as usize,
-                })
-            };
-
-            // A note about possibly confusing terminology: the JS GC "heap" is allocated via
-            // mmap/VirtualAlloc, which means it's not on the malloc "heap", so we use
-            // `ExplicitNonHeapSize` as its kind.
-
-            report(
-                path!["gc-heap", "used"],
-                ReportKind::ExplicitNonHeapSize,
-                stats.gcHeapUsed,
-            );
-
-            report(
-                path!["gc-heap", "unused"],
-                ReportKind::ExplicitNonHeapSize,
-                stats.gcHeapUnused,
-            );
-
-            report(
-                path!["gc-heap", "admin"],
-                ReportKind::ExplicitNonHeapSize,
-                stats.gcHeapAdmin,
-            );
-
-            report(
-                path!["gc-heap", "decommitted"],
-                ReportKind::ExplicitNonHeapSize,
-                stats.gcHeapDecommitted,
-            );
-
-            // SpiderMonkey uses the system heap, not jemalloc.
-            report(
-                path!["malloc-heap"],
-                ReportKind::ExplicitSystemHeapSize,
-                stats.mallocHeap,
-            );
-
-            report(
-                path!["non-heap"],
-                ReportKind::ExplicitNonHeapSize,
-                stats.nonHeap,
-            );
-        }
-    }
-    reports
+    // noop: Due to removal of jemalloc_sys
+    vec![]
 }
 
 thread_local!(static GC_CYCLE_START: Cell<Option<Tm>> = Cell::new(None));

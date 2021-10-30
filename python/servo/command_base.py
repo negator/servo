@@ -378,7 +378,7 @@ class CommandBase(object):
             elif sys.platform == "darwin":
                 binary_name = "libsimpleservo.dylib"
             else:
-                binary_name = "libsimpleservo.so"
+                binary_name = "libsimpleservo.a"
 
         release_path = path.join(base_path, "release", binary_name)
         dev_path = path.join(base_path, "debug", binary_name)

@@ -11,7 +11,7 @@ pub use crate::platform::freetype::{font_list, font_template};
 #[cfg(target_os = "windows")]
 pub use crate::platform::windows::{font, font_context, font_list, font_template};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub use crate::platform::macos::{font, font_context, font_list, font_template};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -45,7 +45,7 @@ mod freetype {
     pub mod font_template;
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 mod macos {
     pub mod font;
     pub mod font_context;

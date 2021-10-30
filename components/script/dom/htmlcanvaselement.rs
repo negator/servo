@@ -364,18 +364,18 @@ impl HTMLCanvasElementMethods for HTMLCanvasElement {
         options: HandleValue,
     ) -> Option<RenderingContext> {
         match &*id {
-            "2d" => self
-                .get_or_init_2d_context()
-                .map(RenderingContext::CanvasRenderingContext2D),
-            "webgl" | "experimental-webgl" => self
-                .get_or_init_webgl_context(cx, options)
-                .map(RenderingContext::WebGLRenderingContext),
-            "webgl2" | "experimental-webgl2" => self
-                .get_or_init_webgl2_context(cx, options)
-                .map(RenderingContext::WebGL2RenderingContext),
-            "gpupresent" => self
-                .get_or_init_webgpu_context()
-                .map(RenderingContext::GPUCanvasContext),
+            // "2d" => self
+            //     .get_or_init_2d_context()
+            //     .map(RenderingContext::CanvasRenderingContext2D),
+            // "webgl" | "experimental-webgl" => self
+            //     .get_or_init_webgl_context(cx, options)
+            //     .map(RenderingContext::WebGLRenderingContext),
+            // "webgl2" | "experimental-webgl2" => self
+            //     .get_or_init_webgl2_context(cx, options)
+            //     .map(RenderingContext::WebGL2RenderingContext),
+            // "gpupresent" => self
+            //     .get_or_init_webgpu_context()
+            //     .map(RenderingContext::GPUCanvasContext),
             _ => None,
         }
     }
