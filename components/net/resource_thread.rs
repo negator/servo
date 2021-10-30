@@ -4,6 +4,8 @@
 
 //! A thread that takes a URL and streams back the binary data.
 
+#![allow(unsafe_code)]
+
 use crate::connector::{
     create_http_client, create_tls_config, ConnectionCerts, ExtraCerts, ALPN_H2_H1,
 };
@@ -14,15 +16,17 @@ use crate::fetch::methods::{fetch, CancellationListener, FetchContext};
 use crate::filemanager_thread::FileManager;
 use crate::hsts::HstsList;
 use crate::http_cache::HttpCache;
-use crate::http_loader::{http_redirect_fetch, HttpState, HANDLE};
+use crate::http_loader::{http_redirect_fetch, HttpState};
 use crate::storage_thread::StorageThreadFactory;
 use crate::websocket_loader::{self, HANDLE as WS_HANDLE};
 use crossbeam_channel::Sender;
 use devtools_traits::DevtoolsControlMsg;
 use embedder_traits::resources::{self, Resource};
 use embedder_traits::EmbedderProxy;
+use futures_util::StreamExt;
 use hyper_serde::Serde;
-use ipc_channel::ipc::{self, IpcReceiver, IpcReceiverSet, IpcSender};
+use ipc_channel::asynch::IpcStream;
+use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
 use net_traits::blob_url_store::parse_blob_url;
 use net_traits::filemanager_thread::FileTokenCheck;
@@ -45,33 +49,33 @@ use servo_url::{ImmutableOrigin, ServoUrl};
 use std::borrow::{Cow, ToOwned};
 use std::collections::HashMap;
 use std::fs::{self, File};
+use std::io::BufWriter;
 use std::io::prelude::*;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
+use tokio_compat::runtime::Runtime;
 
 /// Returns a tuple of (public, private) senders to the new threads.
 pub fn new_resource_threads(
+    runtime: &'static Runtime,
     user_agent: Cow<'static, str>,
     devtools_chan: Option<Sender<DevtoolsControlMsg>>,
-    time_profiler_chan: ProfilerChan,
-    mem_profiler_chan: MemProfilerChan,
     embedder_proxy: EmbedderProxy,
     config_dir: Option<PathBuf>,
     certificate_path: Option<String>,
 ) -> (ResourceThreads, ResourceThreads) {
     let (public_core, private_core) = new_core_resource_thread(
+        runtime,
         user_agent,
         devtools_chan,
-        time_profiler_chan,
-        mem_profiler_chan,
         embedder_proxy,
         config_dir.clone(),
         certificate_path,
     );
-    let storage: IpcSender<StorageThreadMsg> = StorageThreadFactory::new(config_dir);
+    let storage: IpcSender<StorageThreadMsg> = StorageThreadFactory::new(runtime, config_dir);
     (
         ResourceThreads::new(public_core, storage.clone()),
         ResourceThreads::new(private_core, storage),
@@ -80,43 +84,38 @@ pub fn new_resource_threads(
 
 /// Create a CoreResourceThread
 pub fn new_core_resource_thread(
+    runtime: &'static Runtime,
     user_agent: Cow<'static, str>,
     devtools_chan: Option<Sender<DevtoolsControlMsg>>,
-    time_profiler_chan: ProfilerChan,
-    mem_profiler_chan: MemProfilerChan,
     embedder_proxy: EmbedderProxy,
     config_dir: Option<PathBuf>,
     certificate_path: Option<String>,
 ) -> (CoreResourceThread, CoreResourceThread) {
     let (public_setup_chan, public_setup_port) = ipc::channel().unwrap();
     let (private_setup_chan, private_setup_port) = ipc::channel().unwrap();
-    let (report_chan, report_port) = ipc::channel().unwrap();
 
-    thread::Builder::new()
-        .name("ResourceManager".to_owned())
-        .spawn(move || {
-            let resource_manager = CoreResourceManager::new(
-                user_agent,
-                devtools_chan,
-                time_profiler_chan,
-                embedder_proxy,
-                certificate_path.clone(),
-            );
+    runtime.spawn_std(async move {
+        let resource_manager = CoreResourceManager::new(
+            user_agent,
+            devtools_chan,
+            embedder_proxy,
+            certificate_path.clone(),
+        );
 
-            let mut channel_manager = ResourceChannelManager {
-                resource_manager,
-                config_dir,
-                certificate_path,
-            };
-
-            mem_profiler_chan.run_with_memory_reporting(
-                || (channel_manager.start(public_setup_port, private_setup_port, report_port)),
-                String::from("network-cache-reporter"),
-                report_chan,
-                |report_chan| report_chan,
-            );
-        })
-        .expect("Thread spawning failed");
+        let mut channel_manager = ResourceChannelManager {
+            resource_manager,
+            config_dir,
+            certificate_path,
+        };        
+        
+        channel_manager
+            .start(
+                runtime,                
+                public_setup_port,
+                private_setup_port,
+            )
+            .await
+    });
     (public_setup_chan, private_setup_chan)
 }
 
@@ -127,18 +126,21 @@ struct ResourceChannelManager {
 }
 
 fn create_http_states(
-    config_dir: Option<&Path>,
+    runtime: &Runtime,
+    config_dir: Option<&Path>,    
     certificate_path: Option<String>,
-) -> (Arc<HttpState>, Arc<HttpState>) {
+) -> Arc<HttpState> {
     let mut hsts_list = HstsList::from_servo_preload();
     let mut auth_cache = AuthCache::new();
     let http_cache = HttpCache::new();
-    let mut cookie_jar = CookieStorage::new(150);
+    let mut external_cookies = vec![];
     if let Some(config_dir) = config_dir {
         read_json_from_file(&mut auth_cache, config_dir, "auth_cache.json");
         read_json_from_file(&mut hsts_list, config_dir, "hsts_list.json");
-        read_json_from_file(&mut cookie_jar, config_dir, "cookie_jar.json");
+        read_json_from_file(&mut external_cookies, config_dir, "cookie_jar.json");
     }
+
+    let mut cookie_jar = CookieStorage::new_from_external(150, external_cookies);
 
     let certs = match certificate_path {
         Some(ref path) => fs::read_to_string(path).expect("Couldn't not find certificate file"),
@@ -162,119 +164,49 @@ fn create_http_states(
                 extra_certs.clone(),
                 connection_certs.clone(),
             ),
-            HANDLE.lock().unwrap().as_ref().unwrap().executor(),
+            runtime.executor(),
         ),
         extra_certs,
         connection_certs,
     };
 
-    let extra_certs = ExtraCerts::new();
-    let connection_certs = ConnectionCerts::new();
-
-    let private_http_state = HttpState {
-        hsts_list: RwLock::new(HstsList::from_servo_preload()),
-        cookie_jar: RwLock::new(CookieStorage::new(150)),
-        auth_cache: RwLock::new(AuthCache::new()),
-        history_states: RwLock::new(HashMap::new()),
-        http_cache: RwLock::new(HttpCache::new()),
-        http_cache_state: Mutex::new(HashMap::new()),
-        client: create_http_client(
-            create_tls_config(
-                &certs,
-                ALPN_H2_H1,
-                extra_certs.clone(),
-                connection_certs.clone(),
-            ),
-            HANDLE.lock().unwrap().as_ref().unwrap().executor(),
-        ),
-        extra_certs,
-        connection_certs,
-    };
-
-    (Arc::new(http_state), Arc::new(private_http_state))
+    Arc::new(http_state)
 }
 
 impl ResourceChannelManager {
     #[allow(unsafe_code)]
-    fn start(
+    async fn start(
         &mut self,
+        runtime: &'static Runtime,        
         public_receiver: IpcReceiver<CoreResourceMsg>,
         private_receiver: IpcReceiver<CoreResourceMsg>,
-        memory_reporter: IpcReceiver<ReportsChan>,
     ) {
-        let (public_http_state, private_http_state) = create_http_states(
+        let public_http_state = create_http_states(
+            runtime,        
             self.config_dir.as_ref().map(Deref::deref),
             self.certificate_path.clone(),
         );
 
-        let mut rx_set = IpcReceiverSet::new().unwrap();
-        let private_id = rx_set.add(private_receiver).unwrap();
-        let public_id = rx_set.add(public_receiver).unwrap();
-        let reporter_id = rx_set.add(memory_reporter).unwrap();
-
-        loop {
-            for receiver in rx_set.select().unwrap().into_iter() {
-                // Handles case where profiler thread shuts down before resource thread.
-                match receiver {
-                    ipc::IpcSelectionResult::ChannelClosed(..) => continue,
-                    _ => {},
-                }
-                let (id, data) = receiver.unwrap();
-                // If message is memory report, get the size_of of public and private http caches
-                if id == reporter_id {
-                    if let Ok(msg) = data.to() {
-                        self.process_report(msg, &private_http_state, &public_http_state);
-                        continue;
-                    }
-                } else {
-                    let group = if id == private_id {
-                        &private_http_state
-                    } else {
-                        assert_eq!(id, public_id);
-                        &public_http_state
-                    };
-                    if let Ok(msg) = data.to() {
-                        if !self.process_msg(msg, group) {
-                            return;
-                        }
-                    }
-                }
-            }
+        let mut stream =
+            futures03::stream::select(public_receiver.to_stream(), private_receiver.to_stream());
+        while let Ok(msg) = stream.select_next_some().await {
+            self.process_msg(runtime, msg, &public_http_state).await;
         }
     }
 
-    fn process_report(
-        &mut self,
-        msg: ReportsChan,
-        public_http_state: &Arc<HttpState>,
-        private_http_state: &Arc<HttpState>,
-    ) {
-        let mut ops = MallocSizeOfOps::new(servo_allocator::usable_size, None, None);
-        let public_cache = public_http_state.http_cache.read().unwrap();
-        let private_cache = private_http_state.http_cache.read().unwrap();
-
-        let public_report = Report {
-            path: path!["memory-cache", "public"],
-            kind: ReportKind::ExplicitJemallocHeapSize,
-            size: public_cache.size_of(&mut ops),
-        };
-
-        let private_report = Report {
-            path: path!["memory-cache", "private"],
-            kind: ReportKind::ExplicitJemallocHeapSize,
-            size: private_cache.size_of(&mut ops),
-        };
-
-        msg.send(vec![public_report, private_report]);
-    }
-
     /// Returns false if the thread should exit.
-    fn process_msg(&mut self, msg: CoreResourceMsg, http_state: &Arc<HttpState>) -> bool {
+    async fn process_msg(
+        &mut self,
+        runtime: &'static Runtime,
+        msg: CoreResourceMsg,
+        http_state: &Arc<HttpState>,
+    ) -> bool {
         match msg {
             CoreResourceMsg::Fetch(req_init, channels) => match channels {
                 FetchChannels::ResponseMsg(sender, cancel_chan) => {
                     self.resource_manager
-                        .fetch(req_init, None, sender, http_state, cancel_chan)
+                        .fetch(runtime, req_init, None, sender, http_state, cancel_chan)
+                        .await;
                 },
                 FetchChannels::WebSocket {
                     event_sender,
@@ -287,7 +219,8 @@ impl ResourceChannelManager {
                 ),
                 FetchChannels::Prefetch => {
                     self.resource_manager
-                        .fetch(req_init, None, DiscardFetch, http_state, None)
+                        .fetch(runtime, req_init, None, DiscardFetch, http_state, None)
+                        .await;
                 },
             },
             CoreResourceMsg::DeleteCookies(request) => {
@@ -296,11 +229,21 @@ impl ResourceChannelManager {
                     .write()
                     .unwrap()
                     .clear_storage(&request);
+                self.persist_cookies(http_state);
                 return true;
+            },            
+            CoreResourceMsg::FetchRedirect(req_init, res_init, sender, cancel_chan) => {
+                self.resource_manager
+                    .fetch(
+                        runtime,
+                        req_init,
+                        Some(res_init),
+                        sender,
+                        http_state,
+                        cancel_chan,
+                    )
+                    .await
             },
-            CoreResourceMsg::FetchRedirect(req_init, res_init, sender, cancel_chan) => self
-                .resource_manager
-                .fetch(req_init, Some(res_init), sender, http_state, cancel_chan),
             CoreResourceMsg::SetCookieForUrl(request, cookie, source) => self
                 .resource_manager
                 .set_cookie_for_url(&request, cookie.into_inner(), source, http_state),
@@ -313,6 +256,7 @@ impl ResourceChannelManager {
                         http_state,
                     );
                 }
+                self.persist_cookies(http_state);
             },
             CoreResourceMsg::GetCookiesForUrl(url, consumer, source) => {
                 let mut cookie_jar = http_state.cookie_jar.write().unwrap();
@@ -358,6 +302,7 @@ impl ResourceChannelManager {
                 http_state.http_cache.write().unwrap().clear();
             },
             CoreResourceMsg::ToFileManager(msg) => self.resource_manager.filemanager.handle(msg),
+
             CoreResourceMsg::Exit(sender) => {
                 if let Some(ref config_dir) = self.config_dir {
                     match http_state.auth_cache.read() {
@@ -366,21 +311,31 @@ impl ResourceChannelManager {
                         },
                         Err(_) => warn!("Error writing auth cache to disk"),
                     }
-                    match http_state.cookie_jar.read() {
-                        Ok(jar) => write_json_to_file(&*jar, config_dir, "cookie_jar.json"),
-                        Err(_) => warn!("Error writing cookie jar to disk"),
-                    }
+                    self.persist_cookies(http_state);
                     match http_state.hsts_list.read() {
                         Ok(hsts) => write_json_to_file(&*hsts, config_dir, "hsts_list.json"),
                         Err(_) => warn!("Error writing hsts list to disk"),
                     }
                 }
+
                 self.resource_manager.exit();
                 let _ = sender.send(());
                 return false;
             },
         }
         true
+    }
+
+    fn persist_cookies(&self, http_state: &Arc<HttpState>) {
+        if let Some(ref config_dir) = self.config_dir {
+            match http_state.cookie_jar.read() {
+                Ok(jar) => {
+                    let jar = jar.to_external();
+                    write_json_to_file(&jar, config_dir, "cookie_jar.json");
+                },
+                Err(_) => warn!("Error writing cookie jar to disk"),
+            }
+        }
     }
 }
 
@@ -402,7 +357,7 @@ where
     let mut string_buffer: String = String::new();
     match file.read_to_string(&mut string_buffer) {
         Err(why) => panic!("couldn't read from {}: {}", display, why),
-        Ok(_) => println!("successfully read from {}", display),
+        Ok(_) => debug!("successfully read from {}", display),
     }
 
     match serde_json::from_str(&string_buffer) {
@@ -425,13 +380,14 @@ where
 
     let mut file = match File::create(&path) {
         Err(why) => panic!("couldn't create {}: {}", display, why),
-        Ok(file) => file,
+        Ok(file) => BufWriter::new(file),
     };
 
     match file.write_all(json_encoded.as_bytes()) {
         Err(why) => panic!("couldn't write to {}: {}", display, why),
-        Ok(_) => println!("successfully wrote to {}", display),
+        Ok(_) => debug!("successfully wrote to {}", display),
     }
+    file.flush();
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -460,151 +416,24 @@ pub struct CoreResourceManager {
     devtools_chan: Option<Sender<DevtoolsControlMsg>>,
     sw_managers: HashMap<ImmutableOrigin, IpcSender<CustomResponseMediator>>,
     filemanager: FileManager,
-    thread_pool: Arc<CoreResourceThreadPool>,
     certificate_path: Option<String>,
 }
 
-/// The state of the thread-pool used by CoreResource.
-struct ThreadPoolState {
-    /// The number of active workers.
-    active_workers: u32,
-    /// Whether the pool can spawn additional work.
-    active: bool,
-}
-
-impl ThreadPoolState {
-    pub fn new() -> ThreadPoolState {
-        ThreadPoolState {
-            active_workers: 0,
-            active: true,
-        }
-    }
-
-    /// Is the pool still able to spawn new work?
-    pub fn is_active(&self) -> bool {
-        self.active
-    }
-
-    /// How many workers are currently active?
-    pub fn active_workers(&self) -> u32 {
-        self.active_workers
-    }
-
-    /// Prevent additional work from being spawned.
-    pub fn switch_to_inactive(&mut self) {
-        self.active = false;
-    }
-
-    /// Add to the count of active workers.
-    pub fn increment_active(&mut self) {
-        self.active_workers += 1;
-    }
-
-    /// Substract from the count of active workers.
-    pub fn decrement_active(&mut self) {
-        self.active_workers -= 1;
-    }
-}
-
-/// Threadpool used by Fetch and file operations.
-pub struct CoreResourceThreadPool {
-    pool: rayon::ThreadPool,
-    state: Arc<Mutex<ThreadPoolState>>,
-}
-
-impl CoreResourceThreadPool {
-    pub fn new(num_threads: usize) -> CoreResourceThreadPool {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(num_threads)
-            .build()
-            .unwrap();
-        let state = Arc::new(Mutex::new(ThreadPoolState::new()));
-        CoreResourceThreadPool { pool: pool, state }
-    }
-
-    /// Spawn work on the thread-pool, if still active.
-    ///
-    /// There is no need to give feedback to the caller,
-    /// because if we do not perform work,
-    /// it is because the system as a whole is exiting.
-    pub fn spawn<OP>(&self, work: OP)
-    where
-        OP: FnOnce() + Send + 'static,
-    {
-        {
-            let mut state = self.state.lock().unwrap();
-            if state.is_active() {
-                state.increment_active();
-            } else {
-                // Don't spawn any work.
-                return;
-            }
-        }
-
-        let state = self.state.clone();
-
-        self.pool.spawn(move || {
-            {
-                let mut state = state.lock().unwrap();
-                if !state.is_active() {
-                    // Decrement number of active workers and return,
-                    // without doing any work.
-                    return state.decrement_active();
-                }
-            }
-            // Perform work.
-            work();
-            {
-                // Decrement number of active workers.
-                let mut state = state.lock().unwrap();
-                state.decrement_active();
-            }
-        });
-    }
-
-    /// Prevent further work from being spawned,
-    /// and wait until all workers are done,
-    /// or a timeout of roughly one second has been reached.
-    pub fn exit(&self) {
-        {
-            let mut state = self.state.lock().unwrap();
-            state.switch_to_inactive();
-        }
-        let mut rounds = 0;
-        loop {
-            rounds += 1;
-            {
-                let state = self.state.lock().unwrap();
-                let still_active = state.active_workers();
-
-                if still_active == 0 || rounds == 10 {
-                    if still_active > 0 {
-                        debug!("Exiting CoreResourceThreadPool with {:?} still working(should be zero)", still_active);
-                    }
-                    break;
-                }
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-    }
-}
+unsafe impl Sync for CoreResourceManager {}
+unsafe impl Send for CoreResourceManager {}
 
 impl CoreResourceManager {
     pub fn new(
         user_agent: Cow<'static, str>,
         devtools_channel: Option<Sender<DevtoolsControlMsg>>,
-        _profiler_chan: ProfilerChan,
         embedder_proxy: EmbedderProxy,
         certificate_path: Option<String>,
     ) -> CoreResourceManager {
-        let pool = CoreResourceThreadPool::new(16);
-        let pool_handle = Arc::new(pool);
         CoreResourceManager {
             user_agent: user_agent,
             devtools_chan: devtools_channel,
             sw_managers: Default::default(),
-            filemanager: FileManager::new(embedder_proxy, Arc::downgrade(&pool_handle)),
-            thread_pool: pool_handle,
+            filemanager: FileManager::new(embedder_proxy),
             certificate_path,
         }
     }
@@ -614,10 +443,6 @@ impl CoreResourceManager {
         // Prevents further work from being spawned on the pool,
         // blocks until all workers in the pool are done,
         // or a short timeout has been reached.
-        self.thread_pool.exit();
-
-        // Shut-down the async runtime used by fetch workers.
-        drop(HANDLE.lock().unwrap().take());
 
         // Shut-down the async runtime used by websocket workers.
         drop(WS_HANDLE.lock().unwrap().take());
@@ -638,8 +463,9 @@ impl CoreResourceManager {
         }
     }
 
-    fn fetch<Target: 'static + FetchTaskTarget + Send>(
+    async fn fetch<Target: 'static + FetchTaskTarget + Send>(
         &self,
+        runtime: &'static Runtime,
         request_builder: RequestBuilder,
         res_init_: Option<ResponseInit>,
         mut sender: Target,
@@ -680,44 +506,48 @@ impl CoreResourceManager {
             _ => (FileTokenCheck::NotRequired, None),
         };
 
-        self.thread_pool.spawn(move || {
-            // XXXManishearth: Check origin against pipeline id (also ensure that the mode is allowed)
-            // todo load context / mimesniff in fetch
-            // todo referrer policy?
-            // todo service worker stuff
-            let context = FetchContext {
-                state: http_state,
-                user_agent: ua,
-                devtools_chan: dc,
-                filemanager: filemanager,
-                file_token,
-                cancellation_listener: Arc::new(Mutex::new(CancellationListener::new(cancel_chan))),
-                timing: ServoArc::new(Mutex::new(ResourceFetchTiming::new(request.timing_type()))),
-            };
+        // XXXManishearth: Check origin against pipeline id (also ensure that the mode is allowed)
+        // todo load context / mimesniff in fetch
+        // todo referrer policy?
+        // todo service worker stuff
+        let context = FetchContext {
+            runtime: runtime,
+            state: http_state,
+            user_agent: ua,
+            devtools_chan: dc.map(|dc| Arc::new(Mutex::new(dc))),
+            filemanager: Arc::new(Mutex::new(filemanager)),
+            file_token,
+            cancellation_listener: Arc::new(Mutex::new(CancellationListener::new(cancel_chan))),
+            timing: ServoArc::new(Mutex::new(ResourceFetchTiming::new(request.timing_type()))),
+        };
 
-            match res_init_ {
-                Some(res_init) => {
-                    let response = Response::from_init(res_init, timing_type);
-                    http_redirect_fetch(
-                        &mut request,
-                        &mut CorsCache::new(),
-                        response,
-                        true,
-                        &mut sender,
-                        &mut None,
-                        &context,
-                    );
-                },
-                None => fetch(&mut request, &mut sender, &context),
-            };
+        match res_init_ {
+            Some(res_init) => {
+                let response = Response::from_init(res_init, timing_type);
+                http_redirect_fetch(
+                    &mut request,
+                    &mut CorsCache::new(),
+                    response,
+                    true,
+                    &mut sender,
+                    &mut None,
+                    &context,
+                )
+                .await;
+            },
+            None => {
+                fetch(&mut request, &mut sender, &context).await;
+            },
+        };
 
-            // Remove token after fetch.
-            if let Some(id) = blob_url_file_id.as_ref() {
-                context
-                    .filemanager
-                    .invalidate_token(&context.file_token, id);
-            }
-        });
+        // Remove token after fetch.
+        if let Some(id) = blob_url_file_id.as_ref() {
+            context
+                .filemanager
+                .lock()
+                .unwrap()
+                .invalidate_token(&context.file_token, id);
+        }
     }
 
     fn websocket_connect(

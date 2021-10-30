@@ -3,7 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use cssparser::SourceLocation;
-use rayon;
 use servo_arc::Arc;
 use servo_url::ServoUrl;
 use style::context::QuirksMode;

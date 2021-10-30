@@ -13,7 +13,6 @@ use crate::formatting_contexts::IndependentFormattingContext;
 use crate::fragments::Tag;
 use crate::positioned::AbsolutelyPositionedBox;
 use crate::style_ext::DisplayGeneratingBox;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::borrow::Cow;
 use style::values::specified::text::TextDecorationLine;
 
@@ -142,8 +141,8 @@ where
         };
 
         let mut children = std::mem::take(&mut self.jobs)
-            .into_par_iter()
-            .map(|job| match job {
+            .iter()
+            .map(move |job| match job {
                 FlexLevelJob::TextRuns(runs) => ArcRefCell::new(FlexLevelBox::FlexItem(
                     IndependentFormattingContext::construct_for_text_runs(
                         &self
@@ -151,8 +150,8 @@ where
                             .new_replacing_style(anonymous_style.clone().unwrap()),
                         runs.into_iter().map(|run| crate::flow::inline::TextRun {
                             tag: Tag::from_node_and_style_info(&run.info),
-                            text: run.text.into(),
-                            parent_style: run.info.style,
+                            text: run.text.clone().into(),
+                            parent_style: run.info.clone().style,
                         }),
                         self.text_decoration_line,
                     ),
@@ -172,8 +171,8 @@ where
                             ArcRefCell::new(AbsolutelyPositionedBox::construct(
                                 self.context,
                                 &info,
-                                display_inside,
-                                contents,
+                                display_inside.clone(),
+                                /*contents*/ Contents::OfElement,
                             )),
                         ))
                     } else {
@@ -181,13 +180,13 @@ where
                             IndependentFormattingContext::construct(
                                 self.context,
                                 &info,
-                                display_inside,
-                                contents,
+                                display_inside.clone(),
+                                /*contents*/ Contents::OfElement,
                                 self.text_decoration_line,
                             ),
                         ))
                     };
-                    box_slot.set(LayoutBox::FlexLevel(box_.clone()));
+                    // box_slot.set(LayoutBox::FlexLevel(box_.clone()));
                     box_
                 },
             })

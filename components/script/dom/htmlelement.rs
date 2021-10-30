@@ -348,11 +348,14 @@ impl HTMLElementMethods for HTMLElement {
 
     // https://html.spec.whatwg.org/multipage/#dom-click
     fn Click(&self) {
+        info!("Click fired");
         let element = self.upcast::<Element>();
         if element.disabled_state() {
+            warn!("Click ignored due to disabled");
             return;
         }
         if element.click_in_progress() {
+            warn!("Click ignored due to in progress");
             return;
         }
         element.set_click_in_progress(true);

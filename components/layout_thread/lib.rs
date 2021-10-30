@@ -537,7 +537,7 @@ impl LayoutThread {
             first_reflow: Cell::new(true),
             font_cache_receiver: font_cache_receiver,
             font_cache_sender: ipc_font_cache_sender,
-            parallel_flag: true,
+            parallel_flag: false,
             generation: Cell::new(0),
             outstanding_web_fonts: Arc::new(AtomicUsize::new(0)),
             root_flow: RefCell::new(None),
@@ -824,33 +824,6 @@ impl LayoutThread {
         possibly_locked_rw_data: &mut RwData<'a, 'b>,
     ) {
         let mut reports = vec![];
-        // Servo uses vanilla jemalloc, which doesn't have a
-        // malloc_enclosing_size_of function.
-        let mut ops = MallocSizeOfOps::new(servo_allocator::usable_size, None, None);
-
-        // FIXME(njn): Just measuring the display tree for now.
-        let rw_data = possibly_locked_rw_data.lock();
-        let display_list = rw_data.display_list.as_ref();
-        let formatted_url = &format!("url({})", self.url);
-        reports.push(Report {
-            path: path![formatted_url, "layout-thread", "display-list"],
-            kind: ReportKind::ExplicitJemallocHeapSize,
-            size: display_list.map_or(0, |sc| sc.size_of(&mut ops)),
-        });
-
-        reports.push(Report {
-            path: path![formatted_url, "layout-thread", "stylist"],
-            kind: ReportKind::ExplicitJemallocHeapSize,
-            size: self.stylist.size_of(&mut ops),
-        });
-
-        // The LayoutThread has data in Persistent TLS...
-        reports.push(Report {
-            path: path![formatted_url, "layout-thread", "local-context"],
-            kind: ReportKind::ExplicitJemallocHeapSize,
-            size: malloc_size_of_persistent_local_context(&mut ops),
-        });
-
         reports_chan.send(reports);
     }
 

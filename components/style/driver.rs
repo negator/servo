@@ -14,7 +14,6 @@ use crate::parallel;
 use crate::parallel::{DispatchMode, WORK_UNIT_MAX};
 use crate::scoped_tls::ScopedTLS;
 use crate::traversal::{DomTraversal, PerLevelTraversalData, PreTraverseToken};
-use rayon;
 use std::collections::VecDeque;
 use std::mem;
 use time;

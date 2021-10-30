@@ -18,13 +18,19 @@ use servo::servo_url::ServoUrl;
 use servo::{BrowserId, Servo};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::env;
 use std::mem;
 use std::rc::Rc;
+use tokio_compat::runtime::{Runtime, Builder};
 use webxr::glwindow::GlWindowDiscovery;
 
 thread_local! {
-    pub static WINDOWS: RefCell<HashMap<WindowId, Rc<dyn WindowPortsMethods>>> = RefCell::new(HashMap::new());
+    pub static WINDOWS: RefCell<HashMap<WindowId, Rc<dyn WindowPortsMethods>>> = RefCell::new(HashMap::new());    
+}
+
+lazy_static! {
+    pub static ref HANDLE: Runtime = Builder::new().core_threads(2).build().unwrap();        
 }
 
 pub struct App {
@@ -99,8 +105,8 @@ impl App {
                     ev_waker.clone(),
                     xr_discovery,
                 ));
-
-                let servo_data = Servo::new(embedder, window.clone(), user_agent.clone());
+                
+                let servo_data = Servo::new(&HANDLE, embedder, window.clone(), user_agent.clone());
                 let mut servo = servo_data.servo;
                 servo.handle_events(vec![WindowEvent::NewBrowser(get_default_url(), servo_data.browser_id)]);
                 servo.setup_logging();
@@ -232,6 +238,7 @@ fn get_default_url() -> ServoUrl {
     // or a blank page in case the homepage is not set either.
     let cwd = env::current_dir().unwrap();
     let cmdline_url = opts::get().url.clone();
+    
     let pref_url = {
         let homepage_url = pref!(shell.homepage);
         parse_url_or_filename(&cwd, &homepage_url).ok()

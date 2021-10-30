@@ -13,7 +13,7 @@ path = "lib.rs"
 [dependencies]
 arrayvec = { version = "0.5.1", features = ["serde"] }
 euclid = "0.20"
-ipc-channel = "0.14"
+ipc-channel = {version = "0.14", features = ["async"]}
 log = "0.4"
 malloc_size_of = { path = "../malloc_size_of" }
 msg = { path = "../msg" }

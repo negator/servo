@@ -13,7 +13,7 @@ path = "lib.rs"
 [dependencies]
 crossbeam-channel = "0.4"
 gfx = { path = "../gfx" }
-ipc-channel = "0.14"
+ipc-channel = {version = "0.14", features = ["async"]}
 metrics = { path = "../metrics" }
 msg = { path = "../msg" }
 net_traits = { path = "../net_traits" }

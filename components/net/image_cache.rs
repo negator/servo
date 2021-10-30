@@ -644,11 +644,12 @@ impl ImageCache for ImageCacheImpl {
                         };
 
                         let local_store = self.store.clone();
-                        thread::spawn(move || {
-                            let msg = decode_bytes_sync(key, &*bytes, cors_status);
-                            debug!("Image decoded");
-                            local_store.lock().unwrap().handle_decoder(msg);
-                        });
+
+                        /*Disable image decoding entirely for performance*/
+
+                        let msg = decode_bytes_sync(key, &*bytes, cors_status);
+                        debug!("Image decoded");
+                        local_store.lock().unwrap().handle_decoder(msg);
                     },
                     Err(_) => {
                         debug!("Processing error for {:?}", key);

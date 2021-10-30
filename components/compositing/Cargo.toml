@@ -23,7 +23,7 @@ euclid = "0.20"
 gfx_traits = { path = "../gfx_traits" }
 gleam = { version = "0.12", optional = true }
 image = "0.23"
-ipc-channel = "0.14"
+ipc-channel = {version = "0.14", features = ["async"]}
 keyboard-types = "0.5"
 libc = "0.2"
 log = "0.4"

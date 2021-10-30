@@ -173,6 +173,7 @@ impl XRTestMethods for XRTest {
         );
         window
             .webxr_registry()
+            .unwrap()
             .simulate_device_connection(init, sender);
 
         p

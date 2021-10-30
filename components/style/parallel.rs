@@ -28,7 +28,6 @@ use crate::scoped_tls::ScopedTLS;
 use crate::traversal::{DomTraversal, PerLevelTraversalData};
 use arrayvec::ArrayVec;
 use itertools::Itertools;
-use rayon;
 use smallvec::SmallVec;
 
 /// The minimum stack size for a thread in the styling pool, in kilobytes.

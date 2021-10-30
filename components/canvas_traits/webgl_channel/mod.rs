@@ -14,10 +14,6 @@ use serde::{Deserialize, Serialize};
 use servo_config::opts;
 use std::fmt;
 
-lazy_static! {
-    static ref IS_MULTIPROCESS: bool = opts::multiprocess();
-}
-
 #[derive(Deserialize, Serialize)]
 pub enum WebGLSender<T: Serialize> {
     Ipc(ipc::WebGLSender<T>),
@@ -91,19 +87,25 @@ where
             WebGLReceiver::Mpsc(receiver) => receiver.into_inner(),
         }
     }
+
+    pub fn to_ipc(&self) -> ipc_channel::ipc::IpcReceiver<T>
+    where
+        T: Send + 'static,
+    {
+        match self {
+            WebGLReceiver::Ipc(receiver) => receiver.clone(),
+            WebGLReceiver::Mpsc(receiver) => panic!("unsupported"),
+        }
+    }
 }
 
 pub fn webgl_channel<T>() -> Result<(WebGLSender<T>, WebGLReceiver<T>), ()>
 where
     T: for<'de> Deserialize<'de> + Serialize,
 {
-    if *IS_MULTIPROCESS {
-        ipc::webgl_channel()
-            .map(|(tx, rx)| (WebGLSender::Ipc(tx), WebGLReceiver::Ipc(rx)))
-            .map_err(|_| ())
-    } else {
-        mpsc::webgl_channel().map(|(tx, rx)| (WebGLSender::Mpsc(tx), WebGLReceiver::Mpsc(rx)))
-    }
+    ipc::webgl_channel()
+        .map(|(tx, rx)| (WebGLSender::Ipc(tx), WebGLReceiver::Ipc(rx)))
+        .map_err(|_| ())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

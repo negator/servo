@@ -24,7 +24,7 @@ use style::values::CSSFloat;
 use style::Zero;
 use webrender_api::ImageKey;
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct ReplacedContent {
     pub kind: ReplacedContentKind,
     intrinsic: IntrinsicSizes,
@@ -41,14 +41,14 @@ pub(crate) struct ReplacedContent {
 ///
 /// * For SVG, see https://svgwg.org/svg2-draft/coords.html#SizingSVGInCSS
 ///   and again https://github.com/w3c/csswg-drafts/issues/4572.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct IntrinsicSizes {
     pub width: Option<Length>,
     pub height: Option<Length>,
     pub ratio: Option<CSSFloat>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub(crate) enum CanvasSource {
     WebGL(ImageKey),
     Image(Option<Arc<Mutex<IpcSender<CanvasMsg>>>>),
@@ -69,13 +69,13 @@ impl fmt::Debug for CanvasSource {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct CanvasInfo {
     pub source: CanvasSource,
     pub canvas_id: CanvasId,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) enum ReplacedContentKind {
     Image(Option<Arc<Image>>),
     Canvas(CanvasInfo),

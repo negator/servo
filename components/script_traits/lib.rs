@@ -678,7 +678,7 @@ pub struct InitialScriptState {
     /// A channel to the WebGL thread used in this pipeline.
     pub webgl_chan: Option<WebGLPipeline>,
     /// The XR device registry
-    pub webxr_registry: webxr_api::Registry,
+    pub webxr_registry: Option<webxr_api::Registry>,
     /// The Webrender document ID associated with this thread.
     pub webrender_document: DocumentId,
     /// FIXME(victor): The Webrender API sender in this constellation's pipeline

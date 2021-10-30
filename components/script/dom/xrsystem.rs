@@ -110,8 +110,17 @@ impl XRSystemMethods for XRSystem {
         // XXXManishearth this should select an XR device first
         let promise = Promise::new(&self.global());
         let mut trusted = Some(TrustedPromise::new(promise.clone()));
+
         let global = self.global();
         let window = global.as_window();
+
+        if window.webxr_registry().is_none() {
+            if let Some(trusted) = trusted.take() {
+                trusted.resolve_task(false);
+                return promise;
+            };
+        }
+
         let (task_source, canceller) = window
             .task_manager()
             .dom_manipulation_task_source_with_canceller();
@@ -141,8 +150,10 @@ impl XRSystemMethods for XRSystem {
                 };
             }),
         );
+
         window
             .webxr_registry()
+            .unwrap()
             .supports_session(mode.into(), sender);
 
         promise
@@ -254,6 +265,7 @@ impl XRSystemMethods for XRSystem {
         );
         window
             .webxr_registry()
+            .unwrap()
             .request_session(mode.into(), init, sender, frame_sender);
         promise
     }

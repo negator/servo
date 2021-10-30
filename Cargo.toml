@@ -1,3 +1,5 @@
+cargo-features = ["strip"]
+
 [workspace]
 members = [
     "ports/winit",
@@ -10,10 +12,11 @@ members = [
 exclude = [".cargo"]
 
 [profile.release]
-opt-level = 3
-# Uncomment to profile on Linux:
-# debug = true
-# lto = false
+# strip = "symbols"
+# opt-level = "z"
+debug = true
+# lto = true
+# codegen-units = 1
 
 [patch.crates-io]
 # If you need to temporarily test Servo with a local fork of some upstream
@@ -26,10 +29,19 @@ opt-level = 3
 #     [patch."https://github.com/servo/<repository>"]
 #     <crate> = { path = "/path/to/local/checkout" }
 
-# This is here to dedupe winapi since mio 0.6 is still using winapi 0.2.
-mio = { git = "https://github.com/servo/mio.git", branch = "servo-mio-0.6.22" }
 # Work around bug in winit 0.24 crashing servo headless in macOS
 winit = { git = "https://github.com/rust-windowing/winit.git", rev = "4192d04a53202c199f94d1b7d883a34c9ad09272" }
+ipc-channel = { path = "/Users/navgattu/Documents/dev-git/ipc-channel" }
+
+# iOS Support 
+surfman = { git = "https://github.com/negator/surfman", rev = "7701d34bb4636bfef4c79ef8a07866cb7581fc55"}
+
+# openssl = { git = "https://github.com/sfackler/rust-openssl", rev = "5b1813fb15e4ceb77fbeb991143f302d242d32d5", features = ["vendored"] }
+
+[patch."https://github.com/servo/mozjs"]
+# Work around limitation in mozjs_sys that doesn't allow macosdk > 11.1
+# mozjs_sys = { git = "https://github.com/negator/mozjs.git", rev = "928649c44ff9f350a7d388804dfeb4ec8b7e6633" }
+mozjs_sys = { path = "/Users/navgattu/Documents/dev-git/mozjs" }
 
 [patch."https://github.com/jrmuizel/raqote"]
 raqote = { git = "https://github.com/jdm/raqote", branch = "fkup" }

@@ -470,7 +470,7 @@ unsafe fn init(
         xr_discovery: None,
         gl_context_pointer: gl_context,
         native_display_pointer: display,
-        surfman_integration: SurfmanIntegration::Widget(opts.native_widget),
+        surfman_integration: SurfmanIntegration::Surface,
     };
 
     let wakeup = Box::new(WakeupCallback::new(wakeup));
@@ -502,7 +502,8 @@ pub extern "C" fn init_with_egl(
 #[cfg(any(
     target_os = "linux",
     all(target_os = "windows", not(feature = "no-wgl")),
-    target_os = "macos"
+    target_os = "macos",
+    target_os = "ios"
 ))]
 #[no_mangle]
 pub extern "C" fn init_with_gl(

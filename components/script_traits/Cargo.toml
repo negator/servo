@@ -23,7 +23,7 @@ gfx_traits = { path = "../gfx_traits" }
 http = "0.1"
 hyper = "0.12"
 hyper_serde = "0.11"
-ipc-channel = "0.14"
+ipc-channel = {version = "0.14", features = ["async"]}
 keyboard-types = "0.5"
 libc = "0.2"
 log = "0.4"

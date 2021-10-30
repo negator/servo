@@ -553,7 +553,8 @@ impl Node {
 
     /// Returns a string that describes this node.
     pub fn debug_str(&self) -> String {
-        format!("{:?}", self.type_id())
+        // format!("{:?}", self.type_id().to_string())
+        format!("{:?}", "NodeTypeId")
     }
 
     pub fn is_in_doc(&self) -> bool {
@@ -3478,7 +3479,8 @@ impl Into<LayoutNodeType> for NodeTypeId {
         match self {
             NodeTypeId::Element(e) => LayoutNodeType::Element(e.into()),
             NodeTypeId::CharacterData(CharacterDataTypeId::Text(_)) => LayoutNodeType::Text,
-            x => unreachable!("Layout should not traverse nodes of type {:?}", x),
+            // x => unreachable!("Layout should not traverse nodes of type {:?}", x),
+            x => unreachable!("Layout should not traverse nodes of type NodeTypeId"),
         }
     }
 }

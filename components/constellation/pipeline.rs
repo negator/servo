@@ -196,7 +196,7 @@ pub struct InitialPipelineState {
     pub webgl_chan: Option<WebGLPipeline>,
 
     /// The XR device registry
-    pub webxr_registry: webxr_api::Registry,
+    pub webxr_registry: Option<webxr_api::Registry>,
 
     /// Application window's GL Context for Media player
     pub player_context: WindowGLContext,
@@ -515,7 +515,7 @@ pub struct UnprivilegedPipelineContent {
     webrender_image_api_sender: net_traits::WebrenderIpcSender,
     webrender_document: webrender_api::DocumentId,
     webgl_chan: Option<WebGLPipeline>,
-    webxr_registry: webxr_api::Registry,
+    webxr_registry: Option<webxr_api::Registry>,
     player_context: WindowGLContext,
     user_agent: Cow<'static, str>,
 }

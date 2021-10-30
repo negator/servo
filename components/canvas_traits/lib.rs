@@ -7,8 +7,8 @@
 #![deny(unsafe_code)]
 
 use crate::canvas::CanvasId;
-use crossbeam_channel::Sender;
 use euclid::default::Size2D;
+use ipc_channel::ipc::{self, IpcSender};
 
 #[macro_use]
 extern crate lazy_static;
@@ -22,9 +22,10 @@ pub mod canvas;
 pub mod webgl;
 mod webgl_channel;
 
+#[derive(Deserialize, Serialize)]
 pub enum ConstellationCanvasMsg {
     Create {
-        id_sender: Sender<CanvasId>,
+        id_sender: IpcSender<CanvasId>,
         size: Size2D<u64>,
         antialias: bool,
     },

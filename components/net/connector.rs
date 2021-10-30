@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use crate::hosts::replace_host;
+use hyper::client::connect::dns::{Name, Resolve};
 use hyper::client::connect::{Connect, Destination};
 use hyper::client::HttpConnector as HyperHttpConnector;
 use hyper::rt::Future;
@@ -14,6 +15,7 @@ use openssl::ssl::{
 };
 use openssl::x509::{self, X509StoreContext};
 use std::collections::hash_map::{Entry, HashMap};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use tokio::prelude::future::Executor;
 
@@ -67,13 +69,40 @@ impl ConnectionCerts {
     }
 }
 
+#[derive(Clone)]
+pub struct DnsResolver();
+pub struct BlockingLookup(String);
+
+impl futures::Future for BlockingLookup {
+    type Item = std::vec::IntoIter<IpAddr>;
+    type Error = std::io::Error;
+
+    fn poll(&mut self) -> futures::Poll<Self::Item, Self::Error> {
+        debug!("resolving host={:?}", self.0);
+
+        (&*self.0, 0).to_socket_addrs().map(|addrs| {
+            let ips: Vec<IpAddr> = addrs.map(|sa| sa.ip()).collect();
+            futures::Async::Ready(ips.into_iter())
+        })
+    }
+}
+
+impl Resolve for DnsResolver {
+    type Addrs = std::vec::IntoIter<IpAddr>;
+    type Future = BlockingLookup;
+
+    fn resolve(&self, name: Name) -> Self::Future {
+        BlockingLookup(name.as_str().to_owned())
+    }
+}
+
 pub struct HttpConnector {
-    inner: HyperHttpConnector,
+    inner: HyperHttpConnector<DnsResolver>,
 }
 
 impl HttpConnector {
     fn new() -> HttpConnector {
-        let mut inner = HyperHttpConnector::new(4);
+        let mut inner = HyperHttpConnector::new_with_resolver(DnsResolver());
         inner.enforce_http(false);
         inner.set_happy_eyeballs_timeout(None);
         HttpConnector { inner }
@@ -81,9 +110,9 @@ impl HttpConnector {
 }
 
 impl Connect for HttpConnector {
-    type Transport = <HyperHttpConnector as Connect>::Transport;
-    type Error = <HyperHttpConnector as Connect>::Error;
-    type Future = <HyperHttpConnector as Connect>::Future;
+    type Transport = <HyperHttpConnector<DnsResolver> as Connect>::Transport;
+    type Error = <HyperHttpConnector<DnsResolver> as Connect>::Error;
+    type Future = <HyperHttpConnector<DnsResolver> as Connect>::Future;
 
     fn connect(&self, dest: Destination) -> Self::Future {
         // Perform host replacement when making the actual TCP connection.
@@ -165,7 +194,8 @@ pub fn create_tls_config(
             SslOptions::NO_SSLV3 |
             SslOptions::NO_TLSV1 |
             SslOptions::NO_TLSV1_1 |
-            SslOptions::NO_COMPRESSION,
+            SslOptions::NO_COMPRESSION |
+            SslOptions::ALLOW_UNSAFE_LEGACY_RENEGOTIATION,
     );
 
     cfg.set_ex_data(*EXTRA_INDEX, extra_certs);

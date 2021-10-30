@@ -15,8 +15,6 @@ use crate::formatting_contexts::IndependentFormattingContext;
 use crate::fragments::Tag;
 use crate::positioned::AbsolutelyPositionedBox;
 use crate::style_ext::{DisplayGeneratingBox, DisplayInside, DisplayOutside};
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use rayon_croissant::ParallelIteratorExt;
 use servo_arc::Arc;
 use std::borrow::Cow;
 use std::convert::{TryFrom, TryInto};
@@ -235,26 +233,12 @@ impl BlockContainer {
             *contains_floats |= box_contains_floats;
             block_level_box
         };
-        let block_level_boxes = if context.use_rayon {
-            builder
-                .block_level_boxes
-                .into_par_iter()
-                .mapfold_reduce_into(
-                    &mut contains_floats,
-                    mapfold,
-                    || ContainsFloats::No,
-                    |left, right| {
-                        *left |= right;
-                    },
-                )
-                .collect()
-        } else {
-            builder
-                .block_level_boxes
-                .into_iter()
-                .map(|x| mapfold(&mut contains_floats, x))
-                .collect()
-        };
+        let block_level_boxes = builder
+            .block_level_boxes
+            .into_iter()
+            .map(|x| mapfold(&mut contains_floats, x))
+            .collect();
+
         let container = BlockContainer::BlockLevelBoxes(block_level_boxes);
 
         (container, contains_floats)

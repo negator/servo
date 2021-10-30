@@ -3,7 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use crate::fetch::methods::{CancellationListener, Data, RangeRequestBounds};
-use crate::resource_thread::CoreResourceThreadPool;
 use crossbeam_channel::Sender;
 use embedder_traits::{EmbedderMsg, EmbedderProxy, FilterPattern};
 use headers::{ContentLength, ContentType, HeaderMap, HeaderMapExt};
@@ -77,18 +76,13 @@ enum FileImpl {
 pub struct FileManager {
     embedder_proxy: EmbedderProxy,
     store: Arc<FileManagerStore>,
-    thread_pool: Weak<CoreResourceThreadPool>,
 }
 
 impl FileManager {
-    pub fn new(
-        embedder_proxy: EmbedderProxy,
-        pool_handle: Weak<CoreResourceThreadPool>,
-    ) -> FileManager {
+    pub fn new(embedder_proxy: EmbedderProxy) -> FileManager {
         FileManager {
             embedder_proxy,
             store: Arc::new(FileManagerStore::new()),
-            thread_pool: pool_handle,
         }
     }
 
@@ -99,19 +93,10 @@ impl FileManager {
         origin: FileOrigin,
     ) {
         let store = self.store.clone();
-        self.thread_pool
-            .upgrade()
-            .and_then(|pool| {
-                pool.spawn(move || {
-                    if let Err(e) = store.try_read_file(&sender, id, origin) {
-                        let _ = sender.send(Err(FileManagerThreadError::BlobURLStoreError(e)));
-                    }
-                });
-                Some(())
-            })
-            .unwrap_or_else(|| {
-                warn!("FileManager tried to read a file after CoreResourceManager has exited.");
-            });
+
+        if let Err(e) = store.try_read_file(&sender, id, origin) {
+            let _ = sender.send(Err(FileManagerThreadError::BlobURLStoreError(e)));
+        }
     }
 
     pub fn get_token_for_file(&self, file_id: &Uuid) -> FileTokenCheck {
@@ -156,36 +141,12 @@ impl FileManager {
             FileManagerThreadMsg::SelectFile(filter, sender, origin, opt_test_path) => {
                 let store = self.store.clone();
                 let embedder = self.embedder_proxy.clone();
-                self.thread_pool
-                    .upgrade()
-                    .and_then(|pool| {
-                        pool.spawn(move || {
-                            store.select_file(filter, sender, origin, opt_test_path, embedder);
-                        });
-                        Some(())
-                    })
-                    .unwrap_or_else(|| {
-                        warn!(
-                            "FileManager tried to select a file after CoreResourceManager has exited."
-                        );
-                    });
+                store.select_file(filter, sender, origin, opt_test_path, embedder);
             },
             FileManagerThreadMsg::SelectFiles(filter, sender, origin, opt_test_paths) => {
                 let store = self.store.clone();
                 let embedder = self.embedder_proxy.clone();
-                self.thread_pool
-                    .upgrade()
-                    .and_then(|pool| {
-                        pool.spawn(move || {
-                            store.select_files(filter, sender, origin, opt_test_paths, embedder);
-                        });
-                        Some(())
-                    })
-                    .unwrap_or_else(|| {
-                        warn!(
-                            "FileManager tried to select multiple files after CoreResourceManager has exited."
-                        );
-                    });
+                store.select_files(filter, sender, origin, opt_test_paths, embedder);
             },
             FileManagerThreadMsg::ReadFile(sender, id, origin) => {
                 self.read_file(sender, id, origin);
@@ -216,68 +177,56 @@ impl FileManager {
         cancellation_listener: Arc<Mutex<CancellationListener>>,
         range: RelativePos,
     ) {
-        self.thread_pool
-            .upgrade()
-            .and_then(|pool| {
-                pool.spawn(move || {
-                    loop {
-                        if cancellation_listener.lock().unwrap().cancelled() {
-                            *res_body.lock().unwrap() = ResponseBody::Done(vec![]);
-                            let _ = done_sender.send(Data::Cancelled);
-                            return;
-                        }
-                        let length = {
-                            let buffer = reader.fill_buf().unwrap().to_vec();
-                            let mut buffer_len = buffer.len();
-                            if let ResponseBody::Receiving(ref mut body) = *res_body.lock().unwrap()
-                            {
-                                let offset = usize::min(
-                                    {
-                                        if let Some(end) = range.end {
-                                            // HTTP Range requests are specified with closed ranges,
-                                            // while Rust uses half-open ranges. We add +1 here so
-                                            // we don't skip the last requested byte.
-                                            let remaining_bytes =
-                                                end as usize - range.start as usize - body.len() +
-                                                    1;
-                                            if remaining_bytes <= FILE_CHUNK_SIZE {
-                                                // This is the last chunk so we set buffer
-                                                // len to 0 to break the reading loop.
-                                                buffer_len = 0;
-                                                remaining_bytes
-                                            } else {
-                                                FILE_CHUNK_SIZE
-                                            }
-                                        } else {
-                                            FILE_CHUNK_SIZE
-                                        }
-                                    },
-                                    buffer.len(),
-                                );
-                                let chunk = &buffer[0..offset];
-                                body.extend_from_slice(chunk);
-                                let _ = done_sender.send(Data::Payload(chunk.to_vec()));
+        loop {
+            if cancellation_listener.lock().unwrap().cancelled() {
+                *res_body.lock().unwrap() = ResponseBody::Done(vec![]);
+                let _ = done_sender.send(Data::Cancelled);
+                return;
+            }
+            let length = {
+                let buffer = reader.fill_buf().unwrap().to_vec();
+                let mut buffer_len = buffer.len();
+                if let ResponseBody::Receiving(ref mut body) = *res_body.lock().unwrap() {
+                    let offset = usize::min(
+                        {
+                            if let Some(end) = range.end {
+                                // HTTP Range requests are specified with closed ranges,
+                                // while Rust uses half-open ranges. We add +1 here so
+                                // we don't skip the last requested byte.
+                                let remaining_bytes =
+                                    end as usize - range.start as usize - body.len() + 1;
+                                if remaining_bytes <= FILE_CHUNK_SIZE {
+                                    // This is the last chunk so we set buffer
+                                    // len to 0 to break the reading loop.
+                                    buffer_len = 0;
+                                    remaining_bytes
+                                } else {
+                                    FILE_CHUNK_SIZE
+                                }
+                            } else {
+                                FILE_CHUNK_SIZE
                             }
-                            buffer_len
-                        };
-                        if length == 0 {
-                            let mut body = res_body.lock().unwrap();
-                            let completed_body = match *body {
-                                ResponseBody::Receiving(ref mut body) => mem::replace(body, vec![]),
-                                _ => vec![],
-                            };
-                            *body = ResponseBody::Done(completed_body);
-                            let _ = done_sender.send(Data::Done);
-                            break;
-                        }
-                        reader.consume(length);
-                    }
-                });
-                Some(())
-            })
-            .unwrap_or_else(|| {
-                warn!("FileManager tried to fetch a file in chunks after CoreResourceManager has exited.");
-            });
+                        },
+                        buffer.len(),
+                    );
+                    let chunk = &buffer[0..offset];
+                    body.extend_from_slice(chunk);
+                    let _ = done_sender.send(Data::Payload(chunk.to_vec()));
+                }
+                buffer_len
+            };
+            if length == 0 {
+                let mut body = res_body.lock().unwrap();
+                let completed_body = match *body {
+                    ResponseBody::Receiving(ref mut body) => mem::replace(body, vec![]),
+                    _ => vec![],
+                };
+                *body = ResponseBody::Done(completed_body);
+                let _ = done_sender.send(Data::Done);
+                break;
+            }
+            reader.consume(length);
+        }
     }
 
     fn fetch_blob_buf(

@@ -273,8 +273,12 @@ pub unsafe fn report_pending_exception(cx: *mut JSContext, dispatch_event: bool,
     };
 
     error!(
-        "Error at {}:{}:{} {}",
-        error_info.filename, error_info.lineno, error_info.column, error_info.message
+        "Error at {}:{}:{} {}\nDispatching error: {:?}",
+        error_info.filename,
+        error_info.lineno,
+        error_info.column,
+        error_info.message,
+        dispatch_event
     );
     #[cfg(feature = "js_backtrace")]
     {
@@ -288,9 +292,9 @@ pub unsafe fn report_pending_exception(cx: *mut JSContext, dispatch_event: bool,
         });
     }
 
-    if dispatch_event {
-        GlobalScope::from_context(cx, realm).report_an_error(error_info, value.handle());
-    }
+    // if dispatch_event {
+    //     GlobalScope::from_context(cx, realm).report_an_error(error_info, value.handle());
+    // }
 }
 
 /// Throw an exception to signal that a `JSObject` can not be converted to a

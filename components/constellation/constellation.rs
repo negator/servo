@@ -476,10 +476,10 @@ pub struct Constellation<Message, LTF, STF, SWF> {
     webgl_threads: Option<WebGLThreads>,
 
     /// The XR device registry
-    webxr_registry: webxr_api::Registry,
+    webxr_registry: Option<webxr_api::Registry>,
 
     /// A channel through which messages can be sent to the canvas paint thread.
-    canvas_chan: Sender<ConstellationCanvasMsg>,
+    canvas_chan: IpcSender<ConstellationCanvasMsg>,
 
     ipc_canvas_chan: IpcSender<CanvasMsg>,
 
@@ -559,7 +559,7 @@ pub struct InitialConstellationState {
     pub webgl_threads: Option<WebGLThreads>,
 
     /// The XR device registry
-    pub webxr_registry: webxr_api::Registry,
+    pub webxr_registry: Option<webxr_api::Registry>,
 
     pub glplayer_threads: Option<GLPlayerThreads>,
 
@@ -755,7 +755,7 @@ where
         is_running_problem_test: bool,
         hard_fail: bool,
         enable_canvas_antialiasing: bool,
-        canvas_chan: Sender<ConstellationCanvasMsg>,
+        canvas_chan: IpcSender<ConstellationCanvasMsg>,
         ipc_canvas_chan: IpcSender<CanvasMsg>,
     ) -> Sender<FromCompositorMsg> {
         let (compositor_sender, compositor_receiver) = unbounded();
@@ -2946,7 +2946,7 @@ where
         thread_name: Option<String>,
         entry: LogEntry,
     ) {
-        debug!("Received log entry {:?}.", entry);
+        trace!("Received log entry {:?}.", entry);
         match (entry, top_level_browsing_context_id) {
             (LogEntry::Panic(reason, backtrace), Some(top_level_browsing_context_id)) => {
                 self.handle_panic(top_level_browsing_context_id, reason, Some(backtrace));
@@ -4380,7 +4380,7 @@ where
         size: UntypedSize2D<u64>,
         response_sender: IpcSender<(IpcSender<CanvasMsg>, CanvasId)>,
     ) {
-        let (canvas_id_sender, canvas_id_receiver) = unbounded();
+        let (canvas_id_sender, canvas_id_receiver) = ipc::channel().unwrap();
 
         if let Err(e) = self.canvas_chan.send(ConstellationCanvasMsg::Create {
             id_sender: canvas_id_sender,

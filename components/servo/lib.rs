@@ -120,6 +120,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use surfman::GLApi;
+use tokio_compat::runtime::Runtime;
 use webrender::ShaderPrecacheFlags;
 use webrender_traits::WebrenderExternalImageHandlers;
 use webrender_traits::WebrenderExternalImageRegistry;
@@ -283,6 +284,7 @@ where
     Window: WindowMethods + 'static + ?Sized,
 {
     pub fn new(
+        runtime: &'static Runtime,
         mut embedder: Box<dyn EmbedderMethods>,
         window: Rc<Window>,
         user_agent: Option<String>,
@@ -354,19 +356,13 @@ where
             create_compositor_channel(event_loop_waker.clone());
         let (embedder_proxy, embedder_receiver) = create_embedder_channel(event_loop_waker.clone());
         let time_profiler_chan = profile_time::Profiler::create(
+            runtime,
             &opts.time_profiling,
             opts.time_profiler_trace_path.clone(),
         );
-        let mem_profiler_chan = profile_mem::Profiler::create(opts.mem_profiler_period);
+        let mem_profiler_chan = profile_mem::Profiler::create(runtime, opts.mem_profiler_period);
 
-        let devtools_chan = if opts.devtools_server_enabled {
-            Some(devtools::start_server(
-                opts.devtools_port,
-                embedder_proxy.clone(),
-            ))
-        } else {
-            None
-        };
+        let devtools_chan = None;
 
         let coordinates = window.get_coordinates();
         let device_pixel_ratio = coordinates.hidpi_factor.get();
@@ -380,7 +376,7 @@ where
 
             // Cast from `DeviceIndependentPixel` to `DevicePixel`
             let window_size = Size2D::from_untyped(viewport_size.to_i32().to_untyped());
-
+            let worker = rayon::ThreadPoolBuilder::new().num_threads(1).build();
             webrender::Renderer::new(
                 webrender_gl.clone(),
                 render_notifier,
@@ -397,6 +393,8 @@ where
                     enable_subpixel_aa: opts.enable_subpixel_text_antialiasing,
                     allow_texture_swizzling: pref!(gfx.texture_swizzling.enabled),
                     clear_color: None,
+                    enable_multithreading: false,
+                    workers: Some(Arc::new(worker.unwrap())),
                     ..Default::default()
                 },
                 None,
@@ -433,6 +431,7 @@ where
             image_handler,
             output_handler,
         } = WebGLComm::new(
+            runtime,
             webrender_surfman.clone(),
             webrender_gl.clone(),
             webrender_api.create_sender(),
@@ -450,12 +449,16 @@ where
         }
 
         // Create the WebXR main thread
-        let mut webxr_main_thread =
-            webxr::MainThreadRegistry::new(event_loop_waker, webxr_layer_grand_manager)
-                .expect("Failed to create WebXR device registry");
-        if pref!(dom.webxr.enabled) {
-            embedder.register_webxr(&mut webxr_main_thread, embedder_proxy.clone());
-        }
+        let webxr_main_thread = if pref!(dom.webxr.enabled) {
+            let mut wxr =
+                webxr::MainThreadRegistry::new(event_loop_waker, webxr_layer_grand_manager)
+                    .expect("Failed to create WebXR device registry");
+
+            embedder.register_webxr(&mut wxr, embedder_proxy.clone());
+            Some(wxr)
+        } else {
+            None
+        };
 
         let glplayer_threads = match window.get_gl_context() {
             GlContext::Unknown => None,
@@ -497,6 +500,7 @@ where
         // pipelines, including the script and layout threads, as well
         // as the navigation context.
         let constellation_chan = create_constellation(
+            runtime,
             user_agent,
             opts.config_dir.clone(),
             embedder_proxy,
@@ -506,7 +510,7 @@ where
             devtools_chan,
             webrender_document,
             webrender_api_sender,
-            webxr_main_thread.registry(),
+            webxr_main_thread.as_ref().map(|wx| wx.registry()),
             player_context,
             Some(webgl_threads),
             glplayer_threads,
@@ -858,6 +862,7 @@ fn create_compositor_channel(
 }
 
 fn create_constellation(
+    runtime: &'static Runtime,
     user_agent: Cow<'static, str>,
     config_dir: Option<PathBuf>,
     embedder_proxy: EmbedderProxy,
@@ -867,7 +872,7 @@ fn create_constellation(
     devtools_chan: Option<Sender<devtools_traits::DevtoolsControlMsg>>,
     webrender_document: webrender_api::DocumentId,
     webrender_api_sender: webrender_api::RenderApiSender,
-    webxr_registry: webxr_api::Registry,
+    webxr_registry: Option<webxr_api::Registry>,
     player_context: WindowGLContext,
     webgl_threads: Option<WebGLThreads>,
     glplayer_threads: Option<GLPlayerThreads>,
@@ -883,21 +888,22 @@ fn create_constellation(
         BluetoothThreadFactory::new(embedder_proxy.clone());
 
     let (public_resource_threads, private_resource_threads) = new_resource_threads(
+        runtime,
         user_agent.clone(),
         devtools_chan.clone(),
-        time_profiler_chan.clone(),
-        mem_profiler_chan.clone(),
         embedder_proxy.clone(),
         config_dir,
         opts.certificate_path.clone(),
     );
 
     let font_cache_thread = FontCacheThread::new(
+        runtime,
         public_resource_threads.sender(),
         Box::new(FontCacheWR(compositor_proxy.clone())),
     );
 
     let (canvas_chan, ipc_canvas_chan) = CanvasPaintThread::start(
+        runtime,
         Box::new(CanvasWebrenderApi(compositor_proxy.clone())),
         font_cache_thread.clone(),
     );
@@ -1115,7 +1121,7 @@ fn default_user_agent_string_for(agent: UserAgent) -> &'static str {
     const DESKTOP_UA_STRING: &'static str =
         "Mozilla/5.0 (Windows NT 10.0; rv:78.0) Servo/1.0 Firefox/78.0";
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     const DESKTOP_UA_STRING: &'static str =
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:78.0) Servo/1.0 Firefox/78.0";
 

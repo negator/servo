@@ -12,6 +12,6 @@ path = "lib.rs"
 
 [dependencies]
 embedder_traits = { path = "../embedder_traits" }
-ipc-channel = "0.14"
+ipc-channel = {version = "0.14", features = ["async"]}
 regex = "1.1"
 serde = "1.0"

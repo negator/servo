@@ -3,6 +3,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use crate::resource_thread;
+use futures_util::stream::{ForEach, Next, StreamExt};
+use ipc_channel::asynch::IpcStream;
 use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
 use net_traits::storage_thread::{StorageThreadMsg, StorageType};
 use servo_url::ServoUrl;
@@ -11,42 +13,39 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::thread;
+use tokio_compat::runtime::Runtime;
 
 const QUOTA_SIZE_LIMIT: usize = 5 * 1024 * 1024;
 
 pub trait StorageThreadFactory {
-    fn new(config_dir: Option<PathBuf>) -> Self;
+    fn new(runtime: &Runtime, config_dir: Option<PathBuf>) -> Self;
 }
 
 impl StorageThreadFactory for IpcSender<StorageThreadMsg> {
     /// Create a storage thread
-    fn new(config_dir: Option<PathBuf>) -> IpcSender<StorageThreadMsg> {
+    fn new(runtime: &Runtime, config_dir: Option<PathBuf>) -> IpcSender<StorageThreadMsg> {
         let (chan, port) = ipc::channel().unwrap();
-        thread::Builder::new()
-            .name("StorageManager".to_owned())
-            .spawn(move || {
-                StorageManager::new(port, config_dir).start();
-            })
-            .expect("Thread spawning failed");
+        runtime.spawn_std(async move {
+            let mut manager = StorageManager::new(config_dir);
+            (manager).start(port).await
+        });
         chan
     }
 }
 
 struct StorageManager {
-    port: IpcReceiver<StorageThreadMsg>,
     session_data: HashMap<String, (usize, BTreeMap<String, String>)>,
     local_data: HashMap<String, (usize, BTreeMap<String, String>)>,
     config_dir: Option<PathBuf>,
 }
 
 impl StorageManager {
-    fn new(port: IpcReceiver<StorageThreadMsg>, config_dir: Option<PathBuf>) -> StorageManager {
+    fn new(config_dir: Option<PathBuf>) -> StorageManager {
         let mut local_data = HashMap::new();
         if let Some(ref config_dir) = config_dir {
             resource_thread::read_json_from_file(&mut local_data, config_dir, "local_data.json");
         }
         StorageManager {
-            port: port,
             session_data: HashMap::new(),
             local_data: local_data,
             config_dir: config_dir,
@@ -55,40 +54,43 @@ impl StorageManager {
 }
 
 impl StorageManager {
-    fn start(&mut self) {
-        loop {
-            match self.port.recv().unwrap() {
-                StorageThreadMsg::Length(sender, url, storage_type) => {
-                    self.length(sender, url, storage_type)
-                },
-                StorageThreadMsg::Key(sender, url, storage_type, index) => {
-                    self.key(sender, url, storage_type, index)
-                },
-                StorageThreadMsg::Keys(sender, url, storage_type) => {
-                    self.keys(sender, url, storage_type)
-                },
-                StorageThreadMsg::SetItem(sender, url, storage_type, name, value) => {
-                    self.set_item(sender, url, storage_type, name, value);
-                    self.save_state()
-                },
-                StorageThreadMsg::GetItem(sender, url, storage_type, name) => {
-                    self.request_item(sender, url, storage_type, name)
-                },
-                StorageThreadMsg::RemoveItem(sender, url, storage_type, name) => {
-                    self.remove_item(sender, url, storage_type, name);
-                    self.save_state()
-                },
-                StorageThreadMsg::Clear(sender, url, storage_type) => {
-                    self.clear(sender, url, storage_type);
-                    self.save_state()
-                },
-                StorageThreadMsg::Exit(sender) => {
-                    // Nothing to do since we save localstorage set eagerly.
-                    let _ = sender.send(());
-                    break;
-                },
-            }
-        }
+    async fn start(&mut self, port: IpcReceiver<StorageThreadMsg>) {
+        port.to_stream()
+            .for_each(|msg| {
+                match msg {
+                    Ok(StorageThreadMsg::Length(sender, url, storage_type)) => {
+                        self.length(sender, url, storage_type);
+                    },
+                    Ok(StorageThreadMsg::Key(sender, url, storage_type, index)) => {
+                        self.key(sender, url, storage_type, index);
+                    },
+                    Ok(StorageThreadMsg::Keys(sender, url, storage_type)) => {
+                        self.keys(sender, url, storage_type);
+                    },
+                    Ok(StorageThreadMsg::SetItem(sender, url, storage_type, name, value)) => {
+                        self.set_item(sender, url, storage_type, name, value);
+                        self.save_state();
+                    },
+                    Ok(StorageThreadMsg::GetItem(sender, url, storage_type, name)) => {
+                        self.request_item(sender, url, storage_type, name);
+                    },
+                    Ok(StorageThreadMsg::RemoveItem(sender, url, storage_type, name)) => {
+                        self.remove_item(sender, url, storage_type, name);
+                        self.save_state();
+                    },
+                    Ok(StorageThreadMsg::Clear(sender, url, storage_type)) => {
+                        self.clear(sender, url, storage_type);
+                        self.save_state();
+                    },
+                    Ok(StorageThreadMsg::Exit(sender)) => {
+                        // Nothing to do since we save localstorage set eagerly.
+                        let _ = sender.send(());
+                    },
+                    _ => {},
+                };
+                futures03::future::ready(())
+            })
+            .await
     }
 
     fn save_state(&self) {

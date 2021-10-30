@@ -11,8 +11,6 @@ use crate::geom::flow_relative::{Rect, Sides, Vec2};
 use crate::geom::{LengthOrAuto, LengthPercentageOrAuto};
 use crate::style_ext::{ComputedValuesExt, DisplayInside};
 use crate::{ContainingBlock, DefiniteContainingBlock};
-use rayon::iter::{IntoParallelRefMutIterator, ParallelExtend};
-use rayon_croissant::ParallelIteratorExt;
 use style::computed_values::position::T as Position;
 use style::properties::ComputedValues;
 use style::values::computed::{Length, LengthPercentage};
@@ -381,33 +379,15 @@ impl HoistedAbsolutelyPositionedBox {
         for_nearest_containing_block_for_all_descendants: &mut Vec<HoistedAbsolutelyPositionedBox>,
         containing_block: &DefiniteContainingBlock,
     ) {
-        if layout_context.use_rayon {
-            fragments.par_extend(boxes.par_iter_mut().mapfold_reduce_into(
+        fragments.extend(boxes.iter_mut().map(|box_| {
+            let new_fragment = ArcRefCell::new(Fragment::Box(box_.layout(
+                layout_context,
                 for_nearest_containing_block_for_all_descendants,
-                |for_nearest_containing_block_for_all_descendants, box_| {
-                    let new_fragment = ArcRefCell::new(Fragment::Box(box_.layout(
-                        layout_context,
-                        for_nearest_containing_block_for_all_descendants,
-                        containing_block,
-                    )));
-
-                    box_.fragment.borrow_mut().fragment = Some(new_fragment.clone());
-                    new_fragment
-                },
-                Vec::new,
-                vec_append_owned,
-            ))
-        } else {
-            fragments.extend(boxes.iter_mut().map(|box_| {
-                let new_fragment = ArcRefCell::new(Fragment::Box(box_.layout(
-                    layout_context,
-                    for_nearest_containing_block_for_all_descendants,
-                    containing_block,
-                )));
-                box_.fragment.borrow_mut().fragment = Some(new_fragment.clone());
-                new_fragment
-            }))
-        }
+                containing_block,
+            )));
+            box_.fragment.borrow_mut().fragment = Some(new_fragment.clone());
+            new_fragment
+        }))
     }
 
     pub(crate) fn layout(

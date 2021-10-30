@@ -11,11 +11,15 @@ name = "profile"
 path = "lib.rs"
 
 [dependencies]
-ipc-channel = "0.14"
+futures = "0.3"
+futures-util = { version  = "0.3", features = ["compat"] }
+ipc-channel = {version = "0.14", features = ["async"]}
 profile_traits = { path = "../profile_traits" }
 serde = "1.0"
 serde_json = "1.0"
 servo_config = { path = "../config" }
+tokio-compat = "0.1"
+tokio = {version = "0.3", features = ["time"]}
 
 [target.'cfg(target_os = "macos")'.dependencies]
 task_info = { path = "../../support/rust-task_info" }

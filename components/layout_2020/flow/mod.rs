@@ -21,8 +21,6 @@ use crate::replaced::ReplacedContent;
 use crate::sizing::{self, ContentSizes};
 use crate::style_ext::{ComputedValuesExt, PaddingBorderMargin};
 use crate::ContainingBlock;
-use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
-use rayon_croissant::ParallelIteratorExt;
 use servo_arc::Arc;
 use style::logical_geometry::WritingMode;
 use style::properties::ComputedValues;
@@ -141,13 +139,6 @@ impl BlockContainer {
         writing_mode: WritingMode,
     ) -> ContentSizes {
         match &self {
-            Self::BlockLevelBoxes(boxes) if layout_context.use_rayon => boxes
-                .par_iter()
-                .map(|box_| {
-                    box_.borrow_mut()
-                        .inline_content_sizes(layout_context, writing_mode)
-                })
-                .reduce(ContentSizes::zero, ContentSizes::max),
             Self::BlockLevelBoxes(boxes) => boxes
                 .iter()
                 .map(|box_| {
@@ -240,51 +231,21 @@ fn layout_block_level_children(
         current_block_direction_position: Length::zero(),
     };
     let fragments = positioning_context.adjust_static_positions(tree_rank, |positioning_context| {
-        if float_context.is_some() || !layout_context.use_rayon {
-            // Because floats are involved, we do layout for this block formatting context
-            // in tree order without parallelism. This enables mutable access
-            // to a `FloatContext` that tracks every float encountered so far (again in tree order).
-            child_boxes
-                .iter()
-                .enumerate()
-                .map(|(tree_rank, box_)| {
-                    let mut fragment = box_.borrow_mut().layout(
-                        layout_context,
-                        positioning_context,
-                        containing_block,
-                        tree_rank,
-                        float_context.as_mut().map(|c| &mut **c),
-                    );
-                    place_block_level_fragment(&mut fragment, &mut placement_state);
-                    fragment
-                })
-                .collect()
-        } else {
-            let collects_for_nearest_positioned_ancestor =
-                positioning_context.collects_for_nearest_positioned_ancestor();
-            let mut fragments = child_boxes
-                .par_iter()
-                .enumerate()
-                .mapfold_reduce_into(
+        child_boxes
+            .iter()
+            .enumerate()
+            .map(|(tree_rank, box_)| {
+                let mut fragment = box_.borrow_mut().layout(
+                    layout_context,
                     positioning_context,
-                    |positioning_context, (tree_rank, box_)| {
-                        box_.borrow_mut().layout(
-                            layout_context,
-                            positioning_context,
-                            containing_block,
-                            tree_rank,
-                            /* float_context = */ None,
-                        )
-                    },
-                    || PositioningContext::new_for_rayon(collects_for_nearest_positioned_ancestor),
-                    PositioningContext::append,
-                )
-                .collect();
-            for fragment in &mut fragments {
-                place_block_level_fragment(fragment, &mut placement_state)
-            }
-            fragments
-        }
+                    containing_block,
+                    tree_rank,
+                    float_context.as_mut().map(|c| &mut **c),
+                );
+                place_block_level_fragment(&mut fragment, &mut placement_state);
+                fragment
+            })
+            .collect()
     });
 
     FlowLayout {

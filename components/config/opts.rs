@@ -9,6 +9,7 @@ use euclid::Size2D;
 use getopts::{Matches, Options};
 use servo_geometry::DeviceIndependentPixel;
 use servo_url::ServoUrl;
+use std::collections::HashMap;
 use std::default::Default;
 use std::env;
 use std::fs::{self, File};
@@ -697,6 +698,7 @@ pub fn from_cmdline_args(mut opts: Options, args: &[String]) -> ArgumentParsingR
     });
 
     let url_opt = url_opt.and_then(|url_string| {
+        info!("Parsing url: {:?}", url_string);
         parse_url_or_filename(&cwd, url_string)
             .or_else(|error| {
                 warn!("URL parsing failed ({:?}).", error);
@@ -704,6 +706,8 @@ pub fn from_cmdline_args(mut opts: Options, args: &[String]) -> ArgumentParsingR
             })
             .ok()
     });
+
+    info!("Using url: {:?}", url_opt);
 
     let tile_size: usize = match opt_match.opt_str("s") {
         Some(tile_size_str) => tile_size_str

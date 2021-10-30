@@ -24,10 +24,11 @@ cssparser = "0.29"
 euclid = "0.20"
 font-kit = "0.10"
 fnv = "1.0"
+futures = "0.3"
 gfx = { path = "../gfx" }
 gleam = "0.12"
 half = "1"
-ipc-channel = "0.14"
+ipc-channel = {version = "0.14", features = ["async"]}
 log = "0.4"
 lyon_geom = "0.14"
 num-traits = "0.2"
@@ -44,6 +45,7 @@ surfman = { version = "0.4", features = ["sm-angle","sm-angle-default"] }
 surfman-chains = "0.6"
 surfman-chains-api = "0.2"
 time = { version = "0.1.41", optional = true }
+tokio-compat = "0.1"
 webrender = { git = "https://github.com/servo/webrender" }
 webrender_api = { git = "https://github.com/servo/webrender" }
 webrender_surfman = { path = "../webrender_surfman" }

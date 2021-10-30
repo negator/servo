@@ -6,9 +6,12 @@ license = "MPL-2.0"
 edition = "2018"
 publish = false
 
+[lib]
+name = "simpleservo"
+
 [dependencies]
 getopts = "0.2.11"
-ipc-channel = "0.14"
+ipc-channel = {version = "0.14", features = ["async"]}
 libservo = { path = "../../../components/servo" }
 log = "0.4"
 servo-media = { git = "https://github.com/servo/media" }
@@ -16,10 +19,10 @@ surfman = { version = "0.4", features = ["sm-angle-default"] }
 webxr = { git = "https://github.com/servo/webxr"}
 webxr-api = { git = "https://github.com/servo/webxr", features = ["ipc"] }
 
-[target.'cfg(not(target_os = "macos"))'.dependencies]
+[target.'cfg(not(all(target_os = "macos", target_is = "ios")))'.dependencies]
 libc = "0.2"
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 core-foundation = "0.6"
 
 [target.'cfg(target_os = "windows")'.dependencies]

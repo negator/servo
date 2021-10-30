@@ -255,7 +255,7 @@ impl LiveDOMReferences {
         let capacity = table.capacity();
         let len = table.len();
         if (0 < capacity) && (capacity <= len) {
-            info!("growing refcounted references by {}", len);
+            debug!("growing refcounted references by {}", len);
             remove_nulls(&mut table);
             table.reserve(len);
         }
@@ -284,7 +284,7 @@ fn remove_nulls<K: Eq + Hash + Clone, V>(table: &mut HashMap<K, Weak<V>>) {
         .filter(|&(_, value)| Weak::upgrade(value).is_none())
         .map(|(key, _)| key.clone())
         .collect();
-    info!("removing {} refcounted references", to_remove.len());
+    debug!("removing {} refcounted references", to_remove.len());
     for key in to_remove {
         table.remove(&key);
     }
@@ -293,7 +293,7 @@ fn remove_nulls<K: Eq + Hash + Clone, V>(table: &mut HashMap<K, Weak<V>>) {
 /// A JSTraceDataOp for tracing reflectors held in LIVE_REFERENCES
 #[allow(unrooted_must_root)]
 pub unsafe fn trace_refcounted_objects(tracer: *mut JSTracer) {
-    info!("tracing live refcounted references");
+    debug!("tracing live refcounted references");
     LIVE_REFERENCES.with(|ref r| {
         let r = r.borrow();
         let live_references = r.as_ref().unwrap();

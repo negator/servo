@@ -25,6 +25,8 @@ macro_rules! unreachable_serializable {
 }
 
 pub struct WebGLSender<T>(crossbeam_channel::Sender<T>);
+
+#[derive(Clone)]
 pub struct WebGLReceiver<T>(crossbeam_channel::Receiver<T>);
 
 impl<T> Clone for WebGLSender<T> {

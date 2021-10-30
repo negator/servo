@@ -11,7 +11,7 @@ use net_traits::CookieSource;
 use servo_url::ServoUrl;
 use std::borrow::ToOwned;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use time::{at, now, Duration, Tm};
+use time::{at, now, Duration, Timespec, Tm};
 
 /// A stored cookie that wraps the definition in cookie-rs. This is used to implement
 /// various behaviours defined in the spec that rely on an associated request URL,
@@ -36,6 +36,17 @@ pub struct Cookie {
     )]
     pub last_access: Tm,
     pub expiry_time: Option<Serde<Tm>>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct ExternalCookie {
+    name: String,
+    value: String,
+    domain: Option<String>,
+    path: Option<String>,
+    secure: Option<bool>,
+    httpOnly: Option<bool>,
+    expires: Option<i64>,
 }
 
 impl Cookie {
@@ -137,6 +148,52 @@ impl Cookie {
             last_access: now(),
             expiry_time: expiry_time.map(Serde),
         })
+    }
+
+    pub(crate) fn from_external(cookie: ExternalCookie) -> Cookie {
+        let mut cookiers = cookie_rs::Cookie::build(cookie.name, cookie.value);
+        let mut expiry = now();
+        if let Some(domain) = cookie.domain {
+            cookiers = cookiers.domain(domain);
+        }
+        if let Some(path) = cookie.path {
+            cookiers = cookiers.path(path);
+        }
+        if let Some(secure) = cookie.secure {
+            cookiers = cookiers.secure(secure);
+        }
+        if let Some(http_only) = cookie.httpOnly {
+            cookiers = cookiers.http_only(http_only);
+        }
+        if let Some(mut expires) = cookie.expires {
+            if expires > 1_000_000_000_000 {
+                expires = expires / 1000;
+            }
+            expiry = time::at_utc(Timespec::new(expires, 0));
+            cookiers = cookiers.expires(expiry);
+        }
+
+        let cookiers = cookiers.finish();
+        Cookie {
+            cookie: cookiers,
+            host_only: false,
+            persistent: true,
+            creation_time: now(),
+            last_access: now(),
+            expiry_time: Some(Serde(expiry)),
+        }
+    }
+
+    pub(crate) fn to_external(&self) -> ExternalCookie {
+        ExternalCookie {
+            name: self.cookie.name().to_string(),
+            value: self.cookie.value().to_string(),
+            domain: self.cookie.domain().map(|d| d.to_string()),
+            path: self.cookie.path().map(|d| d.to_string()),
+            secure: self.cookie.secure(),
+            httpOnly: self.cookie.http_only(),
+            expires: self.cookie.expires().map(|t| t.to_timespec().sec),
+        }
     }
 
     pub fn touch(&mut self) {

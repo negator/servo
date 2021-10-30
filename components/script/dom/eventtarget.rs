@@ -386,11 +386,21 @@ impl EventTarget {
 
     pub fn dispatch_event(&self, event: &Event) -> EventStatus {
         if let Some(window) = self.global().downcast::<Window>() {
-            if window.has_document() {
-                assert!(window.Document().can_invoke_script());
+            if window.has_document() && window.Document().can_invoke_script() {
+                return event.dispatch(self, false);
+            } else {
+                warn!(
+                    "Suppressing event dispatch: {:?} due to document",
+                    event.type_()
+                );
             }
-        };
-        event.dispatch(self, false)
+        } else {
+            warn!(
+                "Suppressing event dispatch: {:?} due to window",
+                event.type_()
+            );
+        }
+        EventStatus::Canceled
     }
 
     pub fn remove_all_listeners(&self) {

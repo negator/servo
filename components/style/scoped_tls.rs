@@ -7,7 +7,6 @@
 #![allow(unsafe_code)]
 #![deny(missing_docs)]
 
-use rayon;
 use std::cell::{Ref, RefCell, RefMut};
 use std::ops::DerefMut;
 

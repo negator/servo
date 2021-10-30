@@ -20,6 +20,7 @@ use crate::request::{Request, RequestBuilder};
 use crate::response::{HttpsState, Response, ResponseInit};
 use crate::storage_thread::StorageThreadMsg;
 use cookie::Cookie;
+use futures::channel::mpsc::Sender;
 use headers::{ContentType, HeaderMapExt, ReferrerPolicy as ReferrerPolicyHeader};
 use http::{Error as HttpError, HeaderMap};
 use hyper::Error as HyperError;
@@ -454,7 +455,7 @@ pub enum CoreResourceMsg {
         IpcSender<Vec<Serde<Cookie<'static>>>>,
         CookieSource,
     ),
-    DeleteCookies(ServoUrl),
+    DeleteCookies(ServoUrl),    
     /// Get a history state by a given history state id
     GetHistoryState(HistoryStateId, IpcSender<Option<Vec<u8>>>),
     /// Set a history state for a given history state id

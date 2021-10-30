@@ -24,7 +24,7 @@ fxhash = "0.2"
 gfx = { path = "../gfx" }
 gfx_traits = { path = "../gfx_traits" }
 html5ever = "0.25"
-ipc-channel = "0.14"
+ipc-channel = {version = "0.14", features = ["async"]}
 libc = "0.2"
 log = "0.4"
 mitochondria = "1.1.2"
@@ -32,8 +32,6 @@ msg = { path = "../msg" }
 net_traits = { path = "../net_traits" }
 parking_lot = "0.10"
 range = { path = "../range" }
-rayon = "1"
-rayon_croissant = "0.2.0"
 script_layout_interface = { path = "../script_layout_interface" }
 script_traits = { path = "../script_traits" }
 serde = "1.0"

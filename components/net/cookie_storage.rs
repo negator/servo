@@ -5,9 +5,11 @@
 //! Implementation of cookie storage as specified in
 //! http://tools.ietf.org/html/rfc6265
 
-use crate::cookie::Cookie;
+use crate::cookie::{Cookie, ExternalCookie};
 use net_traits::pub_domains::reg_suffix;
 use net_traits::CookieSource;
+use serde_json::{self, value::Value};
+use servo_config::opts;
 use servo_url::ServoUrl;
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
@@ -29,6 +31,32 @@ impl CookieStorage {
             max_per_host: max_cookies,
         }
     }
+
+    pub(crate) fn new_from_external(max_cookies: usize, cookies: Vec<ExternalCookie>) -> CookieStorage {
+        let mut map: HashMap<String, Vec<Cookie>> = HashMap::new();
+
+        for cookie in cookies {
+            let cookie = Cookie::from_external(cookie);
+            if let Some(domain) = cookie.cookie.domain() {
+                let d = domain.to_string();
+                map.entry(d).or_insert(vec![]).push(cookie);
+            }
+        }
+
+        let mut storage = CookieStorage::new(max_cookies);
+        storage.cookies_map = map;
+        storage
+    }
+
+    pub(crate) fn to_external(&self) -> Vec<ExternalCookie> {
+        let mut list = vec![];
+        for (_, cookies) in &self.cookies_map {            
+            for cookie in cookies {
+                list.push(cookie.to_external());
+            }
+        }
+        list
+    }    
 
     // http://tools.ietf.org/html/rfc6265#section-5.3
     pub fn remove(
@@ -159,14 +187,14 @@ impl CookieStorage {
     // http://tools.ietf.org/html/rfc6265#section-5.4
     pub fn cookies_for_url(&mut self, url: &ServoUrl, source: CookieSource) -> Option<String> {
         let filterer = |c: &&mut Cookie| -> bool {
-            info!(
+            debug!(
                 " === SENT COOKIE : {} {} {:?} {:?}",
                 c.cookie.name(),
                 c.cookie.value(),
                 c.cookie.domain(),
                 c.cookie.path()
             );
-            info!(
+            debug!(
                 " === SENT COOKIE RESULT {}",
                 c.appropriate_for_url(url, source)
             );
@@ -194,7 +222,7 @@ impl CookieStorage {
         };
         let result = url_cookies.iter_mut().fold("".to_owned(), reducer);
 
-        info!(" === COOKIES SENT: {}", result);
+        debug!(" === COOKIES SENT: {}", result);
         match result.len() {
             0 => None,
             _ => Some(result),

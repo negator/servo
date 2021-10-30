@@ -5,6 +5,7 @@
 //! Memory profiling functions.
 
 use crate::time::duration_from_seconds;
+use futures_util::StreamExt;
 use ipc_channel::ipc::{self, IpcReceiver};
 use ipc_channel::router::ROUTER;
 use profile_traits::mem::ReportsChan;
@@ -14,11 +15,10 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::thread;
 use std::time::Instant;
+use tokio::time::sleep;
+use tokio_compat::runtime::Runtime;
 
 pub struct Profiler {
-    /// The port through which messages are received.
-    pub port: IpcReceiver<ProfilerMsg>,
-
     /// Registered memory reporters.
     reporters: HashMap<String, Reporter>,
 
@@ -30,32 +30,28 @@ const JEMALLOC_HEAP_ALLOCATED_STR: &'static str = "jemalloc-heap-allocated";
 const SYSTEM_HEAP_ALLOCATED_STR: &'static str = "system-heap-allocated";
 
 impl Profiler {
-    pub fn create(period: Option<f64>) -> ProfilerChan {
+    pub fn create(runtime: &Runtime, period: Option<f64>) -> ProfilerChan {
         let (chan, port) = ipc::channel().unwrap();
 
         // Create the timer thread if a period was provided.
         if let Some(period) = period {
             let chan = chan.clone();
-            thread::Builder::new()
-                .name("MemoryProfTimer".to_owned())
-                .spawn(move || loop {
-                    thread::sleep(duration_from_seconds(period));
+            runtime.spawn_std(async move {
+                loop {
+                    sleep(duration_from_seconds(period)).await;
                     if chan.send(ProfilerMsg::Print).is_err() {
-                        break;
+                        return;
                     }
-                })
-                .expect("Thread spawning failed");
+                }
+            });
         }
 
         // Always spawn the memory profiler. If there is no timer thread it won't receive regular
         // `Print` events, but it will still receive the other events.
-        thread::Builder::new()
-            .name("MemoryProfiler".to_owned())
-            .spawn(move || {
-                let mut mem_profiler = Profiler::new(port);
-                mem_profiler.start();
-            })
-            .expect("Thread spawning failed");
+        runtime.spawn_std(async move {
+            let mut mem_profiler = Profiler::new();
+            mem_profiler.start(port).await
+        });
 
         let mem_profiler_chan = ProfilerChan(chan);
 
@@ -78,20 +74,24 @@ impl Profiler {
         mem_profiler_chan
     }
 
-    pub fn new(port: IpcReceiver<ProfilerMsg>) -> Profiler {
+    pub fn new() -> Profiler {
         Profiler {
-            port: port,
             reporters: HashMap::new(),
             created: Instant::now(),
         }
     }
 
-    pub fn start(&mut self) {
-        while let Ok(msg) = self.port.recv() {
-            if !self.handle_msg(msg) {
-                break;
-            }
-        }
+    pub async fn start(&mut self, port: IpcReceiver<ProfilerMsg>) {
+        use futures_util::stream::StreamExt;
+        port.to_stream()
+            .for_each(|msg| match msg {
+                Ok(msg) => {
+                    self.handle_msg(msg);
+                    futures::future::ready(())
+                },
+                _ => futures::future::ready(()),
+            })
+            .await;
     }
 
     fn handle_msg(&mut self, msg: ProfilerMsg) -> bool {
@@ -492,57 +492,6 @@ mod system_reporter {
         None
     }
 
-    #[cfg(not(target_os = "windows"))]
-    use servo_allocator::jemalloc_sys::mallctl;
-
-    #[cfg(not(target_os = "windows"))]
-    fn jemalloc_stat(value_name: &str) -> Option<usize> {
-        // Before we request the measurement of interest, we first send an "epoch"
-        // request. Without that jemalloc gives cached statistics(!) which can be
-        // highly inaccurate.
-        let epoch_name = "epoch";
-        let epoch_c_name = CString::new(epoch_name).unwrap();
-        let mut epoch: u64 = 0;
-        let epoch_ptr = &mut epoch as *mut _ as *mut c_void;
-        let mut epoch_len = size_of::<u64>() as size_t;
-
-        let value_c_name = CString::new(value_name).unwrap();
-        let mut value: size_t = 0;
-        let value_ptr = &mut value as *mut _ as *mut c_void;
-        let mut value_len = size_of::<size_t>() as size_t;
-
-        // Using the same values for the `old` and `new` parameters is enough
-        // to get the statistics updated.
-        let rv = unsafe {
-            mallctl(
-                epoch_c_name.as_ptr(),
-                epoch_ptr,
-                &mut epoch_len,
-                epoch_ptr,
-                epoch_len,
-            )
-        };
-        if rv != 0 {
-            return None;
-        }
-
-        let rv = unsafe {
-            mallctl(
-                value_c_name.as_ptr(),
-                value_ptr,
-                &mut value_len,
-                null_mut(),
-                0,
-            )
-        };
-        if rv != 0 {
-            return None;
-        }
-
-        Some(value as usize)
-    }
-
-    #[cfg(target_os = "windows")]
     fn jemalloc_stat(_value_name: &str) -> Option<usize> {
         None
     }

@@ -20,6 +20,7 @@ use surfman::SurfaceTexture;
 use surfman_chains::SwapChains;
 use surfman_chains_api::SwapChainAPI;
 use surfman_chains_api::SwapChainsAPI;
+use tokio_compat::runtime::Runtime;
 use webrender_surfman::WebrenderSurfman;
 use webrender_traits::{
     WebrenderExternalImageApi, WebrenderExternalImageRegistry, WebrenderImageSource,
@@ -37,6 +38,7 @@ pub struct WebGLComm {
 impl WebGLComm {
     /// Creates a new `WebGLComm` object.
     pub fn new(
+        runtime: &Runtime,
         surfman: WebrenderSurfman,
         webrender_gl: Rc<dyn gleam::gl::Gl>,
         webrender_api_sender: webrender_api::RenderApiSender,
@@ -72,7 +74,7 @@ impl WebGLComm {
 
         let external = WebGLExternalImages::new(surfman, webrender_swap_chains);
 
-        WebGLThread::run_on_own_thread(init);
+        WebGLThread::run_on_own_thread(runtime, init);
 
         WebGLComm {
             webgl_threads: WebGLThreads(sender),

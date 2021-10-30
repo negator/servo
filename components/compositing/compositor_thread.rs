@@ -194,5 +194,5 @@ pub struct InitialCompositorState {
     pub webrender_api: webrender_api::RenderApi,
     pub webrender_surfman: WebrenderSurfman,
     pub webrender_gl: Rc<dyn gleam::gl::Gl>,
-    pub webxr_main_thread: webxr::MainThreadRegistry,
+    pub webxr_main_thread: Option<webxr::MainThreadRegistry>,
 }

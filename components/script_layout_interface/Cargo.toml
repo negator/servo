@@ -19,7 +19,7 @@ euclid = "0.20"
 fxhash = "0.2"
 gfx_traits = { path = "../gfx_traits" }
 html5ever = "0.25"
-ipc-channel = "0.14"
+ipc-channel = {version = "0.14", features = ["async"]}
 libc = "0.2"
 malloc_size_of = { path = "../malloc_size_of" }
 malloc_size_of_derive = "0.1"

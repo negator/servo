@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+#![allow(unsafe_code)]
+
 use crate::webgl_limits::GLLimitsDetect;
 use byteorder::{ByteOrder, NativeEndian, WriteBytesExt};
 use canvas_traits::webgl;
@@ -70,6 +72,7 @@ use surfman::SurfaceInfo;
 use surfman::SurfaceType;
 use surfman_chains::SwapChains;
 use surfman_chains_api::SwapChainsAPI;
+use tokio_compat::runtime::Runtime;
 use webrender_traits::{WebrenderExternalImageRegistry, WebrenderImageHandlerType};
 use webxr::SurfmanGL as WebXRSurfman;
 use webxr_api::ContextId as WebXRContextId;
@@ -245,7 +248,7 @@ pub(crate) struct WebGLThread {
     /// We use it to get an unique ID for new WebGLContexts.
     external_images: Arc<Mutex<WebrenderExternalImageRegistry>>,
     /// The receiver that will be used for processing WebGL messages.
-    receiver: crossbeam_channel::Receiver<WebGLMsg>,
+    receiver: WebGLReceiver<WebGLMsg>,
     /// The receiver that should be used to send WebGL messages for processing.
     sender: WebGLSender<WebGLMsg>,
     /// The swap chains used by webrender
@@ -255,6 +258,8 @@ pub(crate) struct WebGLThread {
     /// The bridge to WebXR
     pub webxr_bridge: WebXRBridge,
 }
+
+unsafe impl Send for WebGLThread {}
 
 /// The data required to initialize an instance of the WebGLThread type.
 pub(crate) struct WebGLThreadInit {
@@ -301,7 +306,7 @@ impl WebGLThread {
             dom_outputs: Default::default(),
             external_images,
             sender,
-            receiver: receiver.into_inner(),
+            receiver: receiver,
             webrender_swap_chains,
             api_type,
             webxr_bridge: WebXRBridge::new(webxr_init),
@@ -310,19 +315,20 @@ impl WebGLThread {
 
     /// Perform all initialization required to run an instance of WebGLThread
     /// in parallel on its own dedicated thread.
-    pub(crate) fn run_on_own_thread(init: WebGLThreadInit) {
-        thread::Builder::new()
-            .name("WebGL".to_owned())
-            .spawn(move || {
-                let mut data = WebGLThread::new(init);
-                data.process();
-            })
-            .expect("Thread spawning failed");
+    pub(crate) fn run_on_own_thread(runtime: &Runtime, init: WebGLThreadInit) {
+        runtime.spawn_std(async move {
+            let mut data = WebGLThread::new(init);
+            data.process().await;
+        });
     }
 
-    fn process(&mut self) {
+    async fn process(&mut self) {
+        use futures::StreamExt;
+
         let webgl_chan = WebGLChan(self.sender.clone());
-        while let Ok(msg) = self.receiver.recv() {
+        let ipc = self.receiver.to_ipc();
+        let mut stream = ipc.to_stream();
+        while let Some(Ok(msg)) = stream.next().await {
             let exit = self.handle_msg(msg, &webgl_chan);
             if exit {
                 // Call remove_context functions in order to correctly delete WebRender image keys.
