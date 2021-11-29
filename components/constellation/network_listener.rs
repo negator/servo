@@ -92,12 +92,26 @@ impl NetworkListener {
 
     fn check_redirect(&mut self, message: Result<FetchMetadata, NetworkError>) {
         match message {
-            Ok(res_metadata) => {
-                let metadata = match res_metadata {
-                    FetchMetadata::Filtered { ref unsafe_, .. } => unsafe_,
-                    FetchMetadata::Unfiltered(ref m) => m,
-                };
+            Ok(res_metadata) => {                
+                // preserve URI fragment if the Location value doesn't have a fragment component            
+                // https://www.rfc-editor.org/rfc/rfc7231#section-7.1.2
+                let fragment = self.request_builder.url.fragment();
 
+                let (res_metadata, metadata) = match res_metadata {
+                    FetchMetadata::Filtered { unsafe_, filtered } => {
+                        let mut metadata = unsafe_.clone();
+                        let fragment = unsafe_.final_url.fragment().or(fragment);
+                        metadata.final_url.set_fragment(fragment);
+                        (FetchMetadata::Filtered{ filtered: filtered, unsafe_: metadata.clone()}, metadata)
+                    },
+                    FetchMetadata::Unfiltered(m) => {
+                        let mut metadata = m.clone();
+                        let fragment = m.final_url.fragment().or(fragment);
+                        metadata.final_url.set_fragment(fragment);
+                        (FetchMetadata::Unfiltered(metadata.clone()), metadata)
+                    },
+                };
+                
                 match metadata.location_url {
                     // https://html.spec.whatwg.org/multipage/#process-a-navigate-fetch
                     // Step 7-4.
