@@ -51,7 +51,7 @@ fn expand_dom_object(input: syn::DeriveInput) -> proc_macro2::TokenStream {
         }
 
         impl #impl_generics crate::dom::bindings::reflector::DomObject for #name #ty_generics #where_clause {
-            #[inline]
+            // #[inline]
             fn reflector(&self) -> &crate::dom::bindings::reflector::Reflector {
                 self.#first_field_name.reflector()
             }

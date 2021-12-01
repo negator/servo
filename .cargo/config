@@ -36,3 +36,12 @@ linker = "lld-link.exe"
 
 [target.aarch64-uwp-windows-msvc]
 linker = "lld-link.exe"
+
+[target.aarch64-apple-ios]
+rustflags = [
+	"-C", "inline-threshold=0",
+	"-C", "debuginfo=0",
+	"-C", "default-linker-libraries=no",
+	"-C", "force-unwind-tables=no",
+	"-C", "link-dead-code=no",
+]

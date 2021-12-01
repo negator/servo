@@ -2703,7 +2703,8 @@ class CGAbstractMethod(CGThing):
         self.name = name
         self.returnType = returnType
         self.args = args
-        self.alwaysInline = alwaysInline
+        # self.alwaysInline = alwaysInline
+        self.alwaysInline = False
         self.extern = extern
         self.unsafe = extern or unsafe
         self.templateArgs = templateArgs
@@ -4589,7 +4590,7 @@ class CGEnum(CGThing):
         ident = enum.identifier.name
         decl = """\
 #[repr(usize)]
-#[derive(Copy, Clone, Debug, JSTraceable, MallocSizeOf, PartialEq)]
+#[derive(Copy, Clone, JSTraceable, MallocSizeOf, PartialEq)]
 pub enum %s {
     %s
 }
@@ -8087,7 +8088,7 @@ impl Clone for TopTypeId {
             if config.getDescriptor(base).concrete:
                 variants.append(CGGeneric(base))
             variants += [CGGeneric(type_id_variant(derivedName)) for derivedName in derived]
-            derives = "Clone, Copy, Debug, PartialEq"
+            derives = "Clone, Copy, PartialEq"
             typeIdCode.append(CGWrapper(CGIndenter(CGList(variants, ",\n"), 4),
                                         pre="#[derive(%s)]\npub enum %sTypeId {\n" % (derives, base),
                                         post="\n}\n\n"))

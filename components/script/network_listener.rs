@@ -40,7 +40,7 @@ pub fn submit_timing<T: ResourceTimingListener + FetchResponseListener>(listener
 
     let (initiator_type, url) = listener.resource_timing_information();
     if initiator_type == InitiatorType::Other {
-        warn!("Ignoring InitiatorType::Other resource {:?}", url);
+        warn!("Ignoring InitiatorType::Other resource {:?}", url.as_str());
         return;
     }
 

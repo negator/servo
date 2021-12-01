@@ -492,57 +492,6 @@ mod system_reporter {
         None
     }
 
-    #[cfg(not(target_os = "windows"))]
-    use servo_allocator::jemalloc_sys::mallctl;
-
-    #[cfg(not(target_os = "windows"))]
-    fn jemalloc_stat(value_name: &str) -> Option<usize> {
-        // Before we request the measurement of interest, we first send an "epoch"
-        // request. Without that jemalloc gives cached statistics(!) which can be
-        // highly inaccurate.
-        let epoch_name = "epoch";
-        let epoch_c_name = CString::new(epoch_name).unwrap();
-        let mut epoch: u64 = 0;
-        let epoch_ptr = &mut epoch as *mut _ as *mut c_void;
-        let mut epoch_len = size_of::<u64>() as size_t;
-
-        let value_c_name = CString::new(value_name).unwrap();
-        let mut value: size_t = 0;
-        let value_ptr = &mut value as *mut _ as *mut c_void;
-        let mut value_len = size_of::<size_t>() as size_t;
-
-        // Using the same values for the `old` and `new` parameters is enough
-        // to get the statistics updated.
-        let rv = unsafe {
-            mallctl(
-                epoch_c_name.as_ptr(),
-                epoch_ptr,
-                &mut epoch_len,
-                epoch_ptr,
-                epoch_len,
-            )
-        };
-        if rv != 0 {
-            return None;
-        }
-
-        let rv = unsafe {
-            mallctl(
-                value_c_name.as_ptr(),
-                value_ptr,
-                &mut value_len,
-                null_mut(),
-                0,
-            )
-        };
-        if rv != 0 {
-            return None;
-        }
-
-        Some(value as usize)
-    }
-
-    #[cfg(target_os = "windows")]
     fn jemalloc_stat(_value_name: &str) -> Option<usize> {
         None
     }

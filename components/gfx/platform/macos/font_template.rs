@@ -182,9 +182,17 @@ impl FontTemplateData {
     }
 
     /// Returns the native font that underlies this font template, if applicable.
-    pub fn native_font(&self) -> Option<NativeFontHandle> {
+    #[cfg(target_os = "macos")]
+    pub fn native_font(&self) -> Option<NativeFontHandle> {        
         self.ctfont(0.0)
             .map(|ctfont| NativeFontHandle(ctfont.copy_to_CGFont()))
+    }
+
+    /// The webrender::NativeFontHandle is available only for macos, but not e.g. ios or WatchOS
+    /// https://github.com/servo/webrender/blob/75aa8444754675870e3974b83574eb9da7bcf812/webrender_api/src/font.rs#L208-L210
+    #[cfg(not(target_os = "macos"))]
+    pub fn native_font(&self) -> Option<NativeFontHandle> {        
+        None
     }
 }
 

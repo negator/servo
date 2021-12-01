@@ -18,7 +18,7 @@ app_units = "0.7"
 bitflags = "1.0"
 euclid = "0.20"
 fnv = "1.0"
-fontsan = { git = "https://github.com/servo/fontsan" }
+#fontsan = { git = "https://github.com/servo/fontsan"}
 gfx_traits = { path = "../gfx_traits" }
 harfbuzz-sys = "0.5"
 ipc-channel = "0.14"
@@ -41,7 +41,7 @@ unicode-script = "0.5"
 webrender_api = { git = "https://github.com/servo/webrender" }
 xi-unicode = "0.1.0"
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 byteorder = "1.0"
 core-foundation = "0.9"
 core-graphics = "0.22"

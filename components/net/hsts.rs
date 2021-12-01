@@ -196,10 +196,10 @@ impl HstsList {
                 if let Some(entry) =
                     HstsEntry::new(host.to_owned(), include_subdomains, Some(header.max_age))
                 {
-                    info!("adding host {} to the strict transport security list", host);
-                    info!("- max-age {}", header.max_age);
+                    debug!("adding host {} to the strict transport security list", host);
+                    debug!("- max-age {}", header.max_age);
                     if header.include_subdomains {
-                        info!("- includeSubdomains");
+                        debug!("- includeSubdomains");
                     }
 
                     self.push(entry);

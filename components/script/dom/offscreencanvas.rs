@@ -152,9 +152,9 @@ impl OffscreenCanvasMethods for OffscreenCanvas {
         _options: HandleValue,
     ) -> Option<OffscreenRenderingContext> {
         match &*id {
-            "2d" => self
-                .get_or_init_2d_context()
-                .map(OffscreenRenderingContext::OffscreenCanvasRenderingContext2D),
+            // "2d" => self
+            //     .get_or_init_2d_context()
+            //     .map(OffscreenRenderingContext::OffscreenCanvasRenderingContext2D),
             /*"webgl" | "experimental-webgl" => self
                 .get_or_init_webgl_context(cx, options)
                 .map(OffscreenRenderingContext::WebGLRenderingContext),

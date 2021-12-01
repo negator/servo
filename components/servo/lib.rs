@@ -397,6 +397,7 @@ where
                     enable_subpixel_aa: opts.enable_subpixel_text_antialiasing,
                     allow_texture_swizzling: pref!(gfx.texture_swizzling.enabled),
                     clear_color: None,
+                    enable_multithreading: false,
                     ..Default::default()
                 },
                 None,
@@ -1115,7 +1116,7 @@ fn default_user_agent_string_for(agent: UserAgent) -> &'static str {
     const DESKTOP_UA_STRING: &'static str =
         "Mozilla/5.0 (Windows NT 10.0; rv:78.0) Servo/1.0 Firefox/78.0";
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     const DESKTOP_UA_STRING: &'static str =
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:78.0) Servo/1.0 Firefox/78.0";
 

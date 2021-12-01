@@ -132,10 +132,14 @@ pub fn content_process_sandbox_profile() {
     process::exit(1);
 }
 
-#[cfg(any(
-    target_os = "android",
-    target_arch = "arm",
-    all(target_arch = "aarch64", not(target_os = "windows"))
+#[cfg(all(
+    not(target_os = "ios"),
+    not(target_os = "windows"),
+    any(
+        target_os = "android",
+        target_arch = "arm",
+        all(target_arch = "aarch64")
+    )
 ))]
 pub fn spawn_multiprocess(content: UnprivilegedContent) -> Result<(), Error> {
     use ipc_channel::ipc::{IpcOneShotServer, IpcSender};

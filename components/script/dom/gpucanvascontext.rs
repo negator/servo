@@ -149,7 +149,8 @@ impl GPUCanvasContextMethods for GPUCanvasContext {
             format: match descriptor.format {
                 GPUTextureFormat::Rgba8unorm => webrender_api::ImageFormat::RGBA8,
                 GPUTextureFormat::Bgra8unorm => webrender_api::ImageFormat::BGRA8,
-                _ => panic!("SwapChain format({:?}) not supported", descriptor.format),
+                // _ => panic!("SwapChain format({:?}) not supported", descriptor.format),
+                _ => panic!("SwapChain format not supported"),
             },
             size: webrender_api::units::DeviceIntSize::new(
                 self.size.get().width as i32,
