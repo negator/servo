@@ -49,14 +49,14 @@ use servo_url::{ImmutableOrigin, ServoUrl};
 use std::borrow::{Cow, ToOwned};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::BufWriter;
 use std::io::prelude::*;
+use std::io::BufWriter;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
-use tokio_compat::runtime::Runtime;
+use tokio::runtime::Runtime;
 
 /// Returns a tuple of (public, private) senders to the new threads.
 pub fn new_resource_threads(
@@ -94,7 +94,7 @@ pub fn new_core_resource_thread(
     let (public_setup_chan, public_setup_port) = ipc::channel().unwrap();
     let (private_setup_chan, private_setup_port) = ipc::channel().unwrap();
 
-    runtime.spawn_std(async move {
+    runtime.spawn(async move {
         let resource_manager = CoreResourceManager::new(
             user_agent,
             devtools_chan,
@@ -106,14 +106,10 @@ pub fn new_core_resource_thread(
             resource_manager,
             config_dir,
             certificate_path,
-        };        
-        
+        };
+
         channel_manager
-            .start(
-                runtime,                
-                public_setup_port,
-                private_setup_port,
-            )
+            .start(runtime, public_setup_port, private_setup_port)
             .await
     });
     (public_setup_chan, private_setup_chan)
@@ -126,8 +122,8 @@ struct ResourceChannelManager {
 }
 
 fn create_http_states(
-    runtime: &Runtime,
-    config_dir: Option<&Path>,    
+    runtime: &'static Runtime,
+    config_dir: Option<&Path>,
     certificate_path: Option<String>,
 ) -> Arc<HttpState> {
     let mut hsts_list = HstsList::from_servo_preload();
@@ -140,7 +136,7 @@ fn create_http_states(
         read_json_from_file(&mut external_cookies, config_dir, "cookie_jar.json");
     }
 
-    let mut cookie_jar = CookieStorage::new_from_external(150, external_cookies);
+    let cookie_jar = CookieStorage::new_from_external(150, external_cookies);
 
     let certs = match certificate_path {
         Some(ref path) => fs::read_to_string(path).expect("Couldn't not find certificate file"),
@@ -158,13 +154,13 @@ fn create_http_states(
         http_cache: RwLock::new(http_cache),
         http_cache_state: Mutex::new(HashMap::new()),
         client: create_http_client(
+            runtime,
             create_tls_config(
                 &certs,
                 ALPN_H2_H1,
                 extra_certs.clone(),
                 connection_certs.clone(),
-            ),
-            runtime.executor(),
+            ),            
         ),
         extra_certs,
         connection_certs,
@@ -177,18 +173,18 @@ impl ResourceChannelManager {
     #[allow(unsafe_code)]
     async fn start(
         &mut self,
-        runtime: &'static Runtime,        
+        runtime: &'static Runtime,
         public_receiver: IpcReceiver<CoreResourceMsg>,
         private_receiver: IpcReceiver<CoreResourceMsg>,
     ) {
         let public_http_state = create_http_states(
-            runtime,        
+            runtime,
             self.config_dir.as_ref().map(Deref::deref),
             self.certificate_path.clone(),
         );
 
         let mut stream =
-            futures03::stream::select(public_receiver.to_stream(), private_receiver.to_stream());
+            futures::stream::select(public_receiver.to_stream(), private_receiver.to_stream());
         while let Ok(msg) = stream.select_next_some().await {
             self.process_msg(runtime, msg, &public_http_state).await;
         }
@@ -231,7 +227,7 @@ impl ResourceChannelManager {
                     .clear_storage(&request);
                 self.persist_cookies(http_state);
                 return true;
-            },            
+            },
             CoreResourceMsg::FetchRedirect(req_init, res_init, sender, cancel_chan) => {
                 self.resource_manager
                     .fetch(
@@ -444,9 +440,6 @@ impl CoreResourceManager {
         // blocks until all workers in the pool are done,
         // or a short timeout has been reached.
 
-        // Shut-down the async runtime used by websocket workers.
-        drop(WS_HANDLE.lock().unwrap().take());
-
         debug!("Exited CoreResourceManager");
     }
 
@@ -505,7 +498,6 @@ impl CoreResourceManager {
             },
             _ => (FileTokenCheck::NotRequired, None),
         };
-
         // XXXManishearth: Check origin against pipeline id (also ensure that the mode is allowed)
         // todo load context / mimesniff in fetch
         // todo referrer policy?

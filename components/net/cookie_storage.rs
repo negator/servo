@@ -32,7 +32,10 @@ impl CookieStorage {
         }
     }
 
-    pub(crate) fn new_from_external(max_cookies: usize, cookies: Vec<ExternalCookie>) -> CookieStorage {
+    pub(crate) fn new_from_external(
+        max_cookies: usize,
+        cookies: Vec<ExternalCookie>,
+    ) -> CookieStorage {
         let mut map: HashMap<String, Vec<Cookie>> = HashMap::new();
 
         for cookie in cookies {
@@ -50,13 +53,13 @@ impl CookieStorage {
 
     pub(crate) fn to_external(&self) -> Vec<ExternalCookie> {
         let mut list = vec![];
-        for (_, cookies) in &self.cookies_map {            
+        for (_, cookies) in &self.cookies_map {
             for cookie in cookies {
                 list.push(cookie.to_external());
             }
         }
         list
-    }    
+    }
 
     // http://tools.ietf.org/html/rfc6265#section-5.3
     pub fn remove(

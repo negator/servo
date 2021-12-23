@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::thread;
-use tokio_compat::runtime::Runtime;
+use tokio::runtime::Runtime;
 
 const QUOTA_SIZE_LIMIT: usize = 5 * 1024 * 1024;
 
@@ -25,7 +25,7 @@ impl StorageThreadFactory for IpcSender<StorageThreadMsg> {
     /// Create a storage thread
     fn new(runtime: &Runtime, config_dir: Option<PathBuf>) -> IpcSender<StorageThreadMsg> {
         let (chan, port) = ipc::channel().unwrap();
-        runtime.spawn_std(async move {
+        runtime.spawn(async move {
             let mut manager = StorageManager::new(config_dir);
             (manager).start(port).await
         });
@@ -88,7 +88,7 @@ impl StorageManager {
                     },
                     _ => {},
                 };
-                futures03::future::ready(())
+                futures::future::ready(())
             })
             .await
     }

@@ -120,7 +120,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use surfman::GLApi;
-use tokio_compat::runtime::Runtime;
+use tokio::runtime::Runtime;
 use webrender::ShaderPrecacheFlags;
 use webrender_traits::WebrenderExternalImageHandlers;
 use webrender_traits::WebrenderExternalImageRegistry;

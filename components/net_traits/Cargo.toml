@@ -17,9 +17,9 @@ content-security-policy = { version = "0.4.0", features = ["serde"] }
 cookie = "0.11"
 embedder_traits = { path = "../embedder_traits" }
 futures = "0.3"
-headers = "0.2"
-http = "0.1"
-hyper = "0.12"
+headers = "0.3"
+http = "0.2"
+hyper = "0.14"
 hyper_serde = "0.11"
 ipc-channel = {version = "0.14", features = ["async"]}
 lazy_static = "1"
@@ -36,7 +36,6 @@ serde = "1.0"
 servo_arc = { path = "../servo_arc" }
 servo_rand = { path = "../rand" }
 servo_url = { path = "../url" }
-tokio-compat = "0.1"
 time = "0.1"
 url = "2.0"
 uuid = { version = "0.8", features = ["v4", "serde"] }

@@ -2,7 +2,6 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use crossbeam_channel::unbounded;
 use http::header::{HeaderValue, EXPIRES};
 use http::StatusCode;
 use msg::constellation_msg::TEST_PIPELINE_ID;
@@ -11,6 +10,7 @@ use net_traits::request::{Origin, Referrer, Request};
 use net_traits::response::{HttpsState, Response, ResponseBody};
 use net_traits::{ResourceFetchTiming, ResourceTimingType};
 use servo_url::ServoUrl;
+use tokio::sync::mpsc::unbounded_channel as unbounded;
 
 #[test]
 fn test_refreshing_resource_sets_done_chan_the_appropriate_value() {

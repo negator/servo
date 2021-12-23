@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::thread;
 use std::time::Instant;
 use tokio::time::sleep;
-use tokio_compat::runtime::Runtime;
+use tokio::runtime::Runtime;
 
 pub struct Profiler {
     /// Registered memory reporters.
@@ -36,7 +36,7 @@ impl Profiler {
         // Create the timer thread if a period was provided.
         if let Some(period) = period {
             let chan = chan.clone();
-            runtime.spawn_std(async move {
+            runtime.spawn(async move {
                 loop {
                     sleep(duration_from_seconds(period)).await;
                     if chan.send(ProfilerMsg::Print).is_err() {
@@ -48,7 +48,7 @@ impl Profiler {
 
         // Always spawn the memory profiler. If there is no timer thread it won't receive regular
         // `Print` events, but it will still receive the other events.
-        runtime.spawn_std(async move {
+        runtime.spawn(async move {
             let mut mem_profiler = Profiler::new();
             mem_profiler.start(port).await
         });

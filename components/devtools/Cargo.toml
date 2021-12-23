@@ -14,9 +14,9 @@ path = "lib.rs"
 crossbeam-channel = "0.4"
 devtools_traits = { path = "../devtools_traits" }
 embedder_traits = { path = "../embedder_traits" }
-headers = "0.2"
-http = "0.1"
-hyper = "0.12"
+headers = "0.3"
+http = "0.2"
+hyper = "0.14"
 ipc-channel = {version = "0.14", features = ["async"]}
 log = "0.4"
 msg = { path = "../msg" }

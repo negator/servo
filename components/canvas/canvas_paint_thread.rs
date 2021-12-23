@@ -16,7 +16,7 @@ use gfx::font_cache_thread::FontCacheThread;
 use ipc_channel::ipc::{self, IpcSender};
 use std::collections::HashMap;
 use std::thread;
-use tokio_compat::runtime::Runtime;
+use tokio::runtime::Runtime;
 use webrender_api::{ImageData, ImageDescriptor, ImageKey};
 
 pub enum AntialiasMode {
@@ -70,7 +70,7 @@ impl<'a> CanvasPaintThread<'a> {
             ipc::channel::<ConstellationCanvasMsg>().unwrap();
         let (create_sender, create_receiver) = ipc::channel::<CanvasMsg>().unwrap();
 
-        runtime.spawn_std(async move {
+        runtime.spawn(async move {
             let mut canvas_paint_thread = CanvasPaintThread::new(webrender_api, font_cache_thread);
 
             let mut canvas = canvas_recv.to_stream();

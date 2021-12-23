@@ -22,7 +22,7 @@ use std::sync::Mutex;
 use std::env;
 use std::mem;
 use std::rc::Rc;
-use tokio_compat::runtime::{Runtime, Builder};
+use tokio::runtime::{Runtime, Builder};
 use webxr::glwindow::GlWindowDiscovery;
 
 thread_local! {

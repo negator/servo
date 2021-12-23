@@ -22,9 +22,9 @@ use crate::storage_thread::StorageThreadMsg;
 use cookie::Cookie;
 use futures::channel::mpsc::Sender;
 use headers::{ContentType, HeaderMapExt, ReferrerPolicy as ReferrerPolicyHeader};
+use http::StatusCode;
 use http::{Error as HttpError, HeaderMap};
 use hyper::Error as HyperError;
-use hyper::StatusCode;
 use hyper_serde::Serde;
 use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
 use ipc_channel::router::ROUTER;
@@ -455,7 +455,7 @@ pub enum CoreResourceMsg {
         IpcSender<Vec<Serde<Cookie<'static>>>>,
         CookieSource,
     ),
-    DeleteCookies(ServoUrl),    
+    DeleteCookies(ServoUrl),
     /// Get a history state by a given history state id
     GetHistoryState(HistoryStateId, IpcSender<Option<Vec<u8>>>),
     /// Set a history state for a given history state id
@@ -760,7 +760,7 @@ pub enum NetworkError {
 impl NetworkError {
     pub fn from_hyper_error(error: &HyperError, cert_bytes: Option<Vec<u8>>) -> Self {
         let s = error.to_string();
-        if s.contains("the handshake failed") {
+        if s.to_lowercase().contains("ssl") {
             NetworkError::SslValidation(s, cert_bytes.unwrap_or_default())
         } else {
             NetworkError::Internal(s)

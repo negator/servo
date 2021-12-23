@@ -5,7 +5,9 @@
 //! Implementation of cookie creation and matching as specified by
 //! http://tools.ietf.org/html/rfc6265
 
-use hyper_serde::{self, Serde};
+extern crate hyper_serde;
+
+use hyper_serde::Serde;
 use net_traits::pub_domains::is_pub_domain;
 use net_traits::CookieSource;
 use servo_url::ServoUrl;

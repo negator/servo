@@ -20,7 +20,7 @@ use std::path::Path;
 use std::time::Duration;
 use std::{f64, thread, u32, u64};
 use tokio::time::sleep;
-use tokio_compat::runtime::Runtime;
+use tokio::runtime::Runtime;
 
 pub trait Formattable {
     fn format(&self, output: &Option<OutputOptions>) -> String;
@@ -179,7 +179,7 @@ impl Profiler {
             Some(ref option) => {
                 // Spawn the time profiler thread
                 let outputoption = option.clone();
-                runtime.spawn_std(async move {
+                runtime.spawn(async move {
                     let trace = file_path.as_ref().and_then(|p| TraceDump::new(p).ok());
                     let mut profiler = Profiler::new(trace, Some(outputoption));
                     profiler.start(port).await
@@ -190,7 +190,7 @@ impl Profiler {
                     &OutputOptions::Stdout(period) => {
                         // Spawn a timer thread
                         let chan = chan.clone();
-                        runtime.spawn_std(async move {
+                        runtime.spawn(async move {
                             loop {
                                 sleep(duration_from_seconds(period)).await;
                                 if chan.send(ProfilerMsg::Print).is_err() {
@@ -205,7 +205,7 @@ impl Profiler {
                 // this is when the -p option hasn't been specified
                 if file_path.is_some() {
                     // Spawn the time profiler
-                    runtime.spawn_std(async move {
+                    runtime.spawn(async move {
                         let trace = file_path.as_ref().and_then(|p| TraceDump::new(p).ok());
                         let mut profiler = Profiler::new(trace, None);
                         profiler.start(port).await;
@@ -213,7 +213,7 @@ impl Profiler {
                 } else {
                     // No-op to handle messages when the time profiler is not printing:
                     let mut stream = port.to_stream();
-                    runtime.spawn_std(async move {
+                    runtime.spawn(async move {
                         loop {
                             let msg = stream.next().await;
                             match msg {

@@ -72,7 +72,7 @@ use surfman::SurfaceInfo;
 use surfman::SurfaceType;
 use surfman_chains::SwapChains;
 use surfman_chains_api::SwapChainsAPI;
-use tokio_compat::runtime::Runtime;
+use tokio::runtime::Runtime;
 use webrender_traits::{WebrenderExternalImageRegistry, WebrenderImageHandlerType};
 use webxr::SurfmanGL as WebXRSurfman;
 use webxr_api::ContextId as WebXRContextId;
@@ -316,7 +316,7 @@ impl WebGLThread {
     /// Perform all initialization required to run an instance of WebGLThread
     /// in parallel on its own dedicated thread.
     pub(crate) fn run_on_own_thread(runtime: &Runtime, init: WebGLThreadInit) {
-        runtime.spawn_std(async move {
+        runtime.spawn(async move {
             let mut data = WebGLThread::new(init);
             data.process().await;
         });

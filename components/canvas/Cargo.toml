@@ -45,7 +45,7 @@ surfman = { version = "0.4", features = ["sm-angle","sm-angle-default"] }
 surfman-chains = "0.6"
 surfman-chains-api = "0.2"
 time = { version = "0.1.41", optional = true }
-tokio-compat = "0.1"
+tokio = "1"
 webrender = { git = "https://github.com/servo/webrender" }
 webrender_api = { git = "https://github.com/servo/webrender" }
 webrender_surfman = { path = "../webrender_surfman" }

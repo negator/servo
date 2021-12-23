@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::{f32, fmt, mem, thread};
 use style::font_face::{EffectiveSources, Source};
 use style::values::computed::font::FamilyName;
-use tokio_compat::runtime::Runtime;
+use tokio::runtime::Runtime;
 
 /// A list of font templates that make up a given font family.
 pub struct FontTemplates {
@@ -438,7 +438,7 @@ impl FontCacheThread {
         let (chan, port) = ipc::channel().unwrap();
 
         let channel_to_self = chan.clone();
-        runtime.spawn_std(async move {
+        runtime.spawn(async move {
             // TODO: Allow users to specify these.
             let generic_fonts = populate_generic_fonts();
 

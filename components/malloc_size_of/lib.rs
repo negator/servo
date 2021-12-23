@@ -57,7 +57,7 @@ extern crate cssparser;
 extern crate euclid;
 extern crate hashglobe;
 #[cfg(feature = "servo")]
-extern crate hyper;
+extern crate http;
 #[cfg(feature = "servo")]
 extern crate hyper_serde;
 #[cfg(feature = "servo")]
@@ -950,7 +950,14 @@ impl<T> MallocSizeOf for crossbeam_channel::Sender<T> {
 }
 
 #[cfg(feature = "servo")]
-impl MallocSizeOf for hyper::StatusCode {
+impl<T> MallocSizeOf for tokio::sync::mpsc::UnboundedSender<T> {
+    fn size_of(&self, _ops: &mut MallocSizeOfOps) -> usize {
+        0
+    }
+}
+
+#[cfg(feature = "servo")]
+impl MallocSizeOf for http::StatusCode {
     fn size_of(&self, _ops: &mut MallocSizeOfOps) -> usize {
         0
     }
