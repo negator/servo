@@ -30,7 +30,8 @@ thread_local! {
 }
 
 lazy_static! {
-    pub static ref HANDLE: Runtime = Builder::new().core_threads(2).build().unwrap();        
+    pub static ref HANDLE: Runtime = Builder::new_multi_thread()
+            .enable_io().worker_threads(2).build().unwrap();
 }
 
 pub struct App {

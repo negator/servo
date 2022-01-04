@@ -545,6 +545,9 @@ impl Window {
     // see note at https://dom.spec.whatwg.org/#concept-event-dispatch step 2
     pub fn dispatch_event_with_target_override(&self, event: &Event) -> EventStatus {
         if self.has_document() {
+            if !self.Document().can_invoke_script() {
+                return EventStatus::Canceled;
+            }
             assert!(self.Document().can_invoke_script());
         }
         event.dispatch(self.upcast(), true)

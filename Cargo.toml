@@ -45,10 +45,10 @@ surfman = { git = "https://github.com/negator/surfman", rev = "7701d34bb4636bfef
 
 # openssl = { git = "https://github.com/sfackler/rust-openssl", rev = "5b1813fb15e4ceb77fbeb991143f302d242d32d5", features = ["vendored"] }
 
-[patch."https://github.com/servo/mozjs"]
+# [patch."https://github.com/servo/mozjs"]
 # Work around limitation in mozjs_sys that doesn't allow macosdk > 11.1
 # mozjs_sys = { git = "https://github.com/negator/mozjs.git", rev = "928649c44ff9f350a7d388804dfeb4ec8b7e6633" }
-mozjs_sys = { path = "/Users/navgattu/Documents/dev-git/mozjs" }
+# mozjs_sys = { path = "/Users/navgattu/Documents/dev-git/mozjs" }
 
 [patch."https://github.com/jrmuizel/raqote"]
 raqote = { git = "https://github.com/jdm/raqote", branch = "fkup" }

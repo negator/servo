@@ -1680,7 +1680,7 @@ async fn http_network_fetch(
     if log_enabled!(log::Level::Info) {
         info!("{:?} request for {}", request.method, url);
         for header in request.headers.iter() {
-            debug!(" - {:?}", header);
+            // debug!(" - {:?}", header);
         }
     }
 
@@ -1728,9 +1728,9 @@ async fn http_network_fetch(
     };
 
     if log_enabled!(log::Level::Info) {
-        debug!("{:?} response for {}", res.version(), url);
+        info!("{:?} response for {}", res.version(), url);
         for header in res.headers().iter() {
-            debug!(" - {:?}", header);
+            // debug!(" - {:?}", header);
         }
     }
 
