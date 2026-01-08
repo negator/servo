@@ -9,11 +9,12 @@
 //! This library will eventually become the core of the Fetch crate
 //! with CORSRequest being expanded into FetchRequest (etc)
 
-use http::header::HeaderName;
+use std::time::{Duration, Instant};
+
 use http::Method;
+use http::header::HeaderName;
 use net_traits::request::{CredentialsMode, Origin, Request};
 use servo_url::ServoUrl;
-use time::{self, Timespec};
 
 /// Union type for CORS cache entries
 ///
@@ -45,27 +46,27 @@ impl HeaderOrMethod {
 pub struct CorsCacheEntry {
     pub origin: Origin,
     pub url: ServoUrl,
-    pub max_age: u32,
+    pub max_age: Duration,
     pub credentials: bool,
     pub header_or_method: HeaderOrMethod,
-    created: Timespec,
+    created: Instant,
 }
 
 impl CorsCacheEntry {
     fn new(
         origin: Origin,
         url: ServoUrl,
-        max_age: u32,
+        max_age: Duration,
         credentials: bool,
         header_or_method: HeaderOrMethod,
     ) -> CorsCacheEntry {
         CorsCacheEntry {
-            origin: origin,
-            url: url,
-            max_age: max_age,
-            credentials: credentials,
-            header_or_method: header_or_method,
-            created: time::now().to_timespec(),
+            origin,
+            url,
+            max_age,
+            credentials,
+            header_or_method,
+            created: Instant::now(),
         }
     }
 }
@@ -77,14 +78,10 @@ fn match_headers(cors_cache: &CorsCacheEntry, cors_req: &Request) -> bool {
 }
 
 /// A simple, vector-based CORS Cache
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct CorsCache(Vec<CorsCacheEntry>);
 
 impl CorsCache {
-    pub fn new() -> CorsCache {
-        CorsCache(vec![])
-    }
-
     fn find_entry_by_header<'a>(
         &'a mut self,
         request: &Request,
@@ -111,10 +108,10 @@ impl CorsCache {
     /// Remove old entries
     pub fn cleanup(&mut self) {
         let CorsCache(buf) = self.clone();
-        let now = time::now().to_timespec();
+        let now = Instant::now();
         let new_buf: Vec<CorsCacheEntry> = buf
             .into_iter()
-            .filter(|e| now.sec < e.created.sec + e.max_age as i64)
+            .filter(|e| now < e.created + e.max_age)
             .collect();
         *self = CorsCache(new_buf);
     }
@@ -122,7 +119,7 @@ impl CorsCache {
     /// Returns true if an entry with a
     /// [matching header](https://fetch.spec.whatwg.org/#concept-cache-match-header) is found
     pub fn match_header(&mut self, request: &Request, header_name: &HeaderName) -> bool {
-        self.find_entry_by_header(&request, header_name).is_some()
+        self.find_entry_by_header(request, header_name).is_some()
     }
 
     /// Updates max age if an entry for a
@@ -133,10 +130,10 @@ impl CorsCache {
         &mut self,
         request: &Request,
         header_name: &HeaderName,
-        new_max_age: u32,
+        new_max_age: Duration,
     ) -> bool {
         match self
-            .find_entry_by_header(&request, header_name)
+            .find_entry_by_header(request, header_name)
             .map(|e| e.max_age = new_max_age)
         {
             Some(_) => true,
@@ -156,7 +153,7 @@ impl CorsCache {
     /// Returns true if an entry with a
     /// [matching method](https://fetch.spec.whatwg.org/#concept-cache-match-method) is found
     pub fn match_method(&mut self, request: &Request, method: Method) -> bool {
-        self.find_entry_by_method(&request, method).is_some()
+        self.find_entry_by_method(request, method).is_some()
     }
 
     /// Updates max age if an entry for
@@ -167,10 +164,10 @@ impl CorsCache {
         &mut self,
         request: &Request,
         method: Method,
-        new_max_age: u32,
+        new_max_age: Duration,
     ) -> bool {
         match self
-            .find_entry_by_method(&request, method.clone())
+            .find_entry_by_method(request, method.clone())
             .map(|e| e.max_age = new_max_age)
         {
             Some(_) => true,

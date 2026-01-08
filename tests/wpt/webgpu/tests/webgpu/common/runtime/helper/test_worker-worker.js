@@ -1,26 +1,57 @@
 /**
- * AUTO-GENERATED - DO NOT EDIT. Source: https://github.com/gpuweb/cts
- **/ import { DefaultTestFileLoader } from '../../framework/file_loader.js';
-import { Logger } from '../../framework/logging/logger.js';
-import { parseQuery } from '../../framework/query/parseQuery.js';
-import { assert } from '../../framework/util/util.js';
+* AUTO-GENERATED - DO NOT EDIT. Source: https://github.com/gpuweb/cts
+**/import { runShutdownTasks } from '../../framework/on_shutdown.js';import { setBaseResourcePath } from '../../framework/resources.js';import { DefaultTestFileLoader } from '../../internal/file_loader.js';
+import { parseQuery } from '../../internal/query/parseQuery.js';
+import { assert } from '../../util/util.js';
 
-// should be DedicatedWorkerGlobalScope
+import { setupWorkerEnvironment } from './utils_worker.js';
+
+// Should be WorkerGlobalScope, but importing lib "webworker" conflicts with lib "dom".
+
+
 
 const loader = new DefaultTestFileLoader();
 
-self.onmessage = async ev => {
-  const query = ev.data.query;
-  const debug = ev.data.debug;
+setBaseResourcePath('../../../resources');
 
-  const log = new Logger(debug);
+// MessagePort, DedicatedWorkerGlobalScope, etc.
+
+
+async function handleOnMessage(port, ev) {
+  if (ev.data === 'shutdown') {
+    runShutdownTasks();
+    self.close();
+    return;
+  }
+
+  const { query, expectations, ctsOptions } = ev.data;
+
+  const log = setupWorkerEnvironment(ctsOptions);
 
   const testcases = Array.from(await loader.loadCases(parseQuery(query)));
   assert(testcases.length === 1, 'worker query resulted in != 1 cases');
 
   const testcase = testcases[0];
   const [rec, result] = log.record(testcase.query.toString());
-  await testcase.run(rec);
+  await testcase.run(rec, expectations);
 
-  self.postMessage({ query, result });
+  port.postMessage({
+    query,
+    result: {
+      ...result,
+      logs: result.logs?.map((l) => l.toRawData())
+    }
+  });
+}
+
+self.onmessage = (ev) => {
+  void handleOnMessage(ev.source || self, ev);
+};
+
+self.onconnect = (event) => {
+  const port = event.ports[0];
+
+  port.onmessage = (ev) => {
+    void handleOnMessage(port, ev);
+  };
 };

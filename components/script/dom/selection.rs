@@ -2,22 +2,24 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::Cell;
+
+use dom_struct::dom_struct;
+
 use crate::dom::bindings::codegen::Bindings::NodeBinding::{GetRootNodeOptions, NodeMethods};
 use crate::dom::bindings::codegen::Bindings::RangeBinding::RangeMethods;
 use crate::dom::bindings::codegen::Bindings::SelectionBinding::SelectionMethods;
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
+use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object};
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
 use crate::dom::eventtarget::EventTarget;
-use crate::dom::node::{window_from_node, Node};
+use crate::dom::node::{Node, NodeTraits};
 use crate::dom::range::Range;
-use crate::task_source::TaskSource;
-use dom_struct::dom_struct;
-use std::cell::Cell;
+use crate::script_runtime::CanGc;
 
 #[derive(Clone, Copy, JSTraceable, MallocSizeOf)]
 enum Direction {
@@ -27,7 +29,7 @@ enum Direction {
 }
 
 #[dom_struct]
-pub struct Selection {
+pub(crate) struct Selection {
     reflector_: Reflector,
     document: Dom<Document>,
     range: MutNullableDom<Range>,
@@ -46,10 +48,11 @@ impl Selection {
         }
     }
 
-    pub fn new(document: &Document) -> DomRoot<Selection> {
+    pub(crate) fn new(document: &Document, can_gc: CanGc) -> DomRoot<Selection> {
         reflect_dom_object(
             Box::new(Selection::new_inherited(document)),
             &*document.global(),
+            can_gc,
         )
     }
 
@@ -77,7 +80,7 @@ impl Selection {
         }
     }
 
-    pub fn queue_selectionchange_task(&self) {
+    pub(crate) fn queue_selectionchange_task(&self) {
         if self.task_queued.get() {
             // Spec doesn't specify not to queue multiple tasks,
             // but it's much easier to code range operations if
@@ -85,19 +88,17 @@ impl Selection {
             return;
         }
         let this = Trusted::new(self);
-        let window = window_from_node(&*self.document);
-        window
+        self.document
+            .owner_global()
             .task_manager()
             .user_interaction_task_source() // w3c/selection-api#117
             .queue(
                 task!(selectionchange_task_steps: move || {
                     let this = this.root();
                     this.task_queued.set(false);
-                    this.document.upcast::<EventTarget>().fire_event(atom!("selectionchange"));
-                }),
-                window.upcast(),
-            )
-            .expect("Couldn't queue selectionchange task!");
+                    this.document.upcast::<EventTarget>().fire_event(atom!("selectionchange"), CanGc::note());
+                })
+            );
         self.task_queued.set(true);
     }
 
@@ -106,77 +107,73 @@ impl Selection {
     }
 }
 
-impl SelectionMethods for Selection {
-    // https://w3c.github.io/selection-api/#dom-selection-anchornode
+impl SelectionMethods<crate::DomTypeHolder> for Selection {
+    /// <https://w3c.github.io/selection-api/#dom-selection-anchornode>
     fn GetAnchorNode(&self) -> Option<DomRoot<Node>> {
         if let Some(range) = self.range.get() {
             match self.direction.get() {
-                Direction::Forwards => Some(range.StartContainer()),
-                _ => Some(range.EndContainer()),
+                Direction::Forwards => Some(range.start_container()),
+                _ => Some(range.end_container()),
             }
         } else {
             None
         }
     }
 
-    // https://w3c.github.io/selection-api/#dom-selection-anchoroffset
+    /// <https://w3c.github.io/selection-api/#dom-selection-anchoroffset>
     fn AnchorOffset(&self) -> u32 {
         if let Some(range) = self.range.get() {
             match self.direction.get() {
-                Direction::Forwards => range.StartOffset(),
-                _ => range.EndOffset(),
+                Direction::Forwards => range.start_offset(),
+                _ => range.end_offset(),
             }
         } else {
             0
         }
     }
 
-    // https://w3c.github.io/selection-api/#dom-selection-focusnode
+    /// <https://w3c.github.io/selection-api/#dom-selection-focusnode>
     fn GetFocusNode(&self) -> Option<DomRoot<Node>> {
         if let Some(range) = self.range.get() {
             match self.direction.get() {
-                Direction::Forwards => Some(range.EndContainer()),
-                _ => Some(range.StartContainer()),
+                Direction::Forwards => Some(range.end_container()),
+                _ => Some(range.start_container()),
             }
         } else {
             None
         }
     }
 
-    // https://w3c.github.io/selection-api/#dom-selection-focusoffset
+    /// <https://w3c.github.io/selection-api/#dom-selection-focusoffset>
     fn FocusOffset(&self) -> u32 {
         if let Some(range) = self.range.get() {
             match self.direction.get() {
-                Direction::Forwards => range.EndOffset(),
-                _ => range.StartOffset(),
+                Direction::Forwards => range.end_offset(),
+                _ => range.start_offset(),
             }
         } else {
             0
         }
     }
 
-    // https://w3c.github.io/selection-api/#dom-selection-iscollapsed
+    /// <https://w3c.github.io/selection-api/#dom-selection-iscollapsed>
     fn IsCollapsed(&self) -> bool {
         if let Some(range) = self.range.get() {
-            range.Collapsed()
+            range.collapsed()
         } else {
             true
         }
     }
 
-    // https://w3c.github.io/selection-api/#dom-selection-rangecount
+    /// <https://w3c.github.io/selection-api/#dom-selection-rangecount>
     fn RangeCount(&self) -> u32 {
-        if self.range.get().is_some() {
-            1
-        } else {
-            0
-        }
+        if self.range.get().is_some() { 1 } else { 0 }
     }
 
-    // https://w3c.github.io/selection-api/#dom-selection-type
+    /// <https://w3c.github.io/selection-api/#dom-selection-type>
     fn Type(&self) -> DOMString {
         if let Some(range) = self.range.get() {
-            if range.Collapsed() {
+            if range.collapsed() {
                 DOMString::from("Caret")
             } else {
                 DOMString::from("Range")
@@ -186,21 +183,21 @@ impl SelectionMethods for Selection {
         }
     }
 
-    // https://w3c.github.io/selection-api/#dom-selection-getrangeat
+    /// <https://w3c.github.io/selection-api/#dom-selection-getrangeat>
     fn GetRangeAt(&self, index: u32) -> Fallible<DomRoot<Range>> {
         if index != 0 {
-            Err(Error::IndexSize)
+            Err(Error::IndexSize(None))
         } else if let Some(range) = self.range.get() {
             Ok(DomRoot::from_ref(&range))
         } else {
-            Err(Error::IndexSize)
+            Err(Error::IndexSize(None))
         }
     }
 
-    // https://w3c.github.io/selection-api/#dom-selection-addrange
+    /// <https://w3c.github.io/selection-api/#dom-selection-addrange>
     fn AddRange(&self, range: &Range) {
         // Step 1
-        if !self.is_same_root(&*range.StartContainer()) {
+        if !self.is_same_root(&range.start_container()) {
             return;
         }
 
@@ -215,7 +212,7 @@ impl SelectionMethods for Selection {
         self.direction.set(Direction::Forwards);
     }
 
-    // https://w3c.github.io/selection-api/#dom-selection-removerange
+    /// <https://w3c.github.io/selection-api/#dom-selection-removerange>
     fn RemoveRange(&self, range: &Range) -> ErrorResult {
         if let Some(own_range) = self.range.get() {
             if &*own_range == range {
@@ -223,10 +220,10 @@ impl SelectionMethods for Selection {
                 return Ok(());
             }
         }
-        Err(Error::NotFound)
+        Err(Error::NotFound(None))
     }
 
-    // https://w3c.github.io/selection-api/#dom-selection-removeallranges
+    /// <https://w3c.github.io/selection-api/#dom-selection-removeallranges>
     fn RemoveAllRanges(&self) {
         self.clear_range();
     }
@@ -238,16 +235,16 @@ impl SelectionMethods for Selection {
         self.clear_range();
     }
 
-    // https://w3c.github.io/selection-api/#dom-selection-collapse
-    fn Collapse(&self, node: Option<&Node>, offset: u32) -> ErrorResult {
+    /// <https://w3c.github.io/selection-api/#dom-selection-collapse>
+    fn Collapse(&self, node: Option<&Node>, offset: u32, can_gc: CanGc) -> ErrorResult {
         if let Some(node) = node {
             if node.is_doctype() {
                 // w3c/selection-api#118
-                return Err(Error::InvalidNodeType);
+                return Err(Error::InvalidNodeType(None));
             }
             if offset > node.len() {
                 // Step 2
-                return Err(Error::IndexSize);
+                return Err(Error::IndexSize(None));
             }
 
             if !self.is_same_root(node) {
@@ -256,7 +253,7 @@ impl SelectionMethods for Selection {
             }
 
             // Steps 4-5
-            let range = Range::new(&self.document, node, offset, node, offset);
+            let range = Range::new(&self.document, node, offset, node, offset, can_gc);
 
             // Step 6
             self.set_range(&range);
@@ -274,32 +271,36 @@ impl SelectionMethods for Selection {
     // TODO: When implementing actual selection UI, this may be the correct
     // method to call as the start-of-selection action, after a
     // selectstart event has fired and not been cancelled.
-    fn SetPosition(&self, node: Option<&Node>, offset: u32) -> ErrorResult {
-        self.Collapse(node, offset)
+    fn SetPosition(&self, node: Option<&Node>, offset: u32, can_gc: CanGc) -> ErrorResult {
+        self.Collapse(node, offset, can_gc)
     }
 
-    // https://w3c.github.io/selection-api/#dom-selection-collapsetostart
-    fn CollapseToStart(&self) -> ErrorResult {
+    /// <https://w3c.github.io/selection-api/#dom-selection-collapsetostart>
+    fn CollapseToStart(&self, can_gc: CanGc) -> ErrorResult {
         if let Some(range) = self.range.get() {
-            self.Collapse(Some(&*range.StartContainer()), range.StartOffset())
+            self.Collapse(
+                Some(&*range.start_container()),
+                range.start_offset(),
+                can_gc,
+            )
         } else {
-            Err(Error::InvalidState)
+            Err(Error::InvalidState(None))
         }
     }
 
-    // https://w3c.github.io/selection-api/#dom-selection-collapsetoend
-    fn CollapseToEnd(&self) -> ErrorResult {
+    /// <https://w3c.github.io/selection-api/#dom-selection-collapsetoend>
+    fn CollapseToEnd(&self, can_gc: CanGc) -> ErrorResult {
         if let Some(range) = self.range.get() {
-            self.Collapse(Some(&*range.EndContainer()), range.EndOffset())
+            self.Collapse(Some(&*range.end_container()), range.end_offset(), can_gc)
         } else {
-            Err(Error::InvalidState)
+            Err(Error::InvalidState(None))
         }
     }
 
     // https://w3c.github.io/selection-api/#dom-selection-extend
     // TODO: When implementing actual selection UI, this may be the correct
     // method to call as the continue-selection action
-    fn Extend(&self, node: &Node, offset: u32) -> ErrorResult {
+    fn Extend(&self, node: &Node, offset: u32, can_gc: CanGc) -> ErrorResult {
         if !self.is_same_root(node) {
             // Step 1
             return Ok(());
@@ -307,19 +308,26 @@ impl SelectionMethods for Selection {
         if let Some(range) = self.range.get() {
             if node.is_doctype() {
                 // w3c/selection-api#118
-                return Err(Error::InvalidNodeType);
+                return Err(Error::InvalidNodeType(None));
             }
 
             if offset > node.len() {
                 // As with is_doctype, not explicit in selection spec steps here
                 // but implied by which exceptions are thrown in WPT tests
-                return Err(Error::IndexSize);
+                return Err(Error::IndexSize(None));
             }
 
             // Step 4
-            if !self.is_same_root(&*range.StartContainer()) {
+            if !self.is_same_root(&range.start_container()) {
                 // Step 5, and its following 8 and 9
-                self.set_range(&*Range::new(&self.document, node, offset, node, offset));
+                self.set_range(&Range::new(
+                    &self.document,
+                    node,
+                    offset,
+                    node,
+                    offset,
+                    can_gc,
+                ));
                 self.direction.set(Direction::Forwards);
             } else {
                 let old_anchor_node = &*self.GetAnchorNode().unwrap(); // has range, therefore has anchor node
@@ -333,49 +341,52 @@ impl SelectionMethods for Selection {
                 };
                 if is_old_anchor_before_or_equal {
                     // Step 6, and its following 8 and 9
-                    self.set_range(&*Range::new(
+                    self.set_range(&Range::new(
                         &self.document,
                         old_anchor_node,
                         old_anchor_offset,
                         node,
                         offset,
+                        can_gc,
                     ));
                     self.direction.set(Direction::Forwards);
                 } else {
                     // Step 7, and its following 8 and 9
-                    self.set_range(&*Range::new(
+                    self.set_range(&Range::new(
                         &self.document,
                         node,
                         offset,
                         old_anchor_node,
                         old_anchor_offset,
+                        can_gc,
                     ));
                     self.direction.set(Direction::Backwards);
                 }
             };
         } else {
             // Step 2
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
-        return Ok(());
+        Ok(())
     }
 
-    // https://w3c.github.io/selection-api/#dom-selection-setbaseandextent
+    /// <https://w3c.github.io/selection-api/#dom-selection-setbaseandextent>
     fn SetBaseAndExtent(
         &self,
         anchor_node: &Node,
         anchor_offset: u32,
         focus_node: &Node,
         focus_offset: u32,
+        can_gc: CanGc,
     ) -> ErrorResult {
         // Step 1
         if anchor_node.is_doctype() || focus_node.is_doctype() {
             // w3c/selection-api#118
-            return Err(Error::InvalidNodeType);
+            return Err(Error::InvalidNodeType(None));
         }
 
         if anchor_offset > anchor_node.len() || focus_offset > focus_node.len() {
-            return Err(Error::IndexSize);
+            return Err(Error::IndexSize(None));
         }
 
         // Step 2
@@ -392,32 +403,34 @@ impl SelectionMethods for Selection {
             }
         };
         if is_focus_before_anchor {
-            self.set_range(&*Range::new(
+            self.set_range(&Range::new(
                 &self.document,
                 focus_node,
                 focus_offset,
                 anchor_node,
                 anchor_offset,
+                can_gc,
             ));
             self.direction.set(Direction::Backwards);
         } else {
-            self.set_range(&*Range::new(
+            self.set_range(&Range::new(
                 &self.document,
                 anchor_node,
                 anchor_offset,
                 focus_node,
                 focus_offset,
+                can_gc,
             ));
             self.direction.set(Direction::Forwards);
         }
         Ok(())
     }
 
-    // https://w3c.github.io/selection-api/#dom-selection-selectallchildren
-    fn SelectAllChildren(&self, node: &Node) -> ErrorResult {
+    /// <https://w3c.github.io/selection-api/#dom-selection-selectallchildren>
+    fn SelectAllChildren(&self, node: &Node, can_gc: CanGc) -> ErrorResult {
         if node.is_doctype() {
             // w3c/selection-api#118
-            return Err(Error::InvalidNodeType);
+            return Err(Error::InvalidNodeType(None));
         }
         if !self.is_same_root(node) {
             return Ok(());
@@ -426,29 +439,30 @@ impl SelectionMethods for Selection {
         // Spec wording just says node length here, but WPT specifically
         // wants number of children (the main difference is that it's 0
         // for cdata).
-        self.set_range(&*Range::new(
+        self.set_range(&Range::new(
             &self.document,
             node,
             0,
             node,
             node.children_count(),
+            can_gc,
         ));
 
         self.direction.set(Direction::Forwards);
         Ok(())
     }
 
-    // https://w3c.github.io/selection-api/#dom-selection-deletecontents
+    /// <https://w3c.github.io/selection-api/#dom-selection-deletecontents>
     fn DeleteFromDocument(&self) -> ErrorResult {
         if let Some(range) = self.range.get() {
             // Since the range is changing, it should trigger a
             // selectionchange event as it would if if mutated any other way
             return range.DeleteContents();
         }
-        return Ok(());
+        Ok(())
     }
 
-    // https://w3c.github.io/selection-api/#dom-selection-containsnode
+    /// <https://w3c.github.io/selection-api/#dom-selection-containsnode>
     fn ContainsNode(&self, node: &Node, allow_partial_containment: bool) -> bool {
         // TODO: Spec requires a "visually equivalent to" check, which is
         // probably up to a layout query. This is therefore not a full implementation.
@@ -456,7 +470,7 @@ impl SelectionMethods for Selection {
             return false;
         }
         if let Some(range) = self.range.get() {
-            let start_node = &*range.StartContainer();
+            let start_node = &*range.start_container();
             if !self.is_same_root(start_node) {
                 // node can't be contained in a range with a different root
                 return false;
@@ -466,40 +480,40 @@ impl SelectionMethods for Selection {
                 if node.is_before(start_node) {
                     return false;
                 }
-                let end_node = &*range.EndContainer();
+                let end_node = &*range.end_container();
                 if end_node.is_before(node) {
                     return false;
                 }
                 if node == start_node {
-                    return range.StartOffset() < node.len();
+                    return range.start_offset() < node.len();
                 }
                 if node == end_node {
-                    return range.EndOffset() > 0;
+                    return range.end_offset() > 0;
                 }
-                return true;
+                true
             } else {
                 if node.is_before(start_node) {
                     return false;
                 }
-                let end_node = &*range.EndContainer();
+                let end_node = &*range.end_container();
                 if end_node.is_before(node) {
                     return false;
                 }
                 if node == start_node {
-                    return range.StartOffset() == 0;
+                    return range.start_offset() == 0;
                 }
                 if node == end_node {
-                    return range.EndOffset() == node.len();
+                    return range.end_offset() == node.len();
                 }
-                return true;
+                true
             }
         } else {
             // No range
-            return false;
+            false
         }
     }
 
-    // https://w3c.github.io/selection-api/#dom-selection-stringifier
+    /// <https://w3c.github.io/selection-api/#dom-selection-stringifier>
     fn Stringifier(&self) -> DOMString {
         // The spec as of Jan 31 2020 just says
         // "See W3C bug 10583." for this method.

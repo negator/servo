@@ -2,13 +2,13 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
-use crate::protocol::JsonPacketStream;
-use crate::StreamId;
+use serde::Serialize;
 use serde_json::{Map, Value};
-use servo_config::pref_util::PrefValue;
-use servo_config::prefs::pref_map;
-use std::net::TcpStream;
+use servo_config::pref;
+
+use crate::StreamId;
+use crate::actor::{Actor, ActorError, ActorRegistry};
+use crate::protocol::ClientRequest;
 
 pub struct PreferenceActor {
     name: String,
@@ -27,110 +27,96 @@ impl Actor for PreferenceActor {
 
     fn handle_message(
         &self,
+        request: ClientRequest,
         _registry: &ActorRegistry,
         msg_type: &str,
-        _msg: &Map<String, Value>,
-        stream: &mut TcpStream,
+        msg: &Map<String, Value>,
         _id: StreamId,
-    ) -> Result<ActorMessageStatus, ()> {
-        let pref_value = pref_map().get(msg_type);
-        Ok(match pref_value {
-            PrefValue::Float(value) => {
-                let reply = FloatReply {
-                    from: self.name(),
-                    value: value,
-                };
-                let _ = stream.write_json_packet(&reply);
-                ActorMessageStatus::Processed
+    ) -> Result<(), ActorError> {
+        let key = msg
+            .get("value")
+            .ok_or(ActorError::MissingParameter)?
+            .as_str()
+            .ok_or(ActorError::BadParameterType)?;
+
+        // TODO: Map more preferences onto their Servo values.
+        match key {
+            "dom.serviceWorkers.enabled" => {
+                self.write_bool(request, pref!(dom_serviceworker_enabled))
             },
-            PrefValue::Int(value) => {
-                let reply = IntReply {
-                    from: self.name(),
-                    value: value,
-                };
-                let _ = stream.write_json_packet(&reply);
-                ActorMessageStatus::Processed
-            },
-            PrefValue::Str(value) => {
-                let reply = CharReply {
-                    from: self.name(),
-                    value: value,
-                };
-                let _ = stream.write_json_packet(&reply);
-                ActorMessageStatus::Processed
-            },
-            PrefValue::Bool(value) => {
-                let reply = BoolReply {
-                    from: self.name(),
-                    value: value,
-                };
-                let _ = stream.write_json_packet(&reply);
-                ActorMessageStatus::Processed
-            },
-            PrefValue::Missing => handle_missing_preference(self.name(), msg_type, stream),
-        })
+            _ => self.handle_missing_preference(request, msg_type),
+        }
     }
 }
 
-// if the preferences are missing from pref_map then we return a
-// fake preference response based on msg_type.
-fn handle_missing_preference(
-    name: String,
-    msg_type: &str,
-    stream: &mut TcpStream,
-) -> ActorMessageStatus {
-    match msg_type {
-        "getBoolPref" => {
-            let reply = BoolReply {
-                from: name,
-                value: false,
-            };
-            let _ = stream.write_json_packet(&reply);
-            ActorMessageStatus::Processed
-        },
-
-        "getCharPref" => {
-            let reply = CharReply {
-                from: name,
-                value: "".to_owned(),
-            };
-            let _ = stream.write_json_packet(&reply);
-            ActorMessageStatus::Processed
-        },
-
-        "getIntPref" => {
-            let reply = IntReply {
-                from: name,
-                value: 0,
-            };
-            let _ = stream.write_json_packet(&reply);
-            ActorMessageStatus::Processed
-        },
-
-        _ => ActorMessageStatus::Ignored,
+impl PreferenceActor {
+    fn handle_missing_preference(
+        &self,
+        request: ClientRequest,
+        msg_type: &str,
+    ) -> Result<(), ActorError> {
+        match msg_type {
+            "getBoolPref" => self.write_bool(request, false),
+            "getCharPref" => self.write_char(request, "".into()),
+            "getIntPref" => self.write_int(request, 0),
+            "getFloatPref" => self.write_float(request, 0.),
+            _ => Err(ActorError::UnrecognizedPacketType),
+        }
     }
-}
 
-#[derive(Serialize)]
-struct BoolReply {
-    from: String,
-    value: bool,
-}
+    fn write_bool(&self, request: ClientRequest, pref_value: bool) -> Result<(), ActorError> {
+        #[derive(Serialize)]
+        struct BoolReply {
+            from: String,
+            value: bool,
+        }
 
-#[derive(Serialize)]
-struct CharReply {
-    from: String,
-    value: String,
-}
+        let reply = BoolReply {
+            from: self.name.clone(),
+            value: pref_value,
+        };
+        request.reply_final(&reply)
+    }
 
-#[derive(Serialize)]
-struct IntReply {
-    from: String,
-    value: i64,
-}
+    fn write_char(&self, request: ClientRequest, pref_value: String) -> Result<(), ActorError> {
+        #[derive(Serialize)]
+        struct CharReply {
+            from: String,
+            value: String,
+        }
 
-#[derive(Serialize)]
-struct FloatReply {
-    from: String,
-    value: f64,
+        let reply = CharReply {
+            from: self.name.clone(),
+            value: pref_value,
+        };
+        request.reply_final(&reply)
+    }
+
+    fn write_int(&self, request: ClientRequest, pref_value: i64) -> Result<(), ActorError> {
+        #[derive(Serialize)]
+        struct IntReply {
+            from: String,
+            value: i64,
+        }
+
+        let reply = IntReply {
+            from: self.name.clone(),
+            value: pref_value,
+        };
+        request.reply_final(&reply)
+    }
+
+    fn write_float(&self, request: ClientRequest, pref_value: f64) -> Result<(), ActorError> {
+        #[derive(Serialize)]
+        struct FloatReply {
+            from: String,
+            value: f64,
+        }
+
+        let reply = FloatReply {
+            from: self.name.clone(),
+            value: pref_value,
+        };
+        request.reply_final(&reply)
+    }
 }

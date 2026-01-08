@@ -1,85 +1,84 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
-use crate::dom::bindings::codegen::Bindings::EventBinding::EventBinding::EventMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLElementBinding::HTMLElementMethods;
+use crate::dom::bindings::codegen::Bindings::HTMLOrSVGElementBinding::FocusOptions;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::element::Element;
 use crate::dom::eventtarget::EventTarget;
-use crate::dom::htmldatalistelement::HTMLDataListElement;
-use crate::dom::htmlelement::HTMLElement;
+use crate::dom::html::htmldatalistelement::HTMLDataListElement;
+use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::node::Node;
 use crate::dom::validitystate::{ValidationFlags, ValidityState};
+use crate::script_runtime::CanGc;
 
 /// Trait for elements with constraint validation support
-pub trait Validatable {
+pub(crate) trait Validatable {
     fn as_element(&self) -> &Element;
 
-    // https://html.spec.whatwg.org/multipage/#dom-cva-validity
-    fn validity_state(&self) -> DomRoot<ValidityState>;
+    /// <https://html.spec.whatwg.org/multipage/#dom-cva-validity>
+    fn validity_state(&self, can_gc: CanGc) -> DomRoot<ValidityState>;
 
-    // https://html.spec.whatwg.org/multipage/#candidate-for-constraint-validation
+    /// <https://html.spec.whatwg.org/multipage/#candidate-for-constraint-validation>
     fn is_instance_validatable(&self) -> bool;
 
     // Check if element satisfies its constraints, excluding custom errors
-    fn perform_validation(&self, _validate_flags: ValidationFlags) -> ValidationFlags {
+    fn perform_validation(
+        &self,
+        _validate_flags: ValidationFlags,
+        _can_gc: CanGc,
+    ) -> ValidationFlags {
         ValidationFlags::empty()
     }
 
-    // https://html.spec.whatwg.org/multipage/#concept-fv-valid
-    fn validate(&self, validate_flags: ValidationFlags) -> ValidationFlags {
-        let mut failed_flags = self.perform_validation(validate_flags);
-
-        // https://html.spec.whatwg.org/multipage/#suffering-from-a-custom-error
-        if validate_flags.contains(ValidationFlags::CUSTOM_ERROR) {
-            if !self.validity_state().custom_error_message().is_empty() {
-                failed_flags.insert(ValidationFlags::CUSTOM_ERROR);
-            }
-        }
-
-        failed_flags
+    /// <https://html.spec.whatwg.org/multipage/#concept-fv-valid>
+    fn satisfies_constraints(&self, can_gc: CanGc) -> bool {
+        self.validity_state(can_gc).invalid_flags().is_empty()
     }
 
-    // https://html.spec.whatwg.org/multipage/#check-validity-steps
-    fn check_validity(&self) -> bool {
-        if self.is_instance_validatable() && !self.validate(ValidationFlags::all()).is_empty() {
+    /// <https://html.spec.whatwg.org/multipage/#check-validity-steps>
+    fn check_validity(&self, can_gc: CanGc) -> bool {
+        if self.is_instance_validatable() && !self.satisfies_constraints(can_gc) {
             self.as_element()
                 .upcast::<EventTarget>()
-                .fire_cancelable_event(atom!("invalid"));
+                .fire_cancelable_event(atom!("invalid"), can_gc);
             false
         } else {
             true
         }
     }
 
-    // https://html.spec.whatwg.org/multipage/#report-validity-steps
-    fn report_validity(&self) -> bool {
+    /// <https://html.spec.whatwg.org/multipage/#report-validity-steps>
+    fn report_validity(&self, can_gc: CanGc) -> bool {
         // Step 1.
         if !self.is_instance_validatable() {
             return true;
         }
 
-        let flags = self.validate(ValidationFlags::all());
-        if flags.is_empty() {
+        if self.satisfies_constraints(can_gc) {
             return true;
         }
 
-        // Step 1.1.
-        let event = self
+        // Step 1.1: Let `report` be the result of firing an event named invalid at element,
+        // with the cancelable attribute initialized to true.
+        let report = self
             .as_element()
             .upcast::<EventTarget>()
-            .fire_cancelable_event(atom!("invalid"));
+            .fire_cancelable_event(atom!("invalid"), can_gc);
 
-        // Step 1.2.
-        if !event.DefaultPrevented() {
+        // Step 1.2. If `report` is true, for the element,
+        // report the problem, run focusing steps, scroll into view.
+        if report {
+            let flags = self.validity_state(can_gc).invalid_flags();
             println!(
                 "Validation error: {}",
-                validation_message_for_flags(&self.validity_state(), flags)
+                validation_message_for_flags(&self.validity_state(can_gc), flags)
             );
             if let Some(html_elem) = self.as_element().downcast::<HTMLElement>() {
-                html_elem.Focus();
+                // Run focusing steps and scroll into view.
+                html_elem.Focus(&FocusOptions::default(), can_gc);
             }
         }
 
@@ -87,19 +86,19 @@ pub trait Validatable {
         false
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-cva-validationmessage
+    /// <https://html.spec.whatwg.org/multipage/#dom-cva-validationmessage>
     fn validation_message(&self) -> DOMString {
         if self.is_instance_validatable() {
-            let flags = self.validate(ValidationFlags::all());
-            validation_message_for_flags(&self.validity_state(), flags)
+            let flags = self.validity_state(CanGc::note()).invalid_flags();
+            validation_message_for_flags(&self.validity_state(CanGc::note()), flags)
         } else {
             DOMString::new()
         }
     }
 }
 
-// https://html.spec.whatwg.org/multipage/#the-datalist-element%3Abarred-from-constraint-validation
-pub fn is_barred_by_datalist_ancestor(elem: &Node) -> bool {
+/// <https://html.spec.whatwg.org/multipage/#the-datalist-element%3Abarred-from-constraint-validation>
+pub(crate) fn is_barred_by_datalist_ancestor(elem: &Node) -> bool {
     elem.upcast::<Node>()
         .ancestors()
         .any(|node| node.is::<HTMLDataListElement>())

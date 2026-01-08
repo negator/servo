@@ -2,97 +2,114 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-//! Selecting the default global allocator for Servo
+//! Selecting the default global allocator for Servo, and exposing common
+//! allocator introspection APIs for memory profiling.
 
+use std::os::raw::c_void;
+
+#[cfg(not(feature = "allocation-tracking"))]
 #[global_allocator]
 static ALLOC: Allocator = Allocator;
 
+#[cfg(feature = "allocation-tracking")]
+#[global_allocator]
+static ALLOC: crate::tracking::AccountingAlloc<Allocator> =
+    crate::tracking::AccountingAlloc::with_allocator(Allocator);
+
+#[cfg(feature = "allocation-tracking")]
+mod tracking;
+
+pub fn is_tracking_unmeasured() -> bool {
+    cfg!(feature = "allocation-tracking")
+}
+
+pub fn dump_unmeasured(_writer: impl std::io::Write) {
+    #[cfg(feature = "allocation-tracking")]
+    ALLOC.dump_unmeasured_allocations(_writer);
+}
+
 pub use crate::platform::*;
 
-#[cfg(not(windows))]
-pub use jemalloc_sys;
+type EnclosingSizeFn = unsafe extern "C" fn(*const c_void) -> usize;
 
-#[cfg(not(windows))]
+/// # Safety
+/// No restrictions. The passed pointer is never dereferenced.
+/// This function is only marked unsafe because the MallocSizeOfOps APIs
+/// requires an unsafe function pointer.
+#[cfg(feature = "allocation-tracking")]
+unsafe extern "C" fn enclosing_size_impl(ptr: *const c_void) -> usize {
+    let (adjusted, size) = crate::ALLOC.enclosing_size(ptr);
+    if size != 0 {
+        crate::ALLOC.note_allocation(adjusted, size);
+    }
+    size
+}
+
+#[expect(non_upper_case_globals)]
+#[cfg(feature = "allocation-tracking")]
+pub static enclosing_size: Option<EnclosingSizeFn> = Some(crate::enclosing_size_impl);
+
+#[expect(non_upper_case_globals)]
+#[cfg(not(feature = "allocation-tracking"))]
+pub static enclosing_size: Option<EnclosingSizeFn> = None;
+
+#[cfg(not(any(windows, feature = "use-system-allocator", target_env = "ohos")))]
 mod platform {
-    use jemalloc_sys as ffi;
-    use std::alloc::{GlobalAlloc, Layout};
-    use std::os::raw::{c_int, c_void};
+    use std::os::raw::c_void;
+
+    pub use tikv_jemallocator::Jemalloc as Allocator;
 
     /// Get the size of a heap block.
+    ///
+    /// # Safety
+    ///
+    /// Passing a non-heap allocated pointer to this function results in undefined behavior.
     pub unsafe extern "C" fn usable_size(ptr: *const c_void) -> usize {
-        ffi::malloc_usable_size(ptr as *const _)
+        let size = unsafe { tikv_jemallocator::usable_size(ptr) };
+        #[cfg(feature = "allocation-tracking")]
+        crate::ALLOC.note_allocation(ptr, size);
+        size
     }
 
     /// Memory allocation APIs compatible with libc
     pub mod libc_compat {
-        pub use super::ffi::{free, malloc, realloc};
+        pub use tikv_jemalloc_sys::{free, malloc, realloc};
     }
+}
 
-    pub struct Allocator;
+#[cfg(all(
+    not(windows),
+    any(feature = "use-system-allocator", target_env = "ohos")
+))]
+mod platform {
+    pub use std::alloc::System as Allocator;
+    use std::os::raw::c_void;
 
-    // The minimum alignment guaranteed by the architecture. This value is used to
-    // add fast paths for low alignment values.
-    #[cfg(all(any(
-        target_arch = "arm",
-        target_arch = "mips",
-        target_arch = "mipsel",
-        target_arch = "powerpc"
-    )))]
-    const MIN_ALIGN: usize = 8;
-    #[cfg(all(any(
-        target_arch = "x86",
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "powerpc64",
-        target_arch = "powerpc64le",
-        target_arch = "mips64",
-        target_arch = "s390x",
-        target_arch = "sparc64"
-    )))]
-    const MIN_ALIGN: usize = 16;
+    /// Get the size of a heap block.
+    ///
+    /// # Safety
+    ///
+    /// Passing a non-heap allocated pointer to this function results in undefined behavior.
+    pub unsafe extern "C" fn usable_size(ptr: *const c_void) -> usize {
+        #[cfg(target_vendor = "apple")]
+        unsafe {
+            let size = libc::malloc_size(ptr);
+            #[cfg(feature = "allocation-tracking")]
+            crate::ALLOC.note_allocation(ptr, size);
+            size
+        }
 
-    fn layout_to_flags(align: usize, size: usize) -> c_int {
-        // If our alignment is less than the minimum alignment they we may not
-        // have to pass special flags asking for a higher alignment. If the
-        // alignment is greater than the size, however, then this hits a sort of odd
-        // case where we still need to ask for a custom alignment. See #25 for more
-        // info.
-        if align <= MIN_ALIGN && align <= size {
-            0
-        } else {
-            // Equivalent to the MALLOCX_ALIGN(a) macro.
-            align.trailing_zeros() as _
+        #[cfg(not(target_vendor = "apple"))]
+        unsafe {
+            let size = libc::malloc_usable_size(ptr as *mut _);
+            #[cfg(feature = "allocation-tracking")]
+            crate::ALLOC.note_allocation(ptr, size);
+            size
         }
     }
 
-    unsafe impl GlobalAlloc for Allocator {
-        #[inline]
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            let flags = layout_to_flags(layout.align(), layout.size());
-            ffi::mallocx(layout.size(), flags) as *mut u8
-        }
-
-        #[inline]
-        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            if layout.align() <= MIN_ALIGN && layout.align() <= layout.size() {
-                ffi::calloc(1, layout.size()) as *mut u8
-            } else {
-                let flags = layout_to_flags(layout.align(), layout.size()) | ffi::MALLOCX_ZERO;
-                ffi::mallocx(layout.size(), flags) as *mut u8
-            }
-        }
-
-        #[inline]
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            let flags = layout_to_flags(layout.align(), layout.size());
-            ffi::sdallocx(ptr as *mut _, layout.size(), flags)
-        }
-
-        #[inline]
-        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            let flags = layout_to_flags(layout.align(), new_size);
-            ffi::rallocx(ptr as *mut _, new_size, flags) as *mut u8
-        }
+    pub mod libc_compat {
+        pub use libc::{free, malloc, realloc};
     }
 }
 
@@ -100,16 +117,27 @@ mod platform {
 mod platform {
     pub use std::alloc::System as Allocator;
     use std::os::raw::c_void;
-    use winapi::um::heapapi::{GetProcessHeap, HeapSize, HeapValidate};
+
+    use windows_sys::Win32::Foundation::FALSE;
+    use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapSize, HeapValidate};
 
     /// Get the size of a heap block.
+    ///
+    /// # Safety
+    ///
+    /// Passing a non-heap allocated pointer to this function results in undefined behavior.
     pub unsafe extern "C" fn usable_size(mut ptr: *const c_void) -> usize {
-        let heap = GetProcessHeap();
+        unsafe {
+            let heap = GetProcessHeap();
 
-        if HeapValidate(heap, 0, ptr) == 0 {
-            ptr = *(ptr as *const *const c_void).offset(-1);
+            if HeapValidate(heap, 0, ptr) == FALSE {
+                ptr = *(ptr as *const *const c_void).offset(-1)
+            }
+
+            let size = HeapSize(heap, 0, ptr) as usize;
+            #[cfg(feature = "allocation-tracking")]
+            crate::ALLOC.note_allocation(ptr, size);
+            size
         }
-
-        HeapSize(heap, 0, ptr) as usize
     }
 }

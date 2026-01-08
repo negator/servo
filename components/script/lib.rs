@@ -2,134 +2,89 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-#![feature(core_intrinsics)]
-#![feature(drain_filter)]
-#![feature(plugin)]
-#![feature(register_tool)]
+#![cfg_attr(crown, feature(register_tool))]
 #![deny(unsafe_code)]
 #![doc = "The script crate contains all matters DOM."]
-#![cfg_attr(not(feature = "unrooted_must_root_lint"), allow(unknown_lints))]
-#![allow(deprecated)] // FIXME: Can we make `allow` only apply to the `plugin` crate attribute?
-#![plugin(script_plugins)]
-#![register_tool(unrooted_must_root_lint)]
+// Register the linter `crown`, which is the Servo-specific linter for the script crate.
+#![cfg_attr(crown, register_tool(crown))]
 
-#[macro_use]
-extern crate bitflags;
-#[macro_use]
-extern crate crossbeam_channel;
-#[macro_use]
-extern crate cssparser;
-#[macro_use]
-extern crate deny_public_fields;
-#[macro_use]
-extern crate domobject_derive;
-#[macro_use]
-extern crate html5ever;
+// These are used a lot so let's keep them for now
 #[macro_use]
 extern crate js;
 #[macro_use]
 extern crate jstraceable_derive;
 #[macro_use]
-extern crate lazy_static;
-#[macro_use]
 extern crate log;
-#[macro_use]
-extern crate malloc_size_of;
 #[macro_use]
 extern crate malloc_size_of_derive;
 #[macro_use]
-extern crate profile_traits;
-#[macro_use]
-extern crate serde;
-#[macro_use]
-extern crate servo_atoms;
-#[macro_use]
-extern crate style;
+extern crate stylo_atoms;
 
 mod animation_timeline;
 mod animations;
-#[warn(deprecated)]
+mod css;
+mod script_window_proxies;
 #[macro_use]
 mod task;
-#[warn(deprecated)]
 mod body;
-#[warn(deprecated)]
-pub mod clipboard_provider;
-#[warn(deprecated)]
+pub(crate) mod clipboard_provider;
+pub(crate) mod conversions;
 mod devtools;
-#[warn(deprecated)]
-pub mod document_loader;
-#[warn(deprecated)]
+pub(crate) mod document_loader;
 #[macro_use]
 mod dom;
-#[warn(deprecated)]
-mod canvas_state;
-mod euclidext;
-#[warn(deprecated)]
-pub mod fetch;
-#[warn(deprecated)]
-mod image_listener;
-#[warn(deprecated)]
+pub(crate) use dom::canvas_context;
+pub(crate) mod fetch;
+pub(crate) mod indexeddb;
 mod init;
-#[warn(deprecated)]
 mod layout_image;
-#[warn(deprecated)]
-mod mem;
-#[warn(deprecated)]
+
+pub(crate) mod document_collection;
+pub(crate) mod iframe_collection;
+pub(crate) mod image_animation;
+pub mod layout_dom;
+pub(crate) mod messaging;
 mod microtask;
-#[warn(deprecated)]
+pub(crate) mod mime;
+mod navigation;
 mod network_listener;
-#[warn(deprecated)]
 mod realms;
-#[warn(deprecated)]
+mod routed_promise;
+#[expect(dead_code)]
 mod script_module;
-#[warn(deprecated)]
-pub mod script_runtime;
-#[warn(deprecated)]
-#[allow(unsafe_code)]
-pub mod script_thread;
-#[warn(deprecated)]
-pub mod serviceworker_manager;
-#[warn(deprecated)]
+mod script_mutation_observers;
+pub(crate) mod script_runtime;
+#[expect(unsafe_code)]
+pub(crate) mod script_thread;
+pub(crate) mod security_manager;
+pub(crate) mod serviceworker_manager;
 mod stylesheet_loader;
-#[warn(deprecated)]
 mod stylesheet_set;
-#[warn(deprecated)]
 mod task_manager;
-#[warn(deprecated)]
 mod task_queue;
-#[warn(deprecated)]
 mod task_source;
-#[warn(deprecated)]
 pub mod test;
-#[warn(deprecated)]
 pub mod textinput;
-#[warn(deprecated)]
 mod timers;
-#[warn(deprecated)]
-mod unpremultiplytable;
-#[warn(deprecated)]
 mod webdriver_handlers;
+mod window_named_properties;
+mod xpath;
+
+mod unminify;
+
+mod drag_data_store;
+mod links;
 
 pub use init::init;
+pub(crate) use script_bindings::DomTypes;
 pub use script_runtime::JSEngineSetup;
+pub use script_thread::ScriptThread;
+pub use serviceworker_manager::ServiceWorkerManager;
 
-/// A module with everything layout can use from script.
-///
-/// Try to keep this small!
-///
-/// TODO(emilio): A few of the FooHelpers can go away, presumably...
-pub mod layout_exports {
-    pub use crate::dom::bindings::inheritance::{
-        CharacterDataTypeId, DocumentFragmentTypeId, ElementTypeId,
-    };
-    pub use crate::dom::bindings::inheritance::{HTMLElementTypeId, NodeTypeId, TextTypeId};
-    pub use crate::dom::bindings::root::LayoutDom;
-    pub use crate::dom::characterdata::LayoutCharacterDataHelpers;
-    pub use crate::dom::document::{Document, LayoutDocumentHelpers};
-    pub use crate::dom::element::{Element, LayoutElementHelpers};
-    pub use crate::dom::node::NodeFlags;
-    pub use crate::dom::node::{LayoutNodeHelpers, Node};
-    pub use crate::dom::shadowroot::{LayoutShadowRootHelpers, ShadowRoot};
-    pub use crate::dom::text::Text;
-}
+pub(crate) use crate::dom::bindings::codegen::DomTypeHolder::DomTypeHolder;
+// These trait exports are public, because they are used in the DOM bindings.
+// Since they are used in derive macros,
+// it is useful that they are accessible at the root of the crate.
+pub(crate) use crate::dom::bindings::inheritance::HasParent;
+pub(crate) use crate::dom::bindings::reflector::{DomObject, MutDomObject, Reflector};
+pub(crate) use crate::dom::bindings::trace::{CustomTraceable, JSTraceable};

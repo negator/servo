@@ -2,25 +2,27 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use crate::dom::audiotrack::AudioTrack;
-use crate::dom::bindings::codegen::Bindings::EventBinding::EventBinding::EventMethods;
+use dom_struct::dom_struct;
+use js::rust::HandleObject;
+use stylo_atoms::Atom;
+
+use crate::dom::audio::audiotrack::AudioTrack;
+use crate::dom::bindings::codegen::Bindings::EventBinding::Event_Binding::EventMethods;
 use crate::dom::bindings::codegen::Bindings::TrackEventBinding;
 use crate::dom::bindings::codegen::Bindings::TrackEventBinding::TrackEventMethods;
 use crate::dom::bindings::codegen::UnionTypes::VideoTrackOrAudioTrackOrTextTrack;
 use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject};
+use crate::dom::bindings::reflector::reflect_dom_object_with_proto;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::event::Event;
-use crate::dom::globalscope::GlobalScope;
 use crate::dom::texttrack::TextTrack;
 use crate::dom::videotrack::VideoTrack;
 use crate::dom::window::Window;
-use dom_struct::dom_struct;
-use servo_atoms::Atom;
+use crate::script_runtime::CanGc;
 
-#[unrooted_must_root_lint::must_root]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 #[derive(JSTraceable, MallocSizeOf)]
 enum MediaTrack {
     Video(Dom<VideoTrack>),
@@ -29,14 +31,14 @@ enum MediaTrack {
 }
 
 #[dom_struct]
-pub struct TrackEvent {
+pub(crate) struct TrackEvent {
     event: Event,
     track: Option<MediaTrack>,
 }
 
-#[allow(non_snake_case)]
 impl TrackEvent {
-    #[allow(unrooted_must_root)]
+    #[expect(non_snake_case)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn new_inherited(track: &Option<VideoTrackOrAudioTrackOrTextTrack>) -> TrackEvent {
         let media_track = match track {
             Some(VideoTrackOrAudioTrackOrTextTrack::VideoTrack(VideoTrack)) => {
@@ -57,39 +59,62 @@ impl TrackEvent {
         }
     }
 
-    pub fn new(
-        global: &GlobalScope,
+    pub(crate) fn new(
+        window: &Window,
         type_: Atom,
         bubbles: bool,
         cancelable: bool,
         track: &Option<VideoTrackOrAudioTrackOrTextTrack>,
+        can_gc: CanGc,
     ) -> DomRoot<TrackEvent> {
-        let te = reflect_dom_object(Box::new(TrackEvent::new_inherited(&track)), global);
+        Self::new_with_proto(window, None, type_, bubbles, cancelable, track, can_gc)
+    }
+
+    fn new_with_proto(
+        window: &Window,
+        proto: Option<HandleObject>,
+        type_: Atom,
+        bubbles: bool,
+        cancelable: bool,
+        track: &Option<VideoTrackOrAudioTrackOrTextTrack>,
+        can_gc: CanGc,
+    ) -> DomRoot<TrackEvent> {
+        let te = reflect_dom_object_with_proto(
+            Box::new(TrackEvent::new_inherited(track)),
+            window,
+            proto,
+            can_gc,
+        );
         {
             let event = te.upcast::<Event>();
             event.init_event(type_, bubbles, cancelable);
         }
         te
     }
+}
 
-    pub fn Constructor(
+impl TrackEventMethods<crate::DomTypeHolder> for TrackEvent {
+    /// <https://html.spec.whatwg.org/multipage/#trackevent>
+    fn Constructor(
         window: &Window,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
         type_: DOMString,
         init: &TrackEventBinding::TrackEventInit,
     ) -> Fallible<DomRoot<TrackEvent>> {
-        Ok(TrackEvent::new(
-            &window.global(),
+        Ok(TrackEvent::new_with_proto(
+            window,
+            proto,
             Atom::from(type_),
             init.parent.bubbles,
             init.parent.cancelable,
             &init.track,
+            can_gc,
         ))
     }
-}
 
-#[allow(non_snake_case)]
-impl TrackEventMethods for TrackEvent {
     // https://html.spec.whatwg.org/multipage/#dom-trackevent-track
+    #[expect(non_snake_case)]
     fn GetTrack(&self) -> Option<VideoTrackOrAudioTrackOrTextTrack> {
         match &self.track {
             Some(MediaTrack::Video(VideoTrack)) => Some(
@@ -105,7 +130,7 @@ impl TrackEventMethods for TrackEvent {
         }
     }
 
-    // https://dom.spec.whatwg.org/#dom-event-istrusted
+    /// <https://dom.spec.whatwg.org/#dom-event-istrusted>
     fn IsTrusted(&self) -> bool {
         self.event.IsTrusted()
     }

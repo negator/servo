@@ -3,78 +3,77 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use crate::dom::bindings::str::DOMString;
-use std::borrow::Cow;
 
-#[allow(non_snake_case)]
-pub fn Product() -> DOMString {
+#[expect(non_snake_case)]
+pub(crate) fn Product() -> DOMString {
     DOMString::from("Gecko")
 }
 
-#[allow(non_snake_case)]
-pub fn ProductSub() -> DOMString {
+#[expect(non_snake_case)]
+pub(crate) fn ProductSub() -> DOMString {
     DOMString::from("20100101")
 }
 
-#[allow(non_snake_case)]
-pub fn Vendor() -> DOMString {
+#[expect(non_snake_case)]
+pub(crate) fn Vendor() -> DOMString {
     DOMString::from("")
 }
 
-#[allow(non_snake_case)]
-pub fn VendorSub() -> DOMString {
+#[expect(non_snake_case)]
+pub(crate) fn VendorSub() -> DOMString {
     DOMString::from("")
 }
 
-#[allow(non_snake_case)]
-pub fn TaintEnabled() -> bool {
+#[expect(non_snake_case)]
+pub(crate) fn TaintEnabled() -> bool {
     false
 }
 
-#[allow(non_snake_case)]
-pub fn AppName() -> DOMString {
+#[expect(non_snake_case)]
+pub(crate) fn AppName() -> DOMString {
     DOMString::from("Netscape") // Like Gecko/Webkit
 }
 
-#[allow(non_snake_case)]
-pub fn AppCodeName() -> DOMString {
+#[expect(non_snake_case)]
+pub(crate) fn AppCodeName() -> DOMString {
     DOMString::from("Mozilla")
 }
 
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 #[cfg(target_os = "windows")]
-pub fn Platform() -> DOMString {
+pub(crate) fn Platform() -> DOMString {
     DOMString::from("Win32")
 }
 
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 #[cfg(any(target_os = "android", target_os = "linux"))]
-pub fn Platform() -> DOMString {
+pub(crate) fn Platform() -> DOMString {
     DOMString::from("Linux")
 }
 
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 #[cfg(target_os = "macos")]
-pub fn Platform() -> DOMString {
+pub(crate) fn Platform() -> DOMString {
     DOMString::from("Mac")
 }
 
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 #[cfg(target_os = "ios")]
-pub fn Platform() -> DOMString {
+pub(crate) fn Platform() -> DOMString {
     DOMString::from("iOS")
 }
 
-#[allow(non_snake_case)]
-pub fn UserAgent(user_agent: Cow<'static, str>) -> DOMString {
-    DOMString::from(&*user_agent)
+#[expect(non_snake_case)]
+pub(crate) fn UserAgent(user_agent: &str) -> DOMString {
+    DOMString::from(user_agent)
 }
 
-#[allow(non_snake_case)]
-pub fn AppVersion() -> DOMString {
+#[expect(non_snake_case)]
+pub(crate) fn AppVersion() -> DOMString {
     DOMString::from("4.0")
 }
 
-#[allow(non_snake_case)]
-pub fn Language() -> DOMString {
+#[expect(non_snake_case)]
+pub(crate) fn Language() -> DOMString {
     DOMString::from("en-US")
 }

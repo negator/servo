@@ -27,8 +27,10 @@ def main(avd_name, apk_path, *args):
         "-no-window",
         "-no-snapshot",
         "-no-snapstorage",
-        "-gpu", "guest",
-        "-port", emulator_port,
+        "-gpu",
+        "guest",
+        "-port",
+        emulator_port,
     ]
     with terminate_on_exit(emulator_args, stdout=sys.stderr) as emulator_process:
         # This is hopefully enough time for the emulator to exit
@@ -59,18 +61,17 @@ def main(avd_name, apk_path, *args):
 
         json_params = shell_quote(json.dumps(args))
         extra = "-e servoargs " + json_params
-        cmd = "am start " + extra + " org.mozilla.servo/org.mozilla.servo.MainActivity"
+        cmd = "am start " + extra + " org.servo.servoshell/org.servo.servoshell.MainActivity"
         check_call(adb + ["shell", cmd], stdout=sys.stderr)
 
         # Start showing logs as soon as the application starts,
         # in case they say something useful while we wait in subsequent steps.
         logcat_args = [
             "--format=raw",  # Print no metadata, only log messages
-            "simpleservo:D",  # Show (debug level) Rust stdio
+            "servoshell:D",  # Show (debug level) Rust stdio
             "*:S",  # Hide everything else
         ]
         with terminate_on_exit(adb + ["logcat"] + logcat_args) as logcat:
-
             # This step needs to happen after application start
             forward_webdriver(adb, args)
 
@@ -79,13 +80,12 @@ def main(avd_name, apk_path, *args):
 
 
 def tool_path(directory, bin_name):
-    if "ANDROID_SDK" in os.environ:
-        path = os.path.join(os.environ["ANDROID_SDK"], directory, bin_name)
+    if "ANDROID_SDK_ROOT" in os.environ:
+        path = os.path.join(os.environ["ANDROID_SDK_ROOT"], directory, bin_name)
         if os.path.exists(path):
             return path
 
-    path = os.path.join(os.path.dirname(__file__), "..", "android-toolchains", "sdk",
-                        directory, bin_name)
+    path = os.path.join(os.path.dirname(__file__), "..", "android-toolchains", "sdk", directory, bin_name)
     if os.path.exists(path):
         return path
 
@@ -128,7 +128,7 @@ def check_call(*args, **kwargs):
 
 
 def write_user_stylesheets(adb, args):
-    data_dir = "/sdcard/Android/data/org.mozilla.servo/files"
+    data_dir = "/sdcard/Android/data/org.servo.servoshell/files"
     check_call(adb + ["shell", "mkdir -p %s" % data_dir])
     for i, (pos, path) in enumerate(extract_args("--user-stylesheet", args)):
         remote_path = "%s/user%s.css" % (data_dir, i)
@@ -139,7 +139,7 @@ def write_user_stylesheets(adb, args):
 def write_hosts_file(adb):
     hosts_file = os.environ.get("HOST_FILE")
     if hosts_file:
-        data_dir = "/sdcard/Android/data/org.mozilla.servo/files"
+        data_dir = "/sdcard/Android/data/org.servo.servoshell/files"
         check_call(adb + ["shell", "mkdir -p %s" % data_dir])
         remote_path = data_dir + "/android_hosts"
         check_call(adb + ["push", hosts_file, remote_path], stdout=sys.stderr)
@@ -207,8 +207,7 @@ def interrupt(_signum, _frame):
 if __name__ == "__main__":
     if len(sys.argv) < 3:
         print("Usage: %s avd_name apk_path [servo args...]" % sys.argv[0])
-        print("Example: %s servo-x86 target/i686-linux-android/release/servo.apk https://servo.org"
-              % sys.argv[0])
+        print("Example: %s servo-x86 target/i686-linux-android/release/servo.apk https://servo.org" % sys.argv[0])
         sys.exit(1)
 
     try:

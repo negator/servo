@@ -2,15 +2,17 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use dom_struct::dom_struct;
+
 use crate::dom::bindings::codegen::Bindings::TouchListBinding::TouchListMethods;
-use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
+use crate::dom::bindings::reflector::{Reflector, reflect_dom_object};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::touch::Touch;
 use crate::dom::window::Window;
-use dom_struct::dom_struct;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct TouchList {
+pub(crate) struct TouchList {
     reflector_: Reflector,
     touches: Vec<Dom<Touch>>,
 }
@@ -23,12 +25,12 @@ impl TouchList {
         }
     }
 
-    pub fn new(window: &Window, touches: &[&Touch]) -> DomRoot<TouchList> {
-        reflect_dom_object(Box::new(TouchList::new_inherited(touches)), window)
+    pub(crate) fn new(window: &Window, touches: &[&Touch], can_gc: CanGc) -> DomRoot<TouchList> {
+        reflect_dom_object(Box::new(TouchList::new_inherited(touches)), window, can_gc)
     }
 }
 
-impl TouchListMethods for TouchList {
+impl TouchListMethods<crate::DomTypeHolder> for TouchList {
     /// <https://w3c.github.io/touch-events/#widl-TouchList-length>
     fn Length(&self) -> u32 {
         self.touches.len() as u32

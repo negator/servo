@@ -2,63 +2,104 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::root::DomRoot;
-use crate::dom::globalscope::GlobalScope;
-use crate::dom::identityhub::Identities;
-use crate::dom::paintworkletglobalscope::PaintWorkletGlobalScope;
-use crate::dom::paintworkletglobalscope::PaintWorkletTask;
-use crate::dom::testworkletglobalscope::TestWorkletGlobalScope;
-use crate::dom::testworkletglobalscope::TestWorkletTask;
-use crate::dom::worklet::WorkletExecutor;
-use crate::script_module::ScriptFetchOptions;
-use crate::script_runtime::JSContext;
-use crate::script_thread::MainThreadScriptMsg;
-use crossbeam_channel::Sender;
-use devtools_traits::ScriptToDevtoolsControlMsg;
-use dom_struct::dom_struct;
-use ipc_channel::ipc::IpcSender;
-use js::jsval::UndefinedValue;
-use js::rust::Runtime;
-use msg::constellation_msg::PipelineId;
-use net_traits::image_cache::ImageCache;
-use net_traits::ResourceThreads;
-use parking_lot::Mutex;
-use profile_traits::mem;
-use profile_traits::time;
-use script_traits::{Painter, ScriptMsg};
-use script_traits::{ScriptToConstellationChan, TimerSchedulerMsg};
-use servo_atoms::Atom;
-use servo_url::ImmutableOrigin;
-use servo_url::MutableOrigin;
-use servo_url::ServoUrl;
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use base::generic_channel::{GenericCallback, GenericSender};
+use base::id::{PipelineId, WebViewId};
+use constellation_traits::{ScriptToConstellationChan, ScriptToConstellationMessage};
+use crossbeam_channel::Sender;
+use devtools_traits::ScriptToDevtoolsControlMsg;
+use dom_struct::dom_struct;
+use embedder_traits::{JavaScriptEvaluationError, ScriptToEmbedderChan};
+use js::jsval::UndefinedValue;
+use net_traits::ResourceThreads;
+use net_traits::image_cache::ImageCache;
+use profile_traits::{mem, time};
+use script_bindings::realms::InRealm;
+use script_traits::Painter;
+use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
+use storage_traits::StorageThreads;
+use stylo_atoms::Atom;
+
+use crate::dom::bindings::inheritance::Castable;
+use crate::dom::bindings::root::DomRoot;
+use crate::dom::bindings::trace::CustomTraceable;
+use crate::dom::bindings::utils::define_all_exposed_interfaces;
+use crate::dom::globalscope::GlobalScope;
+use crate::dom::paintworkletglobalscope::{PaintWorkletGlobalScope, PaintWorkletTask};
+#[cfg(feature = "testbinding")]
+use crate::dom::testworkletglobalscope::{TestWorkletGlobalScope, TestWorkletTask};
+#[cfg(feature = "webgpu")]
+use crate::dom::webgpu::identityhub::IdentityHub;
+use crate::dom::worklet::WorkletExecutor;
+use crate::messaging::MainThreadScriptMsg;
+use crate::realms::enter_realm;
+use crate::script_runtime::{CanGc, IntroductionType, JSContext};
+
 #[dom_struct]
 /// <https://drafts.css-houdini.org/worklets/#workletglobalscope>
-pub struct WorkletGlobalScope {
+pub(crate) struct WorkletGlobalScope {
     /// The global for this worklet.
     globalscope: GlobalScope,
     /// The base URL for this worklet.
+    #[no_trace]
     base_url: ServoUrl,
     /// Sender back to the script thread
-    #[ignore_malloc_size_of = "channels are hard"]
     to_script_thread_sender: Sender<MainThreadScriptMsg>,
     /// Worklet task executor
     executor: WorkletExecutor,
 }
 
 impl WorkletGlobalScope {
-    /// Create a new stack-allocated `WorkletGlobalScope`.
-    pub fn new_inherited(
+    /// Create a new heap-allocated `WorkletGlobalScope`.
+    pub(crate) fn new(
+        scope_type: WorkletGlobalScopeType,
+        webview_id: WebViewId,
         pipeline_id: PipelineId,
         base_url: ServoUrl,
+        inherited_secure_context: Option<bool>,
+        executor: WorkletExecutor,
+        init: &WorkletGlobalScopeInit,
+    ) -> DomRoot<WorkletGlobalScope> {
+        let scope: DomRoot<WorkletGlobalScope> = match scope_type {
+            #[cfg(feature = "testbinding")]
+            WorkletGlobalScopeType::Test => DomRoot::upcast(TestWorkletGlobalScope::new(
+                webview_id,
+                pipeline_id,
+                base_url,
+                inherited_secure_context,
+                executor,
+                init,
+            )),
+            WorkletGlobalScopeType::Paint => DomRoot::upcast(PaintWorkletGlobalScope::new(
+                webview_id,
+                pipeline_id,
+                base_url,
+                inherited_secure_context,
+                executor,
+                init,
+            )),
+        };
+
+        let realm = enter_realm(&*scope);
+        define_all_exposed_interfaces(scope.upcast(), InRealm::entered(&realm), CanGc::note());
+
+        scope
+    }
+
+    /// Create a new stack-allocated `WorkletGlobalScope`.
+    pub(crate) fn new_inherited(
+        webview_id: WebViewId,
+        pipeline_id: PipelineId,
+        base_url: ServoUrl,
+        inherited_secure_context: Option<bool>,
         executor: WorkletExecutor,
         init: &WorkletGlobalScopeInit,
     ) -> Self {
         let script_to_constellation_chan = ScriptToConstellationChan {
             sender: init.to_constellation_sender.clone(),
+            webview_id,
             pipeline_id,
         };
         Self {
@@ -68,15 +109,17 @@ impl WorkletGlobalScope {
                 init.mem_profiler_chan.clone(),
                 init.time_profiler_chan.clone(),
                 script_to_constellation_chan,
-                init.scheduler_chan.clone(),
+                init.to_embedder_sender.clone(),
                 init.resource_threads.clone(),
+                init.storage_threads.clone(),
                 MutableOrigin::new(ImmutableOrigin::new_opaque()),
+                base_url.clone(),
                 None,
-                Default::default(),
-                init.is_headless,
-                init.user_agent.clone(),
+                #[cfg(feature = "webgpu")]
                 init.gpu_id_hub.clone(),
-                init.inherited_secure_context,
+                inherited_secure_context,
+                false,
+                None, // font_context
             ),
             base_url,
             to_script_thread_sender: init.to_script_thread_sender.clone(),
@@ -85,24 +128,29 @@ impl WorkletGlobalScope {
     }
 
     /// Get the JS context.
-    pub fn get_cx(&self) -> JSContext {
-        self.globalscope.get_cx()
+    pub(crate) fn get_cx() -> JSContext {
+        GlobalScope::get_cx()
     }
 
     /// Evaluate a JS script in this global.
-    pub fn evaluate_js(&self, script: &str) -> bool {
+    pub(crate) fn evaluate_js(
+        &self,
+        script: Cow<'_, str>,
+        can_gc: CanGc,
+    ) -> Result<(), JavaScriptEvaluationError> {
         debug!("Evaluating Dom in a worklet.");
-        rooted!(in (*self.globalscope.get_cx()) let mut rval = UndefinedValue());
-        self.globalscope.evaluate_js_on_global_with_result(
-            &*script,
+        rooted!(in (*GlobalScope::get_cx()) let mut rval = UndefinedValue());
+        self.globalscope.evaluate_js_on_global(
+            script,
+            "",
+            Some(IntroductionType::WORKLET),
             rval.handle_mut(),
-            ScriptFetchOptions::default_classic_script(&self.globalscope),
-            self.globalscope.api_base_url(),
+            can_gc,
         )
     }
 
     /// Register a paint worklet to the script thread.
-    pub fn register_paint_worklet(
+    pub(crate) fn register_paint_worklet(
         &self,
         name: Atom,
         properties: Vec<Atom>,
@@ -119,18 +167,19 @@ impl WorkletGlobalScope {
     }
 
     /// The base URL of this global.
-    pub fn base_url(&self) -> ServoUrl {
+    pub(crate) fn base_url(&self) -> ServoUrl {
         self.base_url.clone()
     }
 
     /// The worklet executor.
-    pub fn executor(&self) -> WorkletExecutor {
+    pub(crate) fn executor(&self) -> WorkletExecutor {
         self.executor.clone()
     }
 
     /// Perform a worklet task
-    pub fn perform_a_worklet_task(&self, task: WorkletTask) {
+    pub(crate) fn perform_a_worklet_task(&self, task: WorkletTask) {
         match task {
+            #[cfg(feature = "testbinding")]
             WorkletTask::Test(task) => match self.downcast::<TestWorkletGlobalScope>() {
                 Some(global) => global.perform_a_worklet_task(task),
                 None => warn!("This is not a test worklet."),
@@ -145,73 +194,44 @@ impl WorkletGlobalScope {
 
 /// Resources required by workletglobalscopes
 #[derive(Clone)]
-pub struct WorkletGlobalScopeInit {
+pub(crate) struct WorkletGlobalScopeInit {
     /// Channel to the main script thread
-    pub to_script_thread_sender: Sender<MainThreadScriptMsg>,
+    pub(crate) to_script_thread_sender: Sender<MainThreadScriptMsg>,
     /// Channel to a resource thread
-    pub resource_threads: ResourceThreads,
+    pub(crate) resource_threads: ResourceThreads,
+    /// Channels to the [`StorageThreads`].
+    pub(crate) storage_threads: StorageThreads,
     /// Channel to the memory profiler
-    pub mem_profiler_chan: mem::ProfilerChan,
+    pub(crate) mem_profiler_chan: mem::ProfilerChan,
     /// Channel to the time profiler
-    pub time_profiler_chan: time::ProfilerChan,
+    pub(crate) time_profiler_chan: time::ProfilerChan,
     /// Channel to devtools
-    pub devtools_chan: Option<IpcSender<ScriptToDevtoolsControlMsg>>,
+    pub(crate) devtools_chan: Option<GenericCallback<ScriptToDevtoolsControlMsg>>,
     /// Messages to send to constellation
-    pub to_constellation_sender: IpcSender<(PipelineId, ScriptMsg)>,
-    /// Message to send to the scheduler
-    pub scheduler_chan: IpcSender<TimerSchedulerMsg>,
+    pub(crate) to_constellation_sender:
+        GenericSender<(WebViewId, PipelineId, ScriptToConstellationMessage)>,
+    /// Messages to send to the Embedder
+    pub(crate) to_embedder_sender: ScriptToEmbedderChan,
     /// The image cache
-    pub image_cache: Arc<dyn ImageCache>,
-    /// True if in headless mode
-    pub is_headless: bool,
-    /// An optional string allowing the user agent to be set for testing
-    pub user_agent: Cow<'static, str>,
+    pub(crate) image_cache: Arc<dyn ImageCache>,
     /// Identity manager for WebGPU resources
-    pub gpu_id_hub: Arc<Mutex<Identities>>,
-    /// Is considered secure
-    pub inherited_secure_context: Option<bool>,
+    #[cfg(feature = "webgpu")]
+    pub(crate) gpu_id_hub: Arc<IdentityHub>,
 }
 
 /// <https://drafts.css-houdini.org/worklets/#worklet-global-scope-type>
 #[derive(Clone, Copy, Debug, JSTraceable, MallocSizeOf)]
-pub enum WorkletGlobalScopeType {
+pub(crate) enum WorkletGlobalScopeType {
     /// A servo-specific testing worklet
+    #[cfg(feature = "testbinding")]
     Test,
     /// A paint worklet
     Paint,
 }
 
-impl WorkletGlobalScopeType {
-    /// Create a new heap-allocated `WorkletGlobalScope`.
-    pub fn new(
-        &self,
-        runtime: &Runtime,
-        pipeline_id: PipelineId,
-        base_url: ServoUrl,
-        executor: WorkletExecutor,
-        init: &WorkletGlobalScopeInit,
-    ) -> DomRoot<WorkletGlobalScope> {
-        match *self {
-            WorkletGlobalScopeType::Test => DomRoot::upcast(TestWorkletGlobalScope::new(
-                runtime,
-                pipeline_id,
-                base_url,
-                executor,
-                init,
-            )),
-            WorkletGlobalScopeType::Paint => DomRoot::upcast(PaintWorkletGlobalScope::new(
-                runtime,
-                pipeline_id,
-                base_url,
-                executor,
-                init,
-            )),
-        }
-    }
-}
-
 /// A task which can be performed in the context of a worklet global.
-pub enum WorkletTask {
+pub(crate) enum WorkletTask {
+    #[cfg(feature = "testbinding")]
     Test(TestWorkletTask),
     Paint(PaintWorkletTask),
 }

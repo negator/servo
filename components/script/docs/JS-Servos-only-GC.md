@@ -134,7 +134,7 @@ or a custom attribute `#[dom_struct]` which implies it.
 Let's look at [Servo's implementation][document-rs] of the DOM's
 [`Document`][document-mdn] interface:
 
-[document-rs]: https://github.com/servo/servo/blob/master/components/script/dom/document.rs
+[document-rs]: https://github.com/servo/servo/blob/main/components/script/dom/document.rs
 [document-mdn]: https://developer.mozilla.org/en-US/docs/Web/API/document
 
 ```rust
@@ -172,7 +172,7 @@ is where we actually call the SpiderMonkey trace hooks:
 
 ```rust
 /// Trace the `JSObject` held by `reflector`.
-#[allow(unrooted_must_root)]
+#[allow(crown::unrooted_must_root)]
 pub fn trace_reflector(tracer: *mut JSTracer, description: &str, reflector: &Reflector) {
     trace!("tracing reflector {}", description);
     trace_object(tracer, description, reflector.rootable())
@@ -334,7 +334,7 @@ the usual [warnings infrastructure][warnings], we can use the `allow` attribute
 in places where it's okay to use `Dom<T>`, like DOM struct definitions and the
 implementation of `Dom<T>` itself.
 
-[js-lint]: https://doc.servo.org/script_plugins/struct.UnrootedPass.html
+[js-lint]: https://github.com/servo/servo/blob/main/support/crown/src/unrooted_must_root.rs
 [stack]: https://en.wikipedia.org/wiki/Stack-based_memory_allocation
 [warnings]: https://doc.rust-lang.org/book/compiler-plugins.html#lint-plugins
 

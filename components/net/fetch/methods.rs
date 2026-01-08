@@ -2,52 +2,61 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use crate::data_loader::decode;
-use crate::fetch::cors_cache::CorsCache;
-use crate::fetch::headers::determine_nosniff;
-use crate::filemanager_thread::{FileManager, FILE_CHUNK_SIZE};
-use crate::http_loader::{determine_requests_referrer, http_fetch, HttpState};
-use crate::http_loader::{set_default_accept, set_default_accept_language};
-use crate::subresource_integrity::is_response_integrity_valid;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::{io, mem, str};
+
+use base::id::PipelineId;
+use base64::Engine as _;
+use base64::engine::general_purpose;
 use content_security_policy as csp;
 use crossbeam_channel::Sender;
 use devtools_traits::DevtoolsControlMsg;
-use headers::{AccessControlExposeHeaders, ContentType, HeaderMapExt, Range};
-use http::header::{self, HeaderMap, HeaderName};
-use http::Method;
-use http::StatusCode;
-use ipc_channel::ipc::{self, IpcReceiver};
+use embedder_traits::resources::{self, Resource};
+use headers::{AccessControlExposeHeaders, ContentType, HeaderMapExt};
+use http::header::{self, HeaderMap, HeaderName, RANGE};
+use http::{HeaderValue, Method, StatusCode};
+use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
+use log::{debug, trace, warn};
+use malloc_size_of_derive::MallocSizeOf;
 use mime::{self, Mime};
-use net_traits::blob_url_store::{parse_blob_url, BlobURLStoreError};
+use net_traits::fetch::headers::extract_mime_type_as_mime;
 use net_traits::filemanager_thread::{FileTokenCheck, RelativePos};
+use net_traits::http_status::HttpStatus;
+use net_traits::policy_container::{PolicyContainer, RequestPolicyContainer};
 use net_traits::request::{
-    is_cors_safelisted_method, is_cors_safelisted_request_header, Origin, ResponseTainting, Window,
-};
-use net_traits::request::{
-    BodyChunkRequest, BodyChunkResponse, CredentialsMode, Destination, Referrer, Request,
-    RequestMode,
+    BodyChunkRequest, BodyChunkResponse, CredentialsMode, Destination, Initiator,
+    InsecureRequestsPolicy, Origin, ParserMetadata, RedirectMode, Referrer, Request, RequestId,
+    RequestMode, ResponseTainting, is_cors_safelisted_method, is_cors_safelisted_request_header,
 };
 use net_traits::response::{Response, ResponseBody, ResponseType};
-use net_traits::{FetchTaskTarget, NetworkError, ReferrerPolicy, ResourceFetchTiming};
-use net_traits::{ResourceAttribute, ResourceTimeValue, ResourceTimingType};
-use servo_arc::Arc as ServoArc;
-use servo_url::ServoUrl;
-use std::borrow::Cow;
-use std::fs::File;
-use std::io::{BufReader, Seek, SeekFrom};
-use std::mem;
-use std::ops::Bound;
-use std::str;
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc::{
-    unbounded_channel, UnboundedReceiver as TokioReceiver, UnboundedSender as TokioSender,
+use net_traits::{
+    FetchTaskTarget, NetworkError, ReferrerPolicy, ResourceAttribute, ResourceFetchTiming,
+    ResourceTimeValue, ResourceTimingType, WebSocketDomAction, WebSocketNetworkEvent,
+    set_default_accept_language,
 };
+use parking_lot::Mutex;
+use rustc_hash::FxHashMap;
+use rustls_pki_types::CertificateDer;
+use serde::{Deserialize, Serialize};
+use servo_arc::Arc as ServoArc;
+use servo_url::{Host, ImmutableOrigin, ServoUrl};
+use tokio::sync::mpsc::{UnboundedReceiver as TokioReceiver, UnboundedSender as TokioSender};
 
-lazy_static! {
-    static ref X_CONTENT_TYPE_OPTIONS: HeaderName =
-        HeaderName::from_static("x-content-type-options");
-}
+use crate::connector::CACertificates;
+use crate::fetch::cors_cache::CorsCache;
+use crate::fetch::fetch_params::{
+    ConsumePreloadedResources, FetchParams, SharedPreloadedResources,
+};
+use crate::fetch::headers::determine_nosniff;
+use crate::filemanager_thread::FileManager;
+use crate::http_loader::{
+    HttpState, determine_requests_referrer, http_fetch, send_early_httprequest_to_devtools,
+    send_response_to_devtools, send_security_info_to_devtools, set_default_accept,
+};
+use crate::protocols::{ProtocolRegistry, is_url_potentially_trustworthy};
+use crate::request_interceptor::RequestInterceptor;
+use crate::subresource_integrity::is_response_integrity_valid;
 
 pub type Target<'a> = &'a mut (dyn FetchTaskTarget + Send);
 
@@ -58,201 +67,401 @@ pub enum Data {
     Cancelled,
 }
 
+pub struct WebSocketChannel {
+    pub sender: IpcSender<WebSocketNetworkEvent>,
+    pub receiver: Option<IpcReceiver<WebSocketDomAction>>,
+}
+
+impl WebSocketChannel {
+    pub fn new(
+        sender: IpcSender<WebSocketNetworkEvent>,
+        receiver: Option<IpcReceiver<WebSocketDomAction>>,
+    ) -> Self {
+        Self { sender, receiver }
+    }
+}
+
+/// Used to keep track of keep-alive requests
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct InFlightKeepAliveRecord {
+    pub(crate) request_id: RequestId,
+    /// Used to keep track of size of keep-alive requests.
+    pub(crate) keep_alive_body_length: u64,
+}
+
+pub type SharedInflightKeepAliveRecords =
+    Arc<Mutex<FxHashMap<PipelineId, Vec<InFlightKeepAliveRecord>>>>;
+
+#[derive(Clone)]
 pub struct FetchContext {
     pub state: Arc<HttpState>,
-    pub user_agent: Cow<'static, str>,
+    pub user_agent: String,
     pub devtools_chan: Option<Arc<Mutex<Sender<DevtoolsControlMsg>>>>,
     pub filemanager: Arc<Mutex<FileManager>>,
     pub file_token: FileTokenCheck,
-    pub cancellation_listener: Arc<Mutex<CancellationListener>>,
+    pub request_interceptor: Arc<Mutex<RequestInterceptor>>,
+    pub cancellation_listener: Arc<CancellationListener>,
     pub timing: ServoArc<Mutex<ResourceFetchTiming>>,
+    pub protocols: Arc<ProtocolRegistry>,
+    pub websocket_chan: Option<Arc<Mutex<WebSocketChannel>>>,
+    pub ca_certificates: CACertificates<'static>,
+    pub ignore_certificate_errors: bool,
+    pub preloaded_resources: SharedPreloadedResources,
+    pub in_flight_keep_alive_records: SharedInflightKeepAliveRecords,
 }
 
+#[derive(Default)]
 pub struct CancellationListener {
-    cancel_chan: Option<IpcReceiver<()>>,
-    cancelled: bool,
+    cancelled: AtomicBool,
 }
 
 impl CancellationListener {
-    pub fn new(cancel_chan: Option<IpcReceiver<()>>) -> Self {
-        Self {
-            cancel_chan: cancel_chan,
-            cancelled: false,
-        }
+    pub(crate) fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
     }
 
-    pub fn cancelled(&mut self) -> bool {
-        if let Some(ref cancel_chan) = self.cancel_chan {
-            if self.cancelled {
-                true
-            } else if cancel_chan.try_recv().is_ok() {
-                self.cancelled = true;
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        }
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed)
     }
 }
 pub type DoneChannel = Option<(TokioSender<Data>, TokioReceiver<Data>)>;
 
 /// [Fetch](https://fetch.spec.whatwg.org#concept-fetch)
-pub async fn fetch(request: &mut Request, target: Target<'_>, context: &FetchContext) {
+pub async fn fetch(request: Request, target: Target<'_>, context: &FetchContext) -> Response {
     // Steps 7,4 of https://w3c.github.io/resource-timing/#processing-model
     // rev order okay since spec says they're equal - https://w3c.github.io/resource-timing/#dfn-starttime
-    context
-        .timing
-        .lock()
-        .unwrap()
-        .set_attribute(ResourceAttribute::FetchStart);
-    context
-        .timing
-        .lock()
-        .unwrap()
-        .set_attribute(ResourceAttribute::StartTime(ResourceTimeValue::FetchStart));
-
-    fetch_with_cors_cache(request, &mut CorsCache::new(), target, context).await;
+    {
+        let mut timing_guard = context.timing.lock();
+        timing_guard.set_attribute(ResourceAttribute::FetchStart);
+        timing_guard.set_attribute(ResourceAttribute::StartTime(ResourceTimeValue::FetchStart));
+    }
+    fetch_with_cors_cache(request, &mut CorsCache::default(), target, context).await
 }
 
+/// Continuation of fetch from step 8.
+///
+/// <https://fetch.spec.whatwg.org#concept-fetch>
 pub async fn fetch_with_cors_cache(
-    request: &mut Request,
+    request: Request,
     cache: &mut CorsCache,
     target: Target<'_>,
     context: &FetchContext,
-) {
-    // Step 1.
-    if request.window == Window::Client {
-        // TODO: Set window to request's client object if client is a Window object
-    } else {
-        request.window = Window::NoWindow;
+) -> Response {
+    // Step 8. Let fetchParams be a new fetch params whose request is request
+    let mut fetch_params = FetchParams::new(request);
+    let request = &mut fetch_params.request;
+
+    // Step 4. Populate request from client given request.
+    request.populate_request_from_client();
+
+    // Step 5. If request’s client is non-null, then:
+    // TODO
+    // Step 5.1. Set taskDestination to request’s client’s global object.
+    // TODO
+    // Step 5.2. Set crossOriginIsolatedCapability to request’s client’s cross-origin isolated capability.
+    // TODO
+
+    // Step 10. If all of the following conditions are true:
+    if
+    // - request’s URL’s scheme is an HTTP(S) scheme
+    matches!(request.current_url().scheme(), "http" | "https")
+        // - request’s mode is "same-origin", "cors", or "no-cors"
+        && matches!(request.mode, RequestMode::SameOrigin | RequestMode::CorsMode | RequestMode::NoCors)
+        // - request’s method is `GET`
+        && matches!(request.method, Method::GET)
+        // - request’s unsafe-request flag is not set or request’s header list is empty
+        && (!request.unsafe_request || request.headers.is_empty())
+    {
+        // - request’s client is not null, and request’s client’s global object is a Window object
+        if let Some(client) = request.client.as_ref() {
+            // Step 10.1. Assert: request’s origin is same origin with request’s client’s origin.
+            assert!(request.origin == client.origin);
+            // Step 10.2. Let onPreloadedResponseAvailable be an algorithm that runs the
+            // following step given a response response: set fetchParams’s preloaded response candidate to response.
+            // Step 10.3. Let foundPreloadedResource be the result of invoking consume a preloaded resource
+            // for request’s client, given request’s URL, request’s destination, request’s mode,
+            // request’s credentials mode, request’s integrity metadata, and onPreloadedResponseAvailable.
+            // Step 10.4. If foundPreloadedResource is true and fetchParams’s preloaded response candidate is null,
+            // then set fetchParams’s preloaded response candidate to "pending".
+            if let Some(candidate) =
+                client.consume_preloaded_resource(request, context.preloaded_resources.clone())
+            {
+                fetch_params.preload_response_candidate = candidate;
+            }
+        }
     }
 
-    // Step 2.
-    if request.origin == Origin::Client {
-        // TODO: set request's origin to request's client's origin
-        unimplemented!()
-    }
+    // Step 11. If request’s header list does not contain `Accept`, then:
+    set_default_accept(request);
 
-    // Step 3.
-    set_default_accept(request.destination, &mut request.headers);
-
-    // Step 4.
+    // Step 12. If request’s header list does not contain `Accept-Language`, then user agents should
+    // append (`Accept-Language, an appropriate header value) to request’s header list.
     set_default_accept_language(&mut request.headers);
 
-    // Step 5.
+    // Step 15. If request’s internal priority is null, then use request’s priority, initiator,
+    // destination, and render-blocking in an implementation-defined manner to set request’s
+    // internal priority to an implementation-defined object.
     // TODO: figure out what a Priority object is.
 
-    // Step 6.
-    // TODO: handle client hints headers.
+    // Step 15. If request is a subresource request:
+    //
+    // We only check for keep-alive requests here, since that's currently the only usage
+    let should_track_in_flight_record = request.keep_alive && request.is_subresource_request();
+    let pipeline_id = request.pipeline_id;
 
-    // Step 7.
-    if request.is_subresource_request() {
-        // TODO: handle client hints headers.
+    if should_track_in_flight_record {
+        // Step 15.1. Let record be a new fetch record whose request is request
+        // and controller is fetchParams’s controller.
+        let record = InFlightKeepAliveRecord {
+            request_id: request.id,
+            keep_alive_body_length: request.keep_alive_body_length(),
+        };
+        // Step 15.2. Append record to request’s client’s fetch group’s fetch records.
+        let mut in_flight_records = context.in_flight_keep_alive_records.lock();
+        in_flight_records
+            .entry(pipeline_id.expect("Must always set a pipeline ID for keep-alive requests"))
+            .or_default()
+            .push(record);
+    };
+    let request_id = request.id;
+
+    // Step 17: Run main fetch given fetchParams.
+    let response = main_fetch(&mut fetch_params, cache, false, target, &mut None, context).await;
+
+    // Mimics <https://fetch.spec.whatwg.org/#done-flag>
+    if should_track_in_flight_record {
+        context
+            .in_flight_keep_alive_records
+            .lock()
+            .get_mut(&pipeline_id.expect("Must always set a pipeline ID for keep-alive requests"))
+            .expect("Must always have initialized tracked requests before starting fetch")
+            .retain(|record| record.request_id != request_id);
     }
 
-    // Step 8.
-    main_fetch(request, cache, false, false, target, &mut None, &context).await;
+    // Step 18: Return fetchParams’s controller.
+    // TODO: We don't implement fetchParams as defined in the spec
+    response
 }
 
-/// https://www.w3.org/TR/CSP/#should-block-request
-pub fn should_request_be_blocked_by_csp(request: &Request) -> csp::CheckResult {
+pub(crate) fn convert_request_to_csp_request(request: &Request) -> Option<csp::Request> {
     let origin = match &request.origin {
-        Origin::Client => return csp::CheckResult::Allowed,
+        Origin::Client => return None,
         Origin::Origin(origin) => origin,
     };
+
+    // We need to retroactively upgrade the ws URL if the rewritten http URL was upgraded to a secure scheme.
+    // https://github.com/w3c/webappsec-csp/issues/532
+    let mut original_url = request.original_url();
+    if original_url.scheme() == "ws" && request.url().scheme() == "https" {
+        original_url.as_mut_url().set_scheme("wss").unwrap();
+    }
+
     let csp_request = csp::Request {
-        url: request.url().into_url(),
+        url: original_url.into_url(),
         origin: origin.clone().into_url_origin(),
         redirect_count: request.redirect_count,
         destination: request.destination,
-        initiator: csp::Initiator::None,
-        nonce: String::new(),
+        initiator: match request.initiator {
+            Initiator::Download => csp::Initiator::Download,
+            Initiator::ImageSet => csp::Initiator::ImageSet,
+            Initiator::Manifest => csp::Initiator::Manifest,
+            Initiator::Prefetch => csp::Initiator::Prefetch,
+            _ => csp::Initiator::None,
+        },
+        nonce: request.cryptographic_nonce_metadata.clone(),
         integrity_metadata: request.integrity_metadata.clone(),
-        parser_metadata: csp::ParserMetadata::None,
+        parser_metadata: match request.parser_metadata {
+            ParserMetadata::ParserInserted => csp::ParserMetadata::ParserInserted,
+            ParserMetadata::NotParserInserted => csp::ParserMetadata::NotParserInserted,
+            ParserMetadata::Default => csp::ParserMetadata::None,
+        },
     };
-    // TODO: Instead of ignoring violations, report them.
-    request
+    Some(csp_request)
+}
+
+/// <https://www.w3.org/TR/CSP/#should-block-request>
+pub fn should_request_be_blocked_by_csp(
+    csp_request: &csp::Request,
+    policy_container: &PolicyContainer,
+) -> (csp::CheckResult, Vec<csp::Violation>) {
+    policy_container
         .csp_list
         .as_ref()
-        .map(|c| c.should_request_be_blocked(&csp_request).0)
-        .unwrap_or(csp::CheckResult::Allowed)
+        .map(|c| c.should_request_be_blocked(csp_request))
+        .unwrap_or((csp::CheckResult::Allowed, Vec::new()))
+}
+
+/// <https://www.w3.org/TR/CSP/#report-for-request>
+pub fn report_violations_for_request_by_csp(
+    csp_request: &csp::Request,
+    policy_container: &PolicyContainer,
+) -> Vec<csp::Violation> {
+    policy_container
+        .csp_list
+        .as_ref()
+        .map(|c| c.report_violations_for_request(csp_request))
+        .unwrap_or_default()
+}
+
+fn should_response_be_blocked_by_csp(
+    csp_request: &csp::Request,
+    response: &Response,
+    policy_container: &PolicyContainer,
+) -> (csp::CheckResult, Vec<csp::Violation>) {
+    if response.is_network_error() {
+        return (csp::CheckResult::Allowed, Vec::new());
+    }
+    let csp_response = csp::Response {
+        url: response
+            .actual_response()
+            .url()
+            .cloned()
+            // NOTE(pylbrecht): for WebSocket connections, the URL scheme is converted to http(s)
+            // to integrate with fetch(). We need to convert it back to ws(s) to get valid CSP
+            // checks.
+            // https://github.com/w3c/webappsec-csp/issues/532
+            .map(|mut url| {
+                match csp_request.url.scheme() {
+                    "ws" | "wss" => {
+                        url.as_mut_url()
+                            .set_scheme(csp_request.url.scheme())
+                            .expect("failed to set URL scheme");
+                    },
+                    _ => {},
+                };
+                url
+            })
+            .expect("response must have a url")
+            .into_url(),
+        redirect_count: csp_request.redirect_count,
+    };
+    policy_container
+        .csp_list
+        .as_ref()
+        .map(|c| c.should_response_to_request_be_blocked(csp_request, &csp_response))
+        .unwrap_or((csp::CheckResult::Allowed, Vec::new()))
 }
 
 /// [Main fetch](https://fetch.spec.whatwg.org/#concept-main-fetch)
 pub async fn main_fetch(
-    request: &mut Request,
+    fetch_params: &mut FetchParams,
     cache: &mut CorsCache,
-    cors_flag: bool,
     recursive_flag: bool,
     target: Target<'_>,
     done_chan: &mut DoneChannel,
     context: &FetchContext,
 ) -> Response {
-    // Step 1.
+    // Step 1: Let request be fetchParam's request.
+    let request = &mut fetch_params.request;
+    send_early_httprequest_to_devtools(request, context);
+    // Step 2: Let response be null.
     let mut response = None;
 
-    // Step 2.
-    if request.local_urls_only {
-        if !matches!(
+    // Servo internal: return a crash error when a crash error page is needed
+    if let Some(ref details) = request.crash {
+        response = Some(Response::network_error(NetworkError::Crash(
+            details.clone(),
+        )));
+    }
+
+    // Step 3: If request’s local-URLs-only flag is set and request’s
+    // current URL is not local, then set response to a network error.
+    if request.local_urls_only &&
+        !matches!(
             request.current_url().scheme(),
             "about" | "blob" | "data" | "filesystem"
-        ) {
-            response = Some(Response::network_error(NetworkError::Internal(
-                "Non-local scheme".into(),
-            )));
+        )
+    {
+        response = Some(Response::network_error(NetworkError::UnsupportedScheme));
+    }
+
+    // The request should have a valid policy_container associated with it.
+    let policy_container = match &request.policy_container {
+        RequestPolicyContainer::Client => unreachable!(),
+        RequestPolicyContainer::PolicyContainer(container) => container.to_owned(),
+    };
+    let csp_request = convert_request_to_csp_request(request);
+    if let Some(csp_request) = csp_request.as_ref() {
+        // Step 2.2.
+        let violations = report_violations_for_request_by_csp(csp_request, &policy_container);
+
+        if !violations.is_empty() {
+            target.process_csp_violations(request, violations);
         }
-    }
-
-    // Step 2.2.
-    // TODO: Report violations.
-
-    // Step 2.4.
-    if should_request_be_blocked_by_csp(request) == csp::CheckResult::Blocked {
-        warn!("Request blocked by CSP");
-        response = Some(Response::network_error(NetworkError::Internal(
-            "Blocked by Content-Security-Policy".into(),
-        )))
-    }
+    };
 
     // Step 3.
     // TODO: handle request abort.
 
-    // Step 4.
-    // TODO: handle upgrade to a potentially secure URL.
-
-    // Step 5.
-    if should_be_blocked_due_to_bad_port(&request.current_url()) {
-        response = Some(Response::network_error(NetworkError::Internal(
-            "Request attempted on bad port".into(),
-        )));
+    // Step 4. Upgrade request to a potentially trustworthy URL, if appropriate.
+    if should_upgrade_request_to_potentially_trustworthy(request, context) ||
+        should_upgrade_mixed_content_request(request, &context.protocols)
+    {
+        trace!(
+            "upgrading {} targeting {:?}",
+            request.current_url(),
+            request.destination
+        );
+        if let Some(new_scheme) = match request.current_url().scheme() {
+            "http" => Some("https"),
+            "ws" => Some("wss"),
+            _ => None,
+        } {
+            request
+                .current_url_mut()
+                .as_mut_url()
+                .set_scheme(new_scheme)
+                .unwrap();
+        }
+    } else {
+        trace!(
+            "not upgrading {} targeting {:?} with {:?}",
+            request.current_url(),
+            request.destination,
+            request.insecure_requests_policy
+        );
     }
-    // TODO: handle blocking as mixed content.
-    // TODO: handle blocking by content security policy.
+    if let Some(csp_request) = csp_request.as_ref() {
+        // Step 7. If should request be blocked due to a bad port, should fetching request be blocked
+        // as mixed content, or should request be blocked by Content Security Policy returns blocked,
+        // then set response to a network error.
+        let (check_result, violations) =
+            should_request_be_blocked_by_csp(csp_request, &policy_container);
 
-    // Step 6
-    // TODO: handle request's client's referrer policy.
+        if !violations.is_empty() {
+            target.process_csp_violations(request, violations);
+        }
 
-    // Step 7.
-    request.referrer_policy = request
-        .referrer_policy
-        .or(Some(ReferrerPolicy::NoReferrerWhenDowngrade));
+        if check_result == csp::CheckResult::Blocked {
+            warn!("Request blocked by CSP");
+            response = Some(Response::network_error(NetworkError::ContentSecurityPolicy))
+        }
+    };
+    if should_request_be_blocked_due_to_a_bad_port(&request.current_url()) {
+        response = Some(Response::network_error(NetworkError::InvalidPort));
+    }
+    if should_request_be_blocked_as_mixed_content(request, &context.protocols) {
+        response = Some(Response::network_error(NetworkError::MixedContent));
+    }
 
-    // Step 8.
-    assert!(request.referrer_policy.is_some());
+    // Step 8: If request’s referrer policy is the empty string, then set request’s referrer policy
+    // to request’s policy container’s referrer policy.
+    if request.referrer_policy == ReferrerPolicy::EmptyString {
+        request.referrer_policy = policy_container.get_referrer_policy();
+    }
+
     let referrer_url = match mem::replace(&mut request.referrer, Referrer::NoReferrer) {
         Referrer::NoReferrer => None,
         Referrer::ReferrerUrl(referrer_source) | Referrer::Client(referrer_source) => {
             request.headers.remove(header::REFERER);
             determine_requests_referrer(
-                request.referrer_policy.unwrap(),
+                request.referrer_policy,
                 referrer_source,
                 request.current_url(),
             )
         },
     };
-    request.referrer = referrer_url.map_or(Referrer::NoReferrer, |url| Referrer::ReferrerUrl(url));
+    request.referrer = referrer_url.map_or(Referrer::NoReferrer, Referrer::ReferrerUrl);
 
     // Step 9.
     // TODO: handle FTP URLs.
@@ -262,43 +471,77 @@ pub async fn main_fetch(
         .state
         .hsts_list
         .read()
-        .unwrap()
         .apply_hsts_rules(request.current_url_mut());
 
     // Step 11.
     // Not applicable: see fetch_async.
 
-    // Step 12.
+    let current_url = request.current_url();
+    let current_scheme = current_url.scheme();
+
+    // Intercept the request and maybe override the response.
+    context
+        .request_interceptor
+        .lock()
+        .intercept_request(request, &mut response, context);
 
     let mut response = match response {
         Some(res) => res,
         None => {
-            let current_url = request.current_url();
+            // Step 12. If response is null, then set response to the result
+            // of running the steps corresponding to the first matching statement:
             let same_origin = if let Origin::Origin(ref origin) = request.origin {
                 *origin == current_url.origin()
             } else {
                 false
             };
 
-            if (same_origin && !cors_flag) ||
-                current_url.scheme() == "data" ||
-                current_url.scheme() == "chrome"
+            // fetchParams’s preloaded response candidate is non-null
+            if let Some((response, preload_id)) =
+                fetch_params.preload_response_candidate.response().await
             {
-                // Substep 1.
+                response.get_resource_timing().lock().preloaded = true;
+                context
+                    .preloaded_resources
+                    .lock()
+                    .unwrap()
+                    .remove(&preload_id);
+                response
+            }
+            // request's current URL's origin is same origin with request's origin, and request's
+            // response tainting is "basic"
+            else if (same_origin && request.response_tainting == ResponseTainting::Basic) ||
+                // request's current URL's scheme is "data"
+                current_scheme == "data" ||
+                // Note: Although it is not part of the specification, we make an exception here
+                // for custom protocols that are explicitly marked as active for fetch.
+                context.protocols.is_fetchable(current_scheme) ||
+                // request's mode is "navigate" or "websocket"
+                matches!(
+                    request.mode,
+                    RequestMode::Navigate | RequestMode::WebSocket { .. }
+                )
+            {
+                // Substep 1. Set request's response tainting to "basic".
                 request.response_tainting = ResponseTainting::Basic;
 
-                // Substep 2.
-                scheme_fetch(request, cache, target, done_chan, context).await
+                // Substep 2. Return the result of running scheme fetch given fetchParams.
+                scheme_fetch(fetch_params, cache, target, done_chan, context).await
             } else if request.mode == RequestMode::SameOrigin {
-                Response::network_error(NetworkError::Internal("Cross-origin response".into()))
+                Response::network_error(NetworkError::CrossOriginResponse)
             } else if request.mode == RequestMode::NoCors {
-                // Substep 1.
-                request.response_tainting = ResponseTainting::Opaque;
+                // Substep 1. If request's redirect mode is not "follow", then return a network error.
+                if request.redirect_mode != RedirectMode::Follow {
+                    Response::network_error(NetworkError::RedirectError)
+                } else {
+                    // Substep 2. Set request's response tainting to "opaque".
+                    request.response_tainting = ResponseTainting::Opaque;
 
-                // Substep 2.
-                scheme_fetch(request, cache, target, done_chan, context).await
-            } else if !matches!(current_url.scheme(), "http" | "https") {
-                Response::network_error(NetworkError::Internal("Non-http scheme".into()))
+                    // Substep 3. Return the result of running scheme fetch given fetchParams.
+                    scheme_fetch(fetch_params, cache, target, done_chan, context).await
+                }
+            } else if !matches!(current_scheme, "http" | "https") {
+                Response::network_error(NetworkError::UnsupportedScheme)
             } else if request.use_cors_preflight ||
                 (request.unsafe_request &&
                     (!is_cors_safelisted_method(&request.method) ||
@@ -310,7 +553,14 @@ pub async fn main_fetch(
                 request.response_tainting = ResponseTainting::CorsTainting;
                 // Substep 2.
                 let response = http_fetch(
-                    request, cache, true, true, false, target, done_chan, context,
+                    fetch_params,
+                    cache,
+                    true,
+                    true,
+                    false,
+                    target,
+                    done_chan,
+                    context,
                 )
                 .await;
                 // Substep 3.
@@ -324,7 +574,14 @@ pub async fn main_fetch(
                 request.response_tainting = ResponseTainting::CorsTainting;
                 // Substep 2.
                 http_fetch(
-                    request, cache, true, false, false, target, done_chan, context,
+                    fetch_params,
+                    cache,
+                    true,
+                    false,
+                    false,
+                    target,
+                    done_chan,
+                    context,
                 )
                 .await
             }
@@ -335,6 +592,9 @@ pub async fn main_fetch(
     if recursive_flag {
         return response;
     }
+
+    // reborrow request to avoid double mutable borrow
+    let request = &mut fetch_params.request;
 
     // Step 14.
     let mut response = if !response.is_network_error() && response.internal_response.is_none() {
@@ -384,59 +644,98 @@ pub async fn main_fetch(
             should_be_blocked_due_to_nosniff(request.destination, &response.headers);
         let should_replace_with_mime_type_error = !response_is_network_error &&
             should_be_blocked_due_to_mime_type(request.destination, &response.headers);
+        let should_replace_with_mixed_content = !response_is_network_error &&
+            should_response_be_blocked_as_mixed_content(request, &response, &context.protocols);
+        let should_replace_with_csp_error = csp_request.is_some_and(|csp_request| {
+            let (check_result, violations) =
+                should_response_be_blocked_by_csp(&csp_request, &response, &policy_container);
+            if !violations.is_empty() {
+                target.process_csp_violations(request, violations);
+            }
+            check_result == csp::CheckResult::Blocked
+        });
 
         // Step 15.
         let mut network_error_response = response
             .get_network_error()
             .cloned()
             .map(Response::network_error);
+
+        // Step 15. Let internalResponse be response, if response is a network error;
+        // otherwise response’s internal response.
+        let response_type = response.response_type.clone(); // Needed later after the mutable borrow
         let internal_response = if let Some(error_response) = network_error_response.as_mut() {
             error_response
         } else {
             response.actual_response_mut()
         };
 
-        // Step 16.
+        // Step 16. If internalResponse’s URL list is empty, then set it to a clone of request’s URL list.
         if internal_response.url_list.is_empty() {
-            internal_response.url_list = request.url_list.clone();
+            internal_response.url_list.clone_from(&request.url_list)
         }
 
-        // Step 17.
-        // TODO: handle blocking as mixed content.
-        // TODO: handle blocking by content security policy.
-        let blocked_error_response;
+        // Step 19. If response is not a network error and any of the following returns blocked
+        // * should internalResponse to request be blocked as mixed content
+        // * should internalResponse to request be blocked by Content Security Policy
+        // * should internalResponse to request be blocked due to its MIME type
+        // * should internalResponse to request be blocked due to nosniff
+        let mut blocked_error_response;
+
         let internal_response = if should_replace_with_nosniff_error {
             // Defer rebinding result
-            blocked_error_response =
-                Response::network_error(NetworkError::Internal("Blocked by nosniff".into()));
+            blocked_error_response = Response::network_error(NetworkError::Nosniff);
             &blocked_error_response
         } else if should_replace_with_mime_type_error {
             // Defer rebinding result
             blocked_error_response =
-                Response::network_error(NetworkError::Internal("Blocked by mime type".into()));
+                Response::network_error(NetworkError::MimeType("Blocked by MIME type".into()));
+            &blocked_error_response
+        } else if should_replace_with_mixed_content {
+            blocked_error_response = Response::network_error(NetworkError::MixedContent);
+            &blocked_error_response
+        } else if should_replace_with_csp_error {
+            blocked_error_response = Response::network_error(NetworkError::ContentSecurityPolicy);
             &blocked_error_response
         } else {
             internal_response
         };
 
-        // Step 18.
-        // We check `internal_response` since we did not mutate `response`
-        // in the previous step.
+        // Step 20. If response’s type is "opaque", internalResponse’s status is 206, internalResponse’s
+        // range-requested flag is set, and request’s header list does not contain `Range`, then set
+        // response and internalResponse to a network error.
+        // Also checking if internal response is a network error to prevent crash from attemtping to
+        // read status of a network error if we blocked the request above.
+        let internal_response = if !internal_response.is_network_error() &&
+            response_type == ResponseType::Opaque &&
+            internal_response.status.code() == StatusCode::PARTIAL_CONTENT &&
+            internal_response.range_requested &&
+            !request.headers.contains_key(RANGE)
+        {
+            // Defer rebinding result
+            blocked_error_response =
+                Response::network_error(NetworkError::PartialResponseToNonRangeRequestError);
+            &blocked_error_response
+        } else {
+            internal_response
+        };
+
+        // Step 21. If response is not a network error and either request’s method is `HEAD` or `CONNECT`,
+        // or internalResponse’s status is a null body status, set internalResponse’s body to null and
+        // disregard any enqueuing toward it (if any).
+        // NOTE: We check `internal_response` since we did not mutate `response` in the previous steps.
         let not_network_error = !response_is_network_error && !internal_response.is_network_error();
         if not_network_error &&
             (is_null_body_status(&internal_response.status) ||
-                match request.method {
-                    Method::HEAD | Method::CONNECT => true,
-                    _ => false,
-                })
+                matches!(request.method, Method::HEAD | Method::CONNECT))
         {
             // when Fetch is used only asynchronously, we will need to make sure
             // that nothing tries to write to the body at this point
-            let mut body = internal_response.body.lock().unwrap();
+            let mut body = internal_response.body.lock();
             *body = ResponseBody::Empty;
         }
 
-        internal_response.get_network_error().map(|e| e.clone())
+        internal_response.get_network_error().cloned()
     };
 
     // Execute deferred rebinding of response.
@@ -450,17 +749,15 @@ pub async fn main_fetch(
     let mut response_loaded = false;
     let mut response = if !response.is_network_error() && !request.integrity_metadata.is_empty() {
         // Step 19.1.
-        wait_for_response(&mut response, target, done_chan).await;
+        wait_for_response(request, &mut response, target, done_chan, context).await;
         response_loaded = true;
 
         // Step 19.2.
-        let ref integrity_metadata = &request.integrity_metadata;
+        let integrity_metadata = &request.integrity_metadata;
         if response.termination_reason.is_none() &&
             !is_response_integrity_valid(integrity_metadata, &response)
         {
-            Response::network_error(NetworkError::Internal(
-                "Subresource integrity validation failed".into(),
-            ))
+            Response::network_error(NetworkError::SubresourceIntegrity)
         } else {
             response
         }
@@ -472,39 +769,48 @@ pub async fn main_fetch(
     if request.synchronous {
         // process_response is not supposed to be used
         // by sync fetch, but we overload it here for simplicity
-        target.process_response(&mut response);
+        target.process_response(request, &response);
         if !response_loaded {
-            wait_for_response(&mut response, target, done_chan).await;
+            wait_for_response(request, &mut response, target, done_chan, context).await;
         }
         // overloaded similarly to process_response
-        target.process_response_eof(&response);
+        target.process_response_eof(request, &response);
         return response;
     }
 
     // Step 21.
-    if request.body.is_some() && matches!(request.current_url().scheme(), "http" | "https") {
+    if request.body.is_some() && matches!(current_scheme, "http" | "https") {
         // XXXManishearth: We actually should be calling process_request
         // in http_network_fetch. However, we can't yet follow the request
         // upload progress, so I'm keeping it here for now and pretending
         // the body got sent in one chunk
-        target.process_request_body(&request);
-        target.process_request_eof(&request);
+        target.process_request_body(request);
+        target.process_request_eof(request);
     }
 
     // Step 22.
-    target.process_response(&response);
+    target.process_response(request, &response);
+    // Send Response to Devtools
+    send_response_to_devtools(request, context, &response, None);
+    send_security_info_to_devtools(request, context, &response);
 
     // Step 23.
     if !response_loaded {
-        wait_for_response(&mut response, target, done_chan).await;
+        wait_for_response(request, &mut response, target, done_chan, context).await;
     }
 
     // Step 24.
-    target.process_response_eof(&response);
+    target.process_response_eof(request, &response);
+    // Send Response to Devtools
+    // This is done after process_response_eof to ensure that the body is fully
+    // processed before sending the response to Devtools.
+    send_response_to_devtools(request, context, &response, None);
 
-    if let Ok(http_cache) = context.state.http_cache.write() {
-        http_cache.update_awaiting_consumers(&request, &response);
-    }
+    context
+        .state
+        .http_cache
+        .update_awaiting_consumers(request, &response)
+        .await;
 
     // Steps 25-27.
     // TODO: remove this line when only asynchronous fetches are used
@@ -512,17 +818,24 @@ pub async fn main_fetch(
 }
 
 async fn wait_for_response(
+    request: &Request,
     response: &mut Response,
     target: Target<'_>,
     done_chan: &mut DoneChannel,
+    context: &FetchContext,
 ) {
     if let Some(ref mut ch) = *done_chan {
+        let mut devtools_body = context.devtools_chan.as_ref().map(|_| Vec::new());
         loop {
             match ch.1.recv().await {
                 Some(Data::Payload(vec)) => {
-                    target.process_response_chunk(vec);
+                    if let Some(body) = devtools_body.as_mut() {
+                        body.extend(&vec);
+                    }
+                    target.process_response_chunk(request, vec);
                 },
                 Some(Data::Done) => {
+                    send_response_to_devtools(request, context, response, devtools_body);
                     break;
                 },
                 Some(Data::Cancelled) => {
@@ -535,14 +848,20 @@ async fn wait_for_response(
             }
         }
     } else {
-        let body = response.actual_response().body.lock().unwrap();
-        if let ResponseBody::Done(ref vec) = *body {
-            // in case there was no channel to wait for, the body was
-            // obtained synchronously via scheme_fetch for data/file/about/etc
-            // We should still send the body across as a chunk
-            target.process_response_chunk(vec.clone());
-        } else {
-            assert_eq!(*body, ResponseBody::Empty)
+        match *response.actual_response().body.lock() {
+            ResponseBody::Done(ref vec) if !vec.is_empty() => {
+                // in case there was no channel to wait for, the body was
+                // obtained synchronously via scheme_fetch for data/file/about/etc
+                // We should still send the body across as a chunk
+                target.process_response_chunk(request, vec.clone());
+                if context.devtools_chan.is_some() {
+                    // Now that we've replayed the entire cached body,
+                    // notify the DevTools server with the full Response.
+                    send_response_to_devtools(request, context, response, Some(vec.clone()));
+                }
+            },
+            ResponseBody::Done(_) | ResponseBody::Empty => {},
+            _ => unreachable!(),
         }
     }
 }
@@ -557,15 +876,15 @@ pub enum RangeRequestBounds {
 }
 
 impl RangeRequestBounds {
-    pub fn get_final(&self, len: Option<u64>) -> Result<RelativePos, ()> {
+    pub fn get_final(&self, len: Option<u64>) -> Result<RelativePos, &'static str> {
         match self {
             RangeRequestBounds::Final(pos) => {
                 if let Some(len) = len {
                     if pos.start <= len as i64 {
-                        return Ok(pos.clone());
+                        return Ok(*pos);
                     }
                 }
-                Err(())
+                Err("Tried to process RangeRequestBounds::Final without len")
             },
             RangeRequestBounds::Pending(offset) => Ok(RelativePos::from_opts(
                 if let Some(len) = len {
@@ -579,274 +898,123 @@ impl RangeRequestBounds {
     }
 }
 
-/// Get the range bounds if the `Range` header is present.
-fn get_range_request_bounds(range: Option<Range>) -> RangeRequestBounds {
-    if let Some(ref range) = range {
-        let (start, end) = match range
-            .iter()
-            .collect::<Vec<(Bound<u64>, Bound<u64>)>>()
-            .first()
-        {
-            Some(&(Bound::Included(start), Bound::Unbounded)) => (start, None),
-            Some(&(Bound::Included(start), Bound::Included(end))) => {
-                // `end` should be less or equal to `start`.
-                (start, Some(i64::max(start as i64, end as i64)))
-            },
-            Some(&(Bound::Unbounded, Bound::Included(offset))) => {
-                return RangeRequestBounds::Pending(offset);
-            },
-            _ => (0, None),
-        };
-        RangeRequestBounds::Final(RelativePos::from_opts(Some(start as i64), end))
-    } else {
-        RangeRequestBounds::Final(RelativePos::from_opts(Some(0), None))
-    }
-}
-
-fn partial_content(response: &mut Response) {
-    let reason = "Partial Content".to_owned();
-    response.status = Some((StatusCode::PARTIAL_CONTENT, reason.clone()));
-    response.raw_status = Some((StatusCode::PARTIAL_CONTENT.as_u16(), reason.into()));
-}
-
-fn range_not_satisfiable_error(response: &mut Response) {
-    let reason = "Range Not Satisfiable".to_owned();
-    response.status = Some((StatusCode::RANGE_NOT_SATISFIABLE, reason.clone()));
-    response.raw_status = Some((StatusCode::RANGE_NOT_SATISFIABLE.as_u16(), reason.into()));
-}
-
 fn create_blank_reply(url: ServoUrl, timing_type: ResourceTimingType) -> Response {
     let mut response = Response::new(url, ResourceFetchTiming::new(timing_type));
     response
         .headers
         .typed_insert(ContentType::from(mime::TEXT_HTML_UTF_8));
-    *response.body.lock().unwrap() = ResponseBody::Done(vec![]);
-    response.status = Some((StatusCode::OK, "OK".to_string()));
-    response.raw_status = Some((StatusCode::OK.as_u16(), b"OK".to_vec()));
+    *response.body.lock() = ResponseBody::Done(vec![]);
+    response.status = HttpStatus::default();
     response
+}
+
+fn create_about_memory(url: ServoUrl, timing_type: ResourceTimingType) -> Response {
+    let mut response = Response::new(url, ResourceFetchTiming::new(timing_type));
+    response
+        .headers
+        .typed_insert(ContentType::from(mime::TEXT_HTML_UTF_8));
+    *response.body.lock() = ResponseBody::Done(resources::read_bytes(Resource::AboutMemoryHTML));
+    response.status = HttpStatus::default();
+    response
+}
+
+/// Handle a request from the user interface to ignore validation errors for a certificate.
+fn handle_allowcert_request(request: &mut Request, context: &FetchContext) -> io::Result<()> {
+    let error = |string| Err(io::Error::other(string));
+
+    let body = match request.body.as_mut() {
+        Some(body) => body,
+        None => return error("No body found"),
+    };
+
+    let stream = body.take_stream();
+    let stream = stream.lock();
+    let (body_chan, body_port) = ipc::channel().unwrap();
+    let _ = stream.send(BodyChunkRequest::Connect(body_chan));
+    let _ = stream.send(BodyChunkRequest::Chunk);
+    let body_bytes = match body_port.recv().ok() {
+        Some(BodyChunkResponse::Chunk(bytes)) => bytes,
+        _ => return error("Certificate not sent in a single chunk"),
+    };
+
+    let split_idx = match body_bytes.iter().position(|b| *b == b'&') {
+        Some(split_idx) => split_idx,
+        None => return error("Could not find ampersand in data"),
+    };
+    let (secret, cert_base64) = body_bytes.split_at(split_idx);
+
+    let secret = str::from_utf8(secret).ok().and_then(|s| s.parse().ok());
+    if secret != Some(*net_traits::PRIVILEGED_SECRET) {
+        return error("Invalid secret sent. Ignoring request");
+    }
+
+    let cert_bytes = match general_purpose::STANDARD_NO_PAD.decode(&cert_base64[1..]) {
+        Ok(bytes) => bytes,
+        Err(_) => return error("Could not decode certificate base64"),
+    };
+
+    context
+        .state
+        .override_manager
+        .add_override(&CertificateDer::from_slice(&cert_bytes).into_owned());
+    Ok(())
 }
 
 /// [Scheme fetch](https://fetch.spec.whatwg.org#scheme-fetch)
 async fn scheme_fetch(
-    request: &mut Request,
+    fetch_params: &mut FetchParams,
     cache: &mut CorsCache,
     target: Target<'_>,
     done_chan: &mut DoneChannel,
     context: &FetchContext,
 ) -> Response {
+    // Step 1: If fetchParams is canceled, then return the appropriate network error for fetchParams.
+
+    // Step 2: Let request be fetchParams’s request.
+    let request = &mut fetch_params.request;
     let url = request.current_url();
 
-    match url.scheme() {
+    let scheme = url.scheme();
+    match scheme {
         "about" if url.path() == "blank" => create_blank_reply(url, request.timing_type()),
+        "about" if url.path() == "memory" => create_about_memory(url, request.timing_type()),
 
         "chrome" if url.path() == "allowcert" => {
-            let data = request.body.as_mut().and_then(|body| {
-                let stream = body.take_stream();
-                let stream = stream.lock().unwrap();
-                let (body_chan, body_port) = ipc::channel().unwrap();
-                let _ = stream.send(BodyChunkRequest::Connect(body_chan));
-                let _ = stream.send(BodyChunkRequest::Chunk);
-                match body_port.recv().ok() {
-                    Some(BodyChunkResponse::Chunk(bytes)) => Some(bytes),
-                    _ => panic!("cert should be sent in a single chunk."),
-                }
-            });
-            let data = data.as_ref().and_then(|b| {
-                let idx = b.iter().position(|b| *b == b'&')?;
-                Some(b.split_at(idx))
-            });
-
-            if let Some((secret, bytes)) = data {
-                let secret = str::from_utf8(secret).ok().and_then(|s| s.parse().ok());
-                if secret == Some(*net_traits::PRIVILEGED_SECRET) {
-                    if let Ok(bytes) = base64::decode(&bytes[1..]) {
-                        context.state.extra_certs.add(bytes);
-                    }
-                }
+            if let Err(error) = handle_allowcert_request(request, context) {
+                warn!("Could not handle allowcert request: {error}");
             }
-
             create_blank_reply(url, request.timing_type())
         },
 
         "http" | "https" => {
             http_fetch(
-                request, cache, false, false, false, target, done_chan, context,
+                fetch_params,
+                cache,
+                false,
+                false,
+                false,
+                target,
+                done_chan,
+                context,
             )
             .await
         },
 
-        "data" => match decode(&url) {
-            Ok((mime, bytes)) => {
-                let mut response =
-                    Response::new(url, ResourceFetchTiming::new(request.timing_type()));
-                *response.body.lock().unwrap() = ResponseBody::Done(bytes);
-                response.headers.typed_insert(ContentType::from(mime));
-                response.status = Some((StatusCode::OK, "OK".to_string()));
-                response.raw_status = Some((StatusCode::OK.as_u16(), b"OK".to_vec()));
-                response
-            },
-            Err(_) => {
-                Response::network_error(NetworkError::Internal("Decoding data URL failed".into()))
-            },
+        _ => match context.protocols.get(scheme) {
+            Some(handler) => handler.load(request, done_chan, context).await,
+            None => Response::network_error(NetworkError::UnsupportedScheme),
         },
-
-        "file" => {
-            if request.method != Method::GET {
-                return Response::network_error(NetworkError::Internal(
-                    "Unexpected method for file".into(),
-                ));
-            }
-            if let Ok(file_path) = url.to_file_path() {
-                if let Ok(file) = File::open(file_path.clone()) {
-                    if let Ok(metadata) = file.metadata() {
-                        if metadata.is_dir() {
-                            return Response::network_error(NetworkError::Internal(
-                                "Opening a directory is not supported".into(),
-                            ));
-                        }
-                    }
-
-                    // Get range bounds (if any) and try to seek to the requested offset.
-                    // If seeking fails, bail out with a NetworkError.
-                    let file_size = match file.metadata() {
-                        Ok(metadata) => Some(metadata.len()),
-                        Err(_) => None,
-                    };
-
-                    let mut response =
-                        Response::new(url, ResourceFetchTiming::new(request.timing_type()));
-
-                    let range_header = request.headers.typed_get::<Range>();
-                    let is_range_request = range_header.is_some();
-                    let range = match get_range_request_bounds(range_header).get_final(file_size) {
-                        Ok(range) => range,
-                        Err(_) => {
-                            range_not_satisfiable_error(&mut response);
-                            return response;
-                        },
-                    };
-                    let mut reader = BufReader::with_capacity(FILE_CHUNK_SIZE, file);
-                    if reader.seek(SeekFrom::Start(range.start as u64)).is_err() {
-                        return Response::network_error(NetworkError::Internal(
-                            "Unexpected method for file".into(),
-                        ));
-                    }
-
-                    // Set response status to 206 if Range header is present.
-                    // At this point we should have already validated the header.
-                    if is_range_request {
-                        partial_content(&mut response);
-                    }
-
-                    // Set Content-Type header.
-                    let mime = mime_guess::from_path(file_path).first_or_octet_stream();
-                    response.headers.typed_insert(ContentType::from(mime));
-
-                    // Setup channel to receive cross-thread messages about the file fetch
-                    // operation.
-                    let (mut done_sender, done_receiver) = unbounded_channel();
-                    *done_chan = Some((done_sender.clone(), done_receiver));
-
-                    *response.body.lock().unwrap() = ResponseBody::Receiving(vec![]);
-
-                    context.filemanager.lock().unwrap().fetch_file_in_chunks(
-                        &mut done_sender,
-                        reader,
-                        response.body.clone(),
-                        context.cancellation_listener.clone(),
-                        range,
-                    );
-
-                    response
-                } else {
-                    Response::network_error(NetworkError::Internal("Opening file failed".into()))
-                }
-            } else {
-                Response::network_error(NetworkError::Internal(
-                    "Constructing file path failed".into(),
-                ))
-            }
-        },
-
-        "blob" => {
-            debug!("Loading blob {}", url.as_str());
-            // Step 2.
-            if request.method != Method::GET {
-                return Response::network_error(NetworkError::Internal(
-                    "Unexpected method for blob".into(),
-                ));
-            }
-
-            let range_header = request.headers.typed_get::<Range>();
-            let is_range_request = range_header.is_some();
-            // We will get a final version of this range once we have
-            // the length of the data backing the blob.
-            let range = get_range_request_bounds(range_header);
-
-            let (id, origin) = match parse_blob_url(&url) {
-                Ok((id, origin)) => (id, origin),
-                Err(()) => {
-                    return Response::network_error(NetworkError::Internal(
-                        "Invalid blob url".into(),
-                    ));
-                },
-            };
-
-            let mut response = Response::new(url, ResourceFetchTiming::new(request.timing_type()));
-            response.status = Some((StatusCode::OK, "OK".to_string()));
-            response.raw_status = Some((StatusCode::OK.as_u16(), b"OK".to_vec()));
-
-            if is_range_request {
-                partial_content(&mut response);
-            }
-
-            let (mut done_sender, done_receiver) = unbounded_channel();
-            *done_chan = Some((done_sender.clone(), done_receiver));
-            *response.body.lock().unwrap() = ResponseBody::Receiving(vec![]);
-
-            if let Err(err) = context.filemanager.lock().unwrap().fetch_file(
-                &mut done_sender,
-                context.cancellation_listener.clone(),
-                id,
-                &context.file_token,
-                origin,
-                &mut response,
-                range,
-            ) {
-                let _ = done_sender.send(Data::Done);
-                let err = match err {
-                    BlobURLStoreError::InvalidRange => {
-                        range_not_satisfiable_error(&mut response);
-                        return response;
-                    },
-                    _ => format!("{:?}", err),
-                };
-                return Response::network_error(NetworkError::Internal(err));
-            };
-
-            response
-        },
-
-        "ftp" => {
-            debug!("ftp is not implemented");
-            Response::network_error(NetworkError::Internal("Unexpected scheme".into()))
-        },
-
-        _ => Response::network_error(NetworkError::Internal("Unexpected scheme".into())),
     }
 }
 
-fn is_null_body_status(status: &Option<(StatusCode, String)>) -> bool {
-    match *status {
-        Some((status, _)) => match status {
-            StatusCode::SWITCHING_PROTOCOLS |
-            StatusCode::NO_CONTENT |
-            StatusCode::RESET_CONTENT |
-            StatusCode::NOT_MODIFIED => true,
-            _ => false,
-        },
-        _ => false,
-    }
+fn is_null_body_status(status: &HttpStatus) -> bool {
+    matches!(
+        status.try_code(),
+        Some(StatusCode::SWITCHING_PROTOCOLS) |
+            Some(StatusCode::NO_CONTENT) |
+            Some(StatusCode::RESET_CONTENT) |
+            Some(StatusCode::NOT_MODIFIED)
+    )
 }
 
 /// <https://fetch.spec.whatwg.org/#should-response-to-request-be-blocked-due-to-nosniff?>
@@ -861,7 +1029,7 @@ pub fn should_be_blocked_due_to_nosniff(
 
     // Step 2
     // Note: an invalid MIME type will produce a `None`.
-    let content_type_header = response_headers.typed_get::<ContentType>();
+    let mime_type = extract_mime_type_as_mime(response_headers);
 
     /// <https://html.spec.whatwg.org/multipage/#scriptingLanguages>
     #[inline]
@@ -890,16 +1058,12 @@ pub fn should_be_blocked_due_to_nosniff(
             .any(|mime| mime.type_() == mime_type.type_() && mime.subtype() == mime_type.subtype())
     }
 
-    match content_type_header {
+    match mime_type {
         // Step 4
-        Some(ref ct) if destination.is_script_like() => {
-            !is_javascript_mime_type(&ct.clone().into())
-        },
-
+        Some(ref mime_type) if destination.is_script_like() => !is_javascript_mime_type(mime_type),
         // Step 5
-        Some(ref ct) if destination == Destination::Style => {
-            let m: mime::Mime = ct.clone().into();
-            m.type_() != mime::TEXT && m.subtype() != mime::CSS
+        Some(ref mime_type) if destination == Destination::Style => {
+            mime_type.type_() != mime::TEXT && mime_type.subtype() != mime::CSS
         },
 
         None if destination == Destination::Style || destination.is_script_like() => true,
@@ -913,56 +1077,107 @@ fn should_be_blocked_due_to_mime_type(
     destination: Destination,
     response_headers: &HeaderMap,
 ) -> bool {
-    // Step 1
-    let mime_type: mime::Mime = match response_headers.typed_get::<ContentType>() {
-        Some(header) => header.into(),
+    // Step 1: Let mimeType be the result of extracting a MIME type from response’s header list.
+    let mime_type: mime::Mime = match extract_mime_type_as_mime(response_headers) {
+        Some(mime_type) => mime_type,
+        // Step 2: If mimeType is failure, then return allowed.
         None => return false,
     };
 
-    // Step 2-3
+    // Step 3: Let destination be request’s destination.
+    // Step 4: If destination is script-like and one of the following is true, then return blocked:
+    //    - mimeType’s essence starts with "audio/", "image/", or "video/".
+    //    - mimeType’s essence is "text/csv".
+    // Step 5: Return allowed.
     destination.is_script_like() &&
         match mime_type.type_() {
             mime::AUDIO | mime::VIDEO | mime::IMAGE => true,
             mime::TEXT if mime_type.subtype() == mime::CSV => true,
-            // Step 4
             _ => false,
         }
 }
 
 /// <https://fetch.spec.whatwg.org/#block-bad-port>
-pub fn should_be_blocked_due_to_bad_port(url: &ServoUrl) -> bool {
-    // Step 1 is not applicable, this function just takes the URL directly.
+pub fn should_request_be_blocked_due_to_a_bad_port(url: &ServoUrl) -> bool {
+    // Step 1. Let url be request’s current URL.
+    // NOTE: We receive the request url as an argument
 
-    // Step 2.
-    let scheme = url.scheme();
-
-    // Step 3.
-    // If there is no explicit port, this means the default one is used for
-    // the given scheme, and thus this means the request should not be blocked
-    // due to a bad port.
-    let port = if let Some(port) = url.port() {
-        port
-    } else {
-        return false;
-    };
-
-    // Step 4.
-    if scheme == "ftp" && (port == 20 || port == 21) {
-        return false;
-    }
-
-    // Step 5.
-    if is_network_scheme(scheme) && is_bad_port(port) {
+    // Step 2. If url’s scheme is an HTTP(S) scheme and url’s port is a bad port, then return blocked.
+    let is_http_scheme = matches!(url.scheme(), "http" | "https");
+    let is_bad_port = url.port().is_some_and(is_bad_port);
+    if is_http_scheme && is_bad_port {
         return true;
     }
 
-    // Step 6.
+    // Step 3. Return allowed.
     false
 }
 
-/// <https://fetch.spec.whatwg.org/#network-scheme>
-fn is_network_scheme(scheme: &str) -> bool {
-    scheme == "ftp" || scheme == "http" || scheme == "https"
+/// <https://w3c.github.io/webappsec-mixed-content/#should-block-fetch>
+pub fn should_request_be_blocked_as_mixed_content(
+    request: &Request,
+    protocol_registry: &ProtocolRegistry,
+) -> bool {
+    // Step 1. Return allowed if one or more of the following conditions are met:
+    // 1.1. Does settings prohibit mixed security contexts?
+    // returns "Does Not Restrict Mixed Security Contexts" when applied to request’s client.
+    if do_settings_prohibit_mixed_security_contexts(request) ==
+        MixedSecurityProhibited::NotProhibited
+    {
+        return false;
+    }
+
+    // 1.2. request’s URL is a potentially trustworthy URL.
+    if is_url_potentially_trustworthy(protocol_registry, &request.url()) {
+        return false;
+    }
+
+    // 1.3. The user agent has been instructed to allow mixed content.
+
+    // 1.4. request’s destination is "document", and request’s target browsing context has
+    // no parent browsing context.
+    if request.destination == Destination::Document {
+        // TODO: request's target browsing context has no parent browsing context
+        return false;
+    }
+
+    true
+}
+
+/// <https://w3c.github.io/webappsec-mixed-content/#should-block-response>
+pub fn should_response_be_blocked_as_mixed_content(
+    request: &Request,
+    response: &Response,
+    protocol_registry: &ProtocolRegistry,
+) -> bool {
+    // Step 1. Return allowed if one or more of the following conditions are met:
+    // 1.1. Does settings prohibit mixed security contexts? returns Does Not Restrict Mixed Content
+    // when applied to request’s client.
+    if do_settings_prohibit_mixed_security_contexts(request) ==
+        MixedSecurityProhibited::NotProhibited
+    {
+        return false;
+    }
+
+    // 1.2. response’s url is a potentially trustworthy URL.
+    if response
+        .actual_response()
+        .url()
+        .is_some_and(|response_url| is_url_potentially_trustworthy(protocol_registry, response_url))
+    {
+        return false;
+    }
+
+    // 1.3. TODO: The user agent has been instructed to allow mixed content.
+
+    // 1.4. request’s destination is "document", and request’s target browsing context
+    // has no parent browsing context.
+    if request.destination == Destination::Document {
+        // TODO: if requests target browsing context has no parent browsing context
+        return false;
+    }
+
+    true
 }
 
 /// <https://fetch.spec.whatwg.org/#bad-port>
@@ -976,4 +1191,145 @@ fn is_bad_port(port: u16) -> bool {
     ];
 
     BAD_PORTS.binary_search(&port).is_ok()
+}
+
+// TODO : Investigate and need to revisit again
+pub fn is_form_submission_request(request: &Request) -> bool {
+    let content_type = request.headers.typed_get::<ContentType>();
+    content_type.is_some_and(|ct| {
+        let mime: Mime = ct.into();
+        mime.type_() == mime::APPLICATION && mime.subtype() == mime::WWW_FORM_URLENCODED
+    })
+}
+
+/// <https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-request>
+fn should_upgrade_request_to_potentially_trustworthy(
+    request: &mut Request,
+    context: &FetchContext,
+) -> bool {
+    fn should_upgrade_navigation_request(request: &Request) -> bool {
+        // Step 2.1 If request is a form submission, skip the remaining substeps, and continue upgrading request.
+        if is_form_submission_request(request) {
+            return true;
+        }
+
+        // Step 2.2 If request’s client's target browsing context is a nested browsing context,
+        // skip the remaining substeps and continue upgrading request.
+        if request
+            .client
+            .as_ref()
+            .is_some_and(|client| client.is_nested_browsing_context)
+        {
+            return true;
+        }
+
+        // Step 2.4
+        // TODO : check for insecure navigation set after its implemention
+
+        // Step 2.5 Return without further modifying request
+        false
+    }
+
+    // Step 1. If request is a navigation request,
+    if request.is_navigation_request() {
+        // Append a header named Upgrade-Insecure-Requests with a value of 1 to
+        // request’s header list if any of the following criteria are met:
+        // * request’s URL is not a potentially trustworthy URL
+        // * request’s URL's host is not a preloadable HSTS host
+        if !is_url_potentially_trustworthy(&context.protocols, &request.current_url()) ||
+            request
+                .current_url()
+                .host_str()
+                .is_none_or(|host| context.state.hsts_list.read().is_host_secure(host))
+        {
+            debug!("Appending the Upgrade-Insecure-Requests header to request’s header list");
+            request
+                .headers
+                .insert("Upgrade-Insecure-Requests", HeaderValue::from_static("1"));
+        }
+
+        if !should_upgrade_navigation_request(request) {
+            return false;
+        }
+    }
+
+    // Step 3. Let upgrade state be the result of executing
+    // §4.2 Should insecure requests be upgraded for client? upon request's client.
+    // Step 4. If upgrade state is "Do Not Upgrade", return without modifying request.
+    request
+        .client
+        .as_ref()
+        .is_some_and(|client| client.insecure_requests_policy == InsecureRequestsPolicy::Upgrade)
+}
+
+#[derive(Debug, PartialEq)]
+pub enum MixedSecurityProhibited {
+    Prohibited,
+    NotProhibited,
+}
+
+/// <https://w3c.github.io/webappsec-mixed-content/#categorize-settings-object>
+fn do_settings_prohibit_mixed_security_contexts(request: &Request) -> MixedSecurityProhibited {
+    if let Origin::Origin(ref origin) = request.origin {
+        // Workers created from a data: url are secure if they were created from secure contexts
+        let is_origin_data_url_worker = matches!(
+            *origin,
+            ImmutableOrigin::Opaque(servo_url::OpaqueOrigin::SecureWorkerFromDataUrl(_))
+        );
+
+        // Step 1. If settings’ origin is a potentially trustworthy origin,
+        // then return "Prohibits Mixed Security Contexts".
+        if origin.is_potentially_trustworthy() || is_origin_data_url_worker {
+            return MixedSecurityProhibited::Prohibited;
+        }
+    }
+
+    // Step 2.2. For each navigable navigable in document’s ancestor navigables:
+    // Step 2.2.1. If navigable’s active document's origin is a potentially trustworthy origin,
+    // then return "Prohibits Mixed Security Contexts".
+    if request.has_trustworthy_ancestor_origin {
+        return MixedSecurityProhibited::Prohibited;
+    }
+
+    MixedSecurityProhibited::NotProhibited
+}
+
+/// <https://w3c.github.io/webappsec-mixed-content/#upgrade-algorithm>
+fn should_upgrade_mixed_content_request(
+    request: &Request,
+    protocol_registry: &ProtocolRegistry,
+) -> bool {
+    let url = request.url();
+    // Step 1.1 : request’s URL is a potentially trustworthy URL.
+    if is_url_potentially_trustworthy(protocol_registry, &url) {
+        return false;
+    }
+
+    // Step 1.2 : request’s URL’s host is an IP address.
+    match url.host() {
+        Some(Host::Ipv4(_)) | Some(Host::Ipv6(_)) => return false,
+        _ => (),
+    }
+
+    // Step 1.3
+    if do_settings_prohibit_mixed_security_contexts(request) ==
+        MixedSecurityProhibited::NotProhibited
+    {
+        return false;
+    }
+
+    // Step 1.4 : request’s destination is not "image", "audio", or "video".
+    if !matches!(
+        request.destination,
+        Destination::Audio | Destination::Image | Destination::Video
+    ) {
+        return false;
+    }
+
+    // Step 1.5 : request’s destination is "image" and request’s initiator is "imageset".
+    if request.destination == Destination::Image && request.initiator == Initiator::ImageSet {
+        return false;
+    }
+
+    true
 }

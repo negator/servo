@@ -8,16 +8,17 @@ use std::env;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Mutex;
+use std::sync::LazyLock;
 
-lazy_static! {
-    static ref HOST_TABLE: Mutex<Option<HashMap<String, IpAddr>>> = Mutex::new(create_host_table());
-}
+use parking_lot::Mutex;
+
+static HOST_TABLE: LazyLock<Mutex<Option<HashMap<String, IpAddr>>>> =
+    LazyLock::new(|| Mutex::new(create_host_table()));
 
 fn create_host_table() -> Option<HashMap<String, IpAddr>> {
     let path = env::var_os("HOST_FILE")?;
 
-    let file = File::open(&path).ok()?;
+    let file = File::open(path).ok()?;
     let mut reader = BufReader::new(file);
 
     let mut lines = String::new();
@@ -26,8 +27,9 @@ fn create_host_table() -> Option<HashMap<String, IpAddr>> {
     Some(parse_hostsfile(&lines))
 }
 
+#[cfg_attr(not(feature = "test-util"), expect(dead_code))]
 pub fn replace_host_table(table: HashMap<String, IpAddr>) {
-    *HOST_TABLE.lock().unwrap() = Some(table);
+    *HOST_TABLE.lock() = Some(table);
 }
 
 pub fn parse_hostsfile(hostsfile_content: &str) -> HashMap<String, IpAddr> {
@@ -50,10 +52,9 @@ pub fn parse_hostsfile(hostsfile_content: &str) -> HashMap<String, IpAddr> {
         .collect()
 }
 
-pub fn replace_host(host: &str) -> Cow<str> {
+pub fn replace_host(host: &str) -> Cow<'_, str> {
     HOST_TABLE
         .lock()
-        .unwrap()
         .as_ref()
         .and_then(|table| table.get(host))
         .map_or(host.into(), |replaced_host| {

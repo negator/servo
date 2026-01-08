@@ -2,77 +2,103 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use crate::dom::bindings::cell::DomRefCell;
+use dom_struct::dom_struct;
+use js::jsapi::{Heap, JSObject, Type};
+use js::rust::CustomAutoRooterGuard;
+use js::typedarray::{ArrayBufferView, ArrayBufferViewU8, HeapArrayBufferView, TypedArray};
+use rand::TryRngCore;
+use rand::rngs::OsRng;
+use script_bindings::trace::RootedTraceableBox;
+use uuid::Uuid;
+
 use crate::dom::bindings::codegen::Bindings::CryptoBinding::CryptoMethods;
 use crate::dom::bindings::error::{Error, Fallible};
-use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
-use crate::dom::bindings::root::DomRoot;
+use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object};
+use crate::dom::bindings::root::{DomRoot, MutNullableDom};
+use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::JSContext;
-use dom_struct::dom_struct;
-use js::jsapi::JSObject;
-use js::jsapi::Type;
-use js::rust::CustomAutoRooterGuard;
-use js::typedarray::ArrayBufferView;
-use servo_rand::{RngCore, ServoRng};
-use std::ptr::NonNull;
-
-unsafe_no_jsmanaged_fields!(ServoRng);
+use crate::dom::subtlecrypto::SubtleCrypto;
+use crate::script_runtime::{CanGc, JSContext};
 
 // https://developer.mozilla.org/en-US/docs/Web/API/Crypto
 #[dom_struct]
-pub struct Crypto {
+pub(crate) struct Crypto {
     reflector_: Reflector,
-    #[ignore_malloc_size_of = "Defined in rand"]
-    rng: DomRefCell<ServoRng>,
+    subtle: MutNullableDom<SubtleCrypto>,
 }
 
 impl Crypto {
     fn new_inherited() -> Crypto {
         Crypto {
             reflector_: Reflector::new(),
-            rng: DomRefCell::new(ServoRng::new()),
+            subtle: MutNullableDom::default(),
         }
     }
 
-    pub fn new(global: &GlobalScope) -> DomRoot<Crypto> {
-        reflect_dom_object(Box::new(Crypto::new_inherited()), global)
+    pub(crate) fn new(global: &GlobalScope, can_gc: CanGc) -> DomRoot<Crypto> {
+        reflect_dom_object(Box::new(Crypto::new_inherited()), global, can_gc)
     }
 }
 
-impl CryptoMethods for Crypto {
-    #[allow(unsafe_code)]
-    // https://dvcs.w3.org/hg/webcrypto-api/raw-file/tip/spec/Overview.html#Crypto-method-getRandomValues
+impl CryptoMethods<crate::DomTypeHolder> for Crypto {
+    /// <https://w3c.github.io/webcrypto/#dfn-Crypto-attribute-subtle>
+    fn Subtle(&self, can_gc: CanGc) -> DomRoot<SubtleCrypto> {
+        self.subtle
+            .or_init(|| SubtleCrypto::new(&self.global(), can_gc))
+    }
+
+    #[expect(unsafe_code)]
+    /// <https://w3c.github.io/webcrypto/#Crypto-method-getRandomValues>
     fn GetRandomValues(
         &self,
         _cx: JSContext,
         mut input: CustomAutoRooterGuard<ArrayBufferView>,
-    ) -> Fallible<NonNull<JSObject>> {
+    ) -> Fallible<RootedTraceableBox<HeapArrayBufferView>> {
         let array_type = input.get_array_type();
 
         if !is_integer_buffer(array_type) {
-            return Err(Error::TypeMismatch);
+            Err(Error::TypeMismatch(None))
         } else {
-            let mut data = unsafe { input.as_mut_slice() };
+            let data = unsafe { input.as_mut_slice() };
             if data.len() > 65536 {
-                return Err(Error::QuotaExceeded);
+                return Err(Error::QuotaExceeded {
+                    quota: None,
+                    requested: None,
+                });
             }
-            self.rng.borrow_mut().fill_bytes(&mut data);
-        }
 
-        unsafe { Ok(NonNull::new_unchecked(*input.underlying_object())) }
+            if OsRng.try_fill_bytes(data).is_err() {
+                return Err(Error::JSFailed);
+            }
+
+            let underlying_object = unsafe { input.underlying_object() };
+            TypedArray::<ArrayBufferViewU8, Box<Heap<*mut JSObject>>>::from(*underlying_object)
+                .map(RootedTraceableBox::new)
+                .map_err(|_| Error::JSFailed)
+        }
+    }
+
+    /// <https://w3c.github.io/webcrypto/#Crypto-method-randomUUID>
+    fn RandomUUID(&self) -> DOMString {
+        let uuid = Uuid::new_v4();
+        uuid.hyphenated()
+            .encode_lower(&mut Uuid::encode_buffer())
+            .to_owned()
+            .into()
     }
 }
 
 fn is_integer_buffer(array_type: Type) -> bool {
-    match array_type {
+    matches!(
+        array_type,
         Type::Uint8 |
-        Type::Uint8Clamped |
-        Type::Int8 |
-        Type::Uint16 |
-        Type::Int16 |
-        Type::Uint32 |
-        Type::Int32 => true,
-        _ => false,
-    }
+            Type::Uint8Clamped |
+            Type::Int8 |
+            Type::Uint16 |
+            Type::Int16 |
+            Type::Uint32 |
+            Type::Int32 |
+            Type::BigInt64 |
+            Type::BigUint64
+    )
 }

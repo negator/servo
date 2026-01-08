@@ -18,6 +18,8 @@ function test_interfaces(interfaceNamesInGlobalScope) {
       "Date",
       "Error",
       "EvalError",
+      "FinalizationRegistry",
+      "Float16Array",
       "Float32Array",
       "Float64Array",
       "Function",
@@ -27,12 +29,14 @@ function test_interfaces(interfaceNamesInGlobalScope) {
       "Int8Array",
       "InternalError",
       "Intl",
+      "Iterator",
       "JSON",
       "Map",
       "Math",
       "MessageChannel",
       "MessagePort",
       "NaN",
+      "Notification",
       "Number",
       "Object",
       "Promise",
@@ -46,6 +50,7 @@ function test_interfaces(interfaceNamesInGlobalScope) {
       "String",
       "Symbol",
       "SyntaxError",
+      "Temporal",
       "TextMetrics",
       "TypeError",
       "URIError",
@@ -54,6 +59,7 @@ function test_interfaces(interfaceNamesInGlobalScope) {
       "Uint8Array",
       "Uint8ClampedArray",
       "WeakMap",
+      "WeakRef",
       "WeakSet",
       "WebAssembly",
     ];
@@ -77,9 +83,7 @@ function test_interfaces(interfaceNamesInGlobalScope) {
       }
       assert_true(name in interfaceMap,
                   "If this is failing: DANGER, are you sure you want to expose the new " +
-                  "interface " + name + " to all webpages as a property on the global? " +
-                  "Do not make a change to this file without review from jdm or Ms2ger " +
-                  "for that specific change!");
+                  "interface " + name + " to all webpages as a property on the global?");
       if (name in interfaceMap) {
         delete interfaceMap[name];
       }

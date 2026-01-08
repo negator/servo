@@ -2,51 +2,42 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-//! Traversals over the DOM and flow trees, running the layout computations.
+use std::cell::Cell;
+use std::sync::atomic::Ordering;
 
-use crate::construct::FlowConstructor;
-use crate::context::LayoutContext;
-use crate::display_list::DisplayListBuildState;
-use crate::flow::{Flow, FlowFlags, GetBaseFlow, ImmutableFlowUtils};
-use crate::wrapper::ThreadSafeLayoutNodeHelpers;
-use crate::wrapper::{GetStyleAndLayoutData, LayoutNodeLayoutData};
-use script_layout_interface::wrapper_traits::{LayoutNode, ThreadSafeLayoutNode};
-use servo_config::opts;
+use bitflags::Flags;
+use layout_api::LayoutDamage;
+use layout_api::wrapper_traits::{LayoutNode, ThreadSafeLayoutNode};
+use script::layout_dom::ServoThreadSafeLayoutNode;
 use style::context::{SharedStyleContext, StyleContext};
 use style::data::ElementData;
 use style::dom::{NodeInfo, TElement, TNode};
 use style::selector_parser::RestyleDamage;
-use style::servo::restyle_damage::ServoRestyleDamage;
-use style::traversal::PerLevelTraversalData;
-use style::traversal::{recalc_style_at, DomTraversal};
+use style::traversal::{DomTraversal, PerLevelTraversalData, recalc_style_at};
+use style::values::computed::Display;
 
-pub struct RecalcStyleAndConstructFlows<'a> {
-    context: LayoutContext<'a>,
+use crate::context::LayoutContext;
+use crate::dom::{DOMLayoutData, NodeExt};
+
+pub struct RecalcStyle<'a> {
+    context: &'a LayoutContext<'a>,
 }
 
-impl<'a> RecalcStyleAndConstructFlows<'a> {
-    /// Creates a traversal context, taking ownership of the shared layout context.
-    pub fn new(context: LayoutContext<'a>) -> Self {
-        RecalcStyleAndConstructFlows { context: context }
+impl<'a> RecalcStyle<'a> {
+    pub(crate) fn new(context: &'a LayoutContext<'a>) -> Self {
+        RecalcStyle { context }
     }
 
-    pub fn context(&self) -> &LayoutContext<'a> {
-        &self.context
-    }
-
-    /// Consumes this traversal context, returning ownership of the shared layout
-    /// context to the caller.
-    pub fn destroy(self) -> LayoutContext<'a> {
+    pub(crate) fn context(&self) -> &LayoutContext<'a> {
         self.context
     }
 }
 
-#[allow(unsafe_code)]
-impl<'a, 'dom, E> DomTraversal<E> for RecalcStyleAndConstructFlows<'a>
+#[expect(unsafe_code)]
+impl<'dom, E> DomTraversal<E> for RecalcStyle<'_>
 where
     E: TElement,
-    E::ConcreteNode: LayoutNode<'dom>,
-    E::FontMetricsProvider: Send,
+    E::ConcreteNode: 'dom + LayoutNode<'dom>,
 {
     fn process_preorder<F>(
         &self,
@@ -57,315 +48,184 @@ where
     ) where
         F: FnMut(E::ConcreteNode),
     {
-        // FIXME(pcwalton): Stop allocating here. Ideally this should just be
-        // done by the HTML parser.
-        unsafe { node.initialize_data() };
+        if node.is_text_node() {
+            return;
+        }
 
-        if !node.is_text_node() {
-            let el = node.as_element().unwrap();
-            let mut data = el.mutate_data().unwrap();
-            recalc_style_at(self, traversal_data, context, el, &mut data, note_child);
+        let had_style_data = node.style_data().is_some();
+        unsafe {
+            node.initialize_style_and_layout_data::<DOMLayoutData>();
+        }
+
+        let element = node.as_element().unwrap();
+        let mut element_data = element.mutate_data().unwrap();
+
+        if !had_style_data {
+            element_data.damage = RestyleDamage::reconstruct();
+        }
+
+        recalc_style_at(
+            self,
+            traversal_data,
+            context,
+            element,
+            &mut element_data,
+            note_child,
+        );
+
+        unsafe {
+            element.unset_dirty_descendants();
         }
     }
 
-    fn process_postorder(&self, _style_context: &mut StyleContext<E>, node: E::ConcreteNode) {
-        construct_flows_at(&self.context, node);
+    #[inline]
+    fn needs_postorder_traversal() -> bool {
+        false
+    }
+
+    fn process_postorder(&self, _style_context: &mut StyleContext<E>, _node: E::ConcreteNode) {
+        panic!("this should never be called")
     }
 
     fn text_node_needs_traversal(node: E::ConcreteNode, parent_data: &ElementData) -> bool {
-        // Text nodes never need styling. However, there are two cases they may need
-        // flow construction:
-        // (1) They child doesn't yet have layout data (preorder traversal initializes it).
-        // (2) The parent element has restyle damage (so the text flow also needs fixup).
-        node.get_style_and_layout_data().is_none() || !parent_data.damage.is_empty()
+        node.layout_data().is_none() || !parent_data.damage.is_empty()
     }
 
-    fn shared_context(&self) -> &SharedStyleContext {
+    fn shared_context(&self) -> &SharedStyleContext<'_> {
         &self.context.style_context
     }
 }
 
-/// A top-down traversal.
-pub trait PreorderFlowTraversal {
-    /// The operation to perform. Return true to continue or false to stop.
-    fn process(&self, flow: &mut dyn Flow);
-
-    /// Returns true if this node should be processed and false if neither this node nor its
-    /// descendants should be processed.
-    fn should_process_subtree(&self, _flow: &mut dyn Flow) -> bool {
-        true
-    }
-
-    /// Returns true if this node must be processed in-order. If this returns false,
-    /// we skip the operation for this node, but continue processing the descendants.
-    /// This is called *after* parent nodes are visited.
-    fn should_process(&self, _flow: &mut dyn Flow) -> bool {
-        true
-    }
-
-    /// Traverses the tree in preorder.
-    fn traverse(&self, flow: &mut dyn Flow) {
-        if !self.should_process_subtree(flow) {
-            return;
-        }
-        if self.should_process(flow) {
-            self.process(flow);
-        }
-        for kid in flow.mut_base().child_iter_mut() {
-            self.traverse(kid);
-        }
-    }
-
-    /// Traverse the Absolute flow tree in preorder.
-    ///
-    /// Traverse all your direct absolute descendants, who will then traverse
-    /// their direct absolute descendants.
-    ///
-    /// Return true if the traversal is to continue or false to stop.
-    fn traverse_absolute_flows(&self, flow: &mut dyn Flow) {
-        if self.should_process(flow) {
-            self.process(flow);
-        }
-        for descendant_link in flow.mut_base().abs_descendants.iter() {
-            self.traverse_absolute_flows(descendant_link)
-        }
-    }
+#[servo_tracing::instrument(skip_all)]
+pub(crate) fn compute_damage_and_repair_style(
+    context: &SharedStyleContext,
+    node: ServoThreadSafeLayoutNode<'_>,
+    damage_from_environment: RestyleDamage,
+) -> RestyleDamage {
+    compute_damage_and_repair_style_inner(context, node, damage_from_environment)
 }
 
-/// A bottom-up traversal, with a optional in-order pass.
-pub trait PostorderFlowTraversal {
-    /// The operation to perform. Return true to continue or false to stop.
-    fn process(&self, flow: &mut dyn Flow);
+pub(crate) fn compute_damage_and_repair_style_inner(
+    context: &SharedStyleContext,
+    node: ServoThreadSafeLayoutNode<'_>,
+    damage_from_parent: RestyleDamage,
+) -> RestyleDamage {
+    let mut element_damage;
+    let original_element_damage;
+    let element_data = &node
+        .style_data()
+        .expect("Should not run `compute_damage` before styling.")
+        .element_data;
 
-    /// Returns false if this node must be processed in-order. If this returns false, we skip the
-    /// operation for this node, but continue processing the ancestors. This is called *after*
-    /// child nodes are visited.
-    fn should_process(&self, _flow: &mut dyn Flow) -> bool {
-        true
-    }
-
-    /// Traverses the tree in postorder.
-    fn traverse(&self, flow: &mut dyn Flow) {
-        for kid in flow.mut_base().child_iter_mut() {
-            self.traverse(kid);
-        }
-        if self.should_process(flow) {
-            self.process(flow);
-        }
-    }
-}
-
-/// An in-order (sequential only) traversal.
-pub trait InorderFlowTraversal {
-    /// The operation to perform. Returns the level of the tree we're at.
-    fn process(&mut self, flow: &mut dyn Flow, level: u32);
-
-    /// Returns true if this node should be processed and false if neither this node nor its
-    /// descendants should be processed.
-    fn should_process_subtree(&mut self, _flow: &mut dyn Flow) -> bool {
-        true
-    }
-
-    /// Traverses the tree in-order.
-    fn traverse(&mut self, flow: &mut dyn Flow, level: u32) {
-        if !self.should_process_subtree(flow) {
-            return;
-        }
-        self.process(flow, level);
-        for kid in flow.mut_base().child_iter_mut() {
-            self.traverse(kid, level + 1);
-        }
-    }
-}
-
-/// A bottom-up, parallelizable traversal.
-pub trait PostorderNodeMutTraversal<'dom, ConcreteThreadSafeLayoutNode>
-where
-    ConcreteThreadSafeLayoutNode: ThreadSafeLayoutNode<'dom>,
-{
-    /// The operation to perform. Return true to continue or false to stop.
-    fn process(&mut self, node: &ConcreteThreadSafeLayoutNode);
-}
-
-#[allow(unsafe_code)]
-#[inline]
-pub unsafe fn construct_flows_at_ancestors<'dom>(
-    context: &LayoutContext,
-    mut node: impl LayoutNode<'dom>,
-) {
-    while let Some(element) = node.traversal_parent() {
-        element.set_dirty_descendants();
-        node = element.as_node();
-        construct_flows_at(context, node);
-    }
-}
-
-/// The flow construction traversal, which builds flows for styled nodes.
-#[inline]
-#[allow(unsafe_code)]
-fn construct_flows_at<'dom>(context: &LayoutContext, node: impl LayoutNode<'dom>) {
-    debug!("construct_flows_at: {:?}", node);
-
-    // Construct flows for this node.
     {
-        let tnode = node.to_threadsafe();
+        let mut element_data = element_data.borrow_mut();
+        original_element_damage = element_data.damage;
+        element_damage = original_element_damage | damage_from_parent;
 
-        // Always reconstruct if incremental layout is turned off.
-        let nonincremental_layout = opts::get().nonincremental_layout;
-        if nonincremental_layout ||
-            tnode.restyle_damage() != RestyleDamage::empty() ||
-            node.as_element()
-                .map_or(false, |el| el.has_dirty_descendants())
-        {
-            let mut flow_constructor = FlowConstructor::new(context);
-            if nonincremental_layout || !flow_constructor.repair_if_possible(&tnode) {
-                flow_constructor.process(&tnode);
-                debug!(
-                    "Constructed flow for {:?}: {:x}",
-                    tnode,
-                    tnode.flow_debug_id()
-                );
+        if let Some(ref style) = element_data.styles.primary {
+            if style.get_box().display == Display::None {
+                element_data.damage = element_damage;
+                return element_damage;
             }
         }
-
-        tnode
-            .mutate_layout_data()
-            .unwrap()
-            .flags
-            .insert(crate::data::LayoutDataFlags::HAS_BEEN_TRAVERSED);
     }
 
-    if let Some(el) = node.as_element() {
-        unsafe {
-            el.unset_dirty_descendants();
+    // If we are reconstructing this node, then all of the children should be reconstructed as well.
+    // Otherwise, do not propagate down its box damage.
+    let mut damage_for_children = element_damage;
+    if !element_damage.contains(LayoutDamage::rebuild_box_tree()) {
+        damage_for_children.truncate();
+    }
+
+    let mut damage_from_children = RestyleDamage::empty();
+    for child in node.children() {
+        if child.is_element() {
+            damage_from_children |=
+                compute_damage_and_repair_style_inner(context, child, damage_for_children);
         }
     }
-}
 
-/// The bubble-inline-sizes traversal, the first part of layout computation. This computes
-/// preferred and intrinsic inline-sizes and bubbles them up the tree.
-pub struct BubbleISizes<'a> {
-    pub layout_context: &'a LayoutContext<'a>,
-}
-
-impl<'a> PostorderFlowTraversal for BubbleISizes<'a> {
-    #[inline]
-    fn process(&self, flow: &mut dyn Flow) {
-        flow.bubble_inline_sizes();
-        flow.mut_base()
-            .restyle_damage
-            .remove(ServoRestyleDamage::BUBBLE_ISIZES);
+    // If one of our children needed to be reconstructed, we need to recollect children
+    // during box tree construction.
+    if damage_from_children.contains(LayoutDamage::recollect_box_tree_children()) {
+        element_damage.insert(LayoutDamage::recollect_box_tree_children());
     }
 
-    #[inline]
-    fn should_process(&self, flow: &mut dyn Flow) -> bool {
-        flow.base()
-            .restyle_damage
-            .contains(ServoRestyleDamage::BUBBLE_ISIZES)
-    }
-}
-
-/// The assign-inline-sizes traversal. In Gecko this corresponds to `Reflow`.
-#[derive(Clone, Copy)]
-pub struct AssignISizes<'a> {
-    pub layout_context: &'a LayoutContext<'a>,
-}
-
-impl<'a> PreorderFlowTraversal for AssignISizes<'a> {
-    #[inline]
-    fn process(&self, flow: &mut dyn Flow) {
-        flow.assign_inline_sizes(self.layout_context);
+    // If this node's box will not be preserved, we need to relayout its box tree.
+    let element_layout_damage = LayoutDamage::from(element_damage);
+    if element_layout_damage.has_box_damage() {
+        element_damage.insert(RestyleDamage::RELAYOUT);
     }
 
-    #[inline]
-    fn should_process(&self, flow: &mut dyn Flow) -> bool {
-        flow.base()
-            .restyle_damage
-            .intersects(ServoRestyleDamage::REFLOW_OUT_OF_FLOW | ServoRestyleDamage::REFLOW)
+    // Only propagate up layout phases from children, as other types of damage are
+    // incorporated into `element_damage` above.
+    let mut damage_for_parent = element_damage | (damage_from_children & RestyleDamage::RELAYOUT);
+
+    // If we are going to potentially reuse this box tree node, then clear any cached
+    // fragment layout.
+    //
+    // TODO: If this node has `recollect_box_tree_children` damage, this is unnecessary
+    // unless it's entirely above the dirty root.
+    if element_damage != RestyleDamage::reconstruct() &&
+        damage_for_parent.contains(RestyleDamage::RELAYOUT)
+    {
+        let outer_inline_content_sizes_depend_on_content = Cell::new(false);
+        node.with_layout_box_base_including_pseudos(|base| {
+            base.clear_fragments();
+            if original_element_damage.contains(RestyleDamage::RELAYOUT) {
+                // If the node itself has damage, we must clear both the cached layout results
+                // and also the cached intrinsic inline sizes.
+                *base.cached_layout_result.borrow_mut() = None;
+                *base.cached_inline_content_size.borrow_mut() = None;
+            } else if damage_from_children.contains(RestyleDamage::RELAYOUT) {
+                // If the damage is propagated from children, then we still need to clear the cached
+                // layout results, but sometimes we can keep the cached intrinsic inline sizes.
+                *base.cached_layout_result.borrow_mut() = None;
+                if !damage_from_children.contains(LayoutDamage::recompute_inline_content_sizes()) {
+                    // This happens when there is a node which is a descendant of the current one and
+                    // an ancestor of the damaged one, whose inline size doesn't depend on its contents.
+                    return;
+                }
+                *base.cached_inline_content_size.borrow_mut() = None;
+            }
+
+            // When a block container has a mix of inline-level and block-level contents,
+            // the inline-level ones are wrapped inside an anonymous block associated with
+            // the block container. The anonymous block has an `auto` size, so its intrinsic
+            // contribution depends on content, but it can't affect the intrinsic size of
+            // ancestors if the block container is sized extrinsically.
+            if !base.base_fragment_info.is_anonymous() {
+                // TODO: Use `Cell::update()` once it becomes stable.
+                outer_inline_content_sizes_depend_on_content.set(
+                    outer_inline_content_sizes_depend_on_content.get() ||
+                        base.outer_inline_content_sizes_depend_on_content
+                            .load(Ordering::Relaxed),
+                );
+            }
+        });
+
+        // If the intrinsic contributions of this node depend on content, we will need to clear
+        // the cached intrinsic sizes of the parent. But if the contributions are purely extrinsic,
+        // then the intrinsic sizes of the ancestors won't be affected, and we can keep the cache.
+        if outer_inline_content_sizes_depend_on_content.get() {
+            damage_for_parent.insert(LayoutDamage::recompute_inline_content_sizes())
+        }
     }
-}
 
-/// The assign-block-sizes-and-store-overflow traversal, the last (and most expensive) part of
-/// layout computation. Determines the final block-sizes for all layout objects and computes
-/// positions. In Gecko this corresponds to `Reflow`.
-#[derive(Clone, Copy)]
-pub struct AssignBSizes<'a> {
-    pub layout_context: &'a LayoutContext<'a>,
-}
-
-impl<'a> PostorderFlowTraversal for AssignBSizes<'a> {
-    #[inline]
-    fn process(&self, flow: &mut dyn Flow) {
-        // Can't do anything with anything that floats might flow through until we reach their
-        // inorder parent.
-        //
-        // NB: We must return without resetting the restyle bits for these, as we haven't actually
-        // reflowed anything!
-        if flow.floats_might_flow_through() {
-            return;
+    // If the box will be preserved, update the box's style and also in any fragments
+    // that haven't been cleared. Meanwhile, clear the damage to avoid affecting the
+    // next reflow.
+    if !element_layout_damage.has_box_damage() {
+        if !original_element_damage.is_empty() {
+            node.repair_style(context);
         }
 
-        flow.assign_block_size(self.layout_context);
+        element_damage = RestyleDamage::empty();
     }
 
-    #[inline]
-    fn should_process(&self, flow: &mut dyn Flow) -> bool {
-        let base = flow.base();
-        base.restyle_damage.intersects(ServoRestyleDamage::REFLOW_OUT_OF_FLOW | ServoRestyleDamage::REFLOW) &&
-        // The fragmentation countainer is responsible for calling
-        // Flow::fragment recursively
-        !base.flags.contains(FlowFlags::CAN_BE_FRAGMENTED)
-    }
-}
-
-pub struct ComputeStackingRelativePositions<'a> {
-    pub layout_context: &'a LayoutContext<'a>,
-}
-
-impl<'a> PreorderFlowTraversal for ComputeStackingRelativePositions<'a> {
-    #[inline]
-    fn should_process_subtree(&self, flow: &mut dyn Flow) -> bool {
-        flow.base()
-            .restyle_damage
-            .contains(ServoRestyleDamage::REPOSITION)
+    if element_damage != original_element_damage {
+        element_data.borrow_mut().damage = element_damage;
     }
 
-    #[inline]
-    fn process(&self, flow: &mut dyn Flow) {
-        flow.compute_stacking_relative_position(self.layout_context);
-        flow.mut_base()
-            .restyle_damage
-            .remove(ServoRestyleDamage::REPOSITION)
-    }
-}
-
-pub struct BuildDisplayList<'a> {
-    pub state: DisplayListBuildState<'a>,
-}
-
-impl<'a> BuildDisplayList<'a> {
-    #[inline]
-    pub fn traverse(&mut self, flow: &mut dyn Flow) {
-        if flow.has_non_invertible_transform() {
-            return;
-        }
-
-        let parent_stacking_context_id = self.state.current_stacking_context_id;
-        self.state.current_stacking_context_id = flow.base().stacking_context_id;
-
-        let parent_clipping_and_scrolling = self.state.current_clipping_and_scrolling;
-        self.state.current_clipping_and_scrolling = flow.clipping_and_scrolling();
-
-        flow.build_display_list(&mut self.state);
-        flow.mut_base()
-            .restyle_damage
-            .remove(ServoRestyleDamage::REPAINT);
-
-        for kid in flow.mut_base().child_iter_mut() {
-            self.traverse(kid);
-        }
-
-        self.state.current_stacking_context_id = parent_stacking_context_id;
-        self.state.current_clipping_and_scrolling = parent_clipping_and_scrolling;
-    }
+    damage_for_parent
 }

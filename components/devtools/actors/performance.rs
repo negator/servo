@@ -2,23 +2,26 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
-use crate::protocol::{ActorDescription, JsonPacketStream, Method};
-use crate::StreamId;
+use serde::Serialize;
 use serde_json::{Map, Value};
-use std::net::TcpStream;
+
+use crate::StreamId;
+use crate::actor::{Actor, ActorError, ActorRegistry};
+use crate::protocol::{ActorDescription, ClientRequest, Method};
 
 pub struct PerformanceActor {
     name: String,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PerformanceFeatures {
-    withMarkers: bool,
-    withMemory: bool,
-    withTicks: bool,
-    withAllocations: bool,
-    withJITOptimizations: bool,
+    with_markers: bool,
+    with_memory: bool,
+    with_ticks: bool,
+    with_allocations: bool,
+    #[serde(rename = "withJITOptimizations")]
+    with_jitoptimizations: bool,
 }
 
 #[derive(Serialize)]
@@ -54,28 +57,27 @@ impl Actor for PerformanceActor {
 
     fn handle_message(
         &self,
+        request: ClientRequest,
         _registry: &ActorRegistry,
         msg_type: &str,
         _msg: &Map<String, Value>,
-        stream: &mut TcpStream,
         _id: StreamId,
-    ) -> Result<ActorMessageStatus, ()> {
-        Ok(match msg_type {
+    ) -> Result<(), ActorError> {
+        match msg_type {
             "connect" => {
                 let msg = ConnectReply {
                     from: self.name(),
                     traits: PerformanceTraits {
                         features: PerformanceFeatures {
-                            withMarkers: true,
-                            withMemory: true,
-                            withTicks: true,
-                            withAllocations: true,
-                            withJITOptimizations: true,
+                            with_markers: true,
+                            with_memory: true,
+                            with_ticks: true,
+                            with_allocations: true,
+                            with_jitoptimizations: true,
                         },
                     },
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
             },
             "canCurrentlyRecord" => {
                 let msg = CanCurrentlyRecordReply {
@@ -85,23 +87,23 @@ impl Actor for PerformanceActor {
                         errors: vec![],
                     },
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
             },
-            _ => ActorMessageStatus::Ignored,
-        })
+            _ => return Err(ActorError::UnrecognizedPacketType),
+        };
+        Ok(())
     }
 }
 
 impl PerformanceActor {
     pub fn new(name: String) -> PerformanceActor {
-        PerformanceActor { name: name }
+        PerformanceActor { name }
     }
 
     pub fn description() -> ActorDescription {
         ActorDescription {
             category: "actor",
-            typeName: "performance",
+            type_name: "performance",
             methods: vec![Method {
                 name: "canCurrentlyRecord",
                 request: Value::Object(

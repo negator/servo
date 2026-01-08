@@ -32,14 +32,15 @@
 //! for a static members and instance methods for regular members).
 //!
 //! The instance methods for an interface `Foo` are defined on a
-//! `dom::bindings::codegen::Bindings::FooBindings::FooMethods` trait. This
+//! `dom::bindings::codegen::Bindings::FooBinding::FooMethods` trait. This
 //! trait is then implemented for `Foo`. (All methods take an `&self`
 //! parameter, as pointers to DOM objects can be freely aliased.)
 //!
-//! The return type and argument types are determined [as described below]
-//! (#rust-reflections-of-webidl-types).
-//! In addition to those, all methods that are [allowed to throw]
-//! (#throwing-exceptions) will have the return value wrapped in
+//! The return type and argument types are determined
+//! [as described below](#rust-reflections-of-webidl-types).
+//! In addition to those, all methods that are
+//! [allowed to throw](#throwing-exceptions)
+//! will have the return value wrapped in
 //! [`Fallible<T>`](error/type.Fallible.html).
 //! Methods that use certain WebIDL types like `any` or `object` will get a
 //! `*mut JSContext` argument prepended to the argument list. Static methods
@@ -129,60 +130,59 @@
 //! return `Err()` from the method with the appropriate [error value]
 //! (error/enum.Error.html).
 
-#![allow(unsafe_code)]
+#![expect(unsafe_code)]
 #![deny(missing_docs)]
 #![deny(non_snake_case)]
 
-pub mod callback;
-pub mod cell;
-pub mod constant;
-pub mod conversions;
-pub mod error;
-pub mod guard;
-pub mod htmlconstructor;
-pub mod inheritance;
-pub mod interface;
-pub mod iterable;
-pub mod namespace;
-pub mod num;
-pub mod principals;
-pub mod proxyhandler;
-pub mod record;
-pub mod refcounted;
-pub mod reflector;
-pub mod root;
-pub mod serializable;
-pub mod settings_stack;
-pub mod str;
-pub mod structuredclone;
-pub mod trace;
-pub mod transferable;
-pub mod utils;
-pub mod weakref;
-pub mod xmlname;
+pub(crate) mod buffer_source;
+#[expect(dead_code)]
+pub(crate) mod cell;
+pub(crate) mod constructor;
+pub(crate) mod conversions;
+pub(crate) mod domname;
+pub(crate) mod error;
+pub(crate) mod frozenarray;
+pub(crate) mod function;
+pub(crate) mod import;
+pub(crate) mod inheritance;
+pub(crate) mod like;
+pub(crate) mod principals;
+pub(crate) mod proxyhandler;
+pub(crate) mod refcounted;
+pub(crate) mod reflector;
+pub(crate) mod root;
+pub(crate) mod serializable;
+pub(crate) mod settings_stack;
+pub(crate) mod str;
+pub(crate) mod structuredclone;
+pub(crate) mod trace;
+pub(crate) mod transferable;
+pub(crate) mod utils;
+pub(crate) mod weakref;
+pub(crate) mod xmlname;
+
+pub(crate) use script_bindings::{callback, iterable, num};
 
 /// Generated JS-Rust bindings.
 #[allow(missing_docs, non_snake_case)]
-pub mod codegen {
-    #[allow(dead_code, unrooted_must_root)]
-    pub mod Bindings {
-        include!(concat!(env!("OUT_DIR"), "/Bindings/mod.rs"));
+pub(crate) mod codegen {
+    pub(crate) mod DomTypeHolder {
+        include!(concat!(env!("OUT_DIR"), "/DomTypeHolder.rs"));
     }
-    pub mod InterfaceObjectMap {
+    pub(crate) use script_bindings::codegen::GenericBindings;
+    #[expect(dead_code)]
+    pub(crate) mod Bindings {
+        include!(concat!(env!("OUT_DIR"), "/ConcreteBindings/mod.rs"));
+    }
+    pub(crate) mod InterfaceObjectMap {
         include!(concat!(env!("OUT_DIR"), "/InterfaceObjectMap.rs"));
     }
-    #[allow(dead_code, unused_imports)]
-    pub mod InheritTypes {
-        include!(concat!(env!("OUT_DIR"), "/InheritTypes.rs"));
+    pub(crate) mod ConcreteInheritTypes {
+        include!(concat!(env!("OUT_DIR"), "/ConcreteInheritTypes.rs"));
     }
-    pub mod PrototypeList {
-        include!(concat!(env!("OUT_DIR"), "/PrototypeList.rs"));
-    }
-    pub mod RegisterBindings {
-        include!(concat!(env!("OUT_DIR"), "/RegisterBindings.rs"));
-    }
-    #[allow(non_camel_case_types, unused_imports, unused_variables)]
-    pub mod UnionTypes {
+    pub(crate) use script_bindings::codegen::{PrototypeList, RegisterBindings};
+    #[expect(dead_code)]
+    pub(crate) mod UnionTypes {
         include!(concat!(env!("OUT_DIR"), "/UnionTypes.rs"));
     }
 }

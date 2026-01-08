@@ -4,13 +4,13 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+from http.server import HTTPServer, SimpleHTTPRequestHandler
 import os
 import subprocess
 import sys
-import BaseHTTPServer
-import SimpleHTTPServer
-import urlparse
+import urllib
 import json
+import urllib.parse
 
 
 # Port to run the HTTP server on for Dromaeo.
@@ -26,29 +26,37 @@ def run_servo(servo_exe, tests):
 
 # Print usage if command line args are incorrect
 def print_usage():
-    print("USAGE: {0} tests servo_binary dromaeo_base_dir".format(sys.argv[0]))
+    print("USAGE: {0} tests servo_binary dromaeo_base_dir [<BMF JSON output> <Cargo profile>]".format(sys.argv[0]))
+
+
+post_data = None
 
 
 # Handle the POST at the end
-class RequestHandler(SimpleHTTPServer.SimpleHTTPRequestHandler):
+class RequestHandler(SimpleHTTPRequestHandler):
     def do_POST(self):
+        global post_data
         self.send_response(200)
         self.end_headers()
-        self.wfile.write("<HTML>POST OK.<BR><BR>")
-        length = int(self.headers.getheader('content-length'))
-        parameters = urlparse.parse_qs(self.rfile.read(length))
-        self.server.got_post = True
-        self.server.post_data = parameters['data']
+        self.wfile.write(b"<HTML>POST OK.<BR><BR>")
+        length = int(self.headers.get('content-length'))
+        parameters = urllib.parse.parse_qs(self.rfile.read(length))
+        post_data = parameters[b'data']
 
     def log_message(self, format, *args):
         return
 
 
 if __name__ == '__main__':
-    if len(sys.argv) == 4:
+    if len(sys.argv) == 4 or len(sys.argv) == 6:
         tests = sys.argv[1]
         servo_exe = sys.argv[2]
         base_dir = sys.argv[3]
+        bmf_output = ""
+        cargo_profile_prefix = ""
+        if len(sys.argv) == 6:
+            bmf_output = sys.argv[4]
+            cargo_profile_prefix = f"{sys.argv[5]}/"
         os.chdir(base_dir)
 
         # Ensure servo binary can be found
@@ -57,14 +65,13 @@ if __name__ == '__main__':
             sys.exit(1)
 
         # Start the test server
-        server = BaseHTTPServer.HTTPServer(('', TEST_SERVER_PORT), RequestHandler)
+        server = HTTPServer(('', TEST_SERVER_PORT), RequestHandler)
 
         print("Testing Dromaeo on Servo!")
         proc = run_servo(servo_exe, tests)
-        server.got_post = False
-        while not server.got_post:
+        while not post_data:
             server.handle_request()
-        data = json.loads(server.post_data[0])
+        data = json.loads(post_data[0])
         number = 0
         length = 0
         for test in data:
@@ -74,6 +81,12 @@ if __name__ == '__main__':
         print("-{0}-|-{1}-".format("-" * length, "-" * number))
         for test in data:
             print(" {0}{1} | {2}".format(test, " " * (length - len(test)), data[test]))
+        if bmf_output:
+            output = dict()
+            for (k, v) in data.items():
+                output[f"{cargo_profile_prefix}Dromaeo/{k}"] = {'throughput': {'value': float(v)}}
+            with open(bmf_output, 'w', encoding='utf-8') as f:
+                json.dump(output, f, indent=4)
         proc.kill()
     else:
         print_usage()

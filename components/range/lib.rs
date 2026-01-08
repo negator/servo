@@ -4,14 +4,11 @@
 
 #![deny(unsafe_code)]
 
-#[macro_use]
-extern crate malloc_size_of_derive;
-#[macro_use]
-extern crate serde;
-
 use std::cmp::{self, max, min};
-use std::fmt;
-use std::ops;
+use std::{fmt, ops};
+
+use malloc_size_of_derive::MallocSizeOf;
+use serde::{Deserialize, Serialize};
 
 pub trait Int:
     Copy + ops::Add<Self, Output = Self> + ops::Sub<Self, Output = Self> + cmp::Ord
@@ -196,6 +193,19 @@ impl<I: RangeIndex> Iterator for EachIndex<I> {
     }
 }
 
+impl<I: RangeIndex> DoubleEndedIterator for EachIndex<I> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.start < self.stop {
+            let next = self.stop - I::one();
+            self.stop = next;
+            Some(next)
+        } else {
+            None
+        }
+    }
+}
+
 impl<I: RangeIndex> Range<I> {
     /// Create a new range from beginning and length offsets. This could be
     /// denoted as `[begin, begin + length)`.
@@ -207,10 +217,7 @@ impl<I: RangeIndex> Range<I> {
     /// ~~~
     #[inline]
     pub fn new(begin: I, length: I) -> Range<I> {
-        Range {
-            begin: begin,
-            length: length,
-        }
+        Range { begin, length }
     }
 
     #[inline]
@@ -254,7 +261,7 @@ impl<I: RangeIndex> Range<I> {
         self.begin + self.length
     }
 
-    /// `true` if the index is between the beginning and the end of the range.
+    /// `true` if the index is between the beginning and the end (exclusive) of the range.
     ///
     /// ~~~ignore
     ///        false        true      false
@@ -264,6 +271,18 @@ impl<I: RangeIndex> Range<I> {
     #[inline]
     pub fn contains(&self, i: I) -> bool {
         i >= self.begin() && i < self.end()
+    }
+
+    /// `true` if the index is between the beginning and the end (inclusive) of the range.
+    ///
+    /// ~~~ignore
+    ///        false        true      false
+    ///          |           |          |
+    /// <- o - - + - - +=====+======+ - + - ->
+    /// ~~~
+    #[inline]
+    pub fn contains_inclusive(&self, i: I) -> bool {
+        i >= self.begin() && i <= self.end()
     }
 
     /// `true` if the offset from the beginning to the end of the range is zero.
@@ -343,7 +362,7 @@ impl<I: RangeIndex> Range<I> {
 
 /// Methods for `Range`s with indices based on integer values
 impl<I: RangeIndex> Range<I> {
-    /// Returns an iterater that increments over `[begin, end)`.
+    /// Returns an iterator that increments over `[begin, end)`.
     #[inline]
     pub fn each_index(&self) -> EachIndex<I> {
         each_index(self.begin(), self.end())

@@ -2,374 +2,59 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-//! Liberally derived from the [Firefox JS implementation]
-//! (http://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/webbrowser.js).
+//! Liberally derived from the [Firefox JS implementation](https://searchfox.org/mozilla-central/source/devtools/server/actors/webbrowser.js).
 //! Connection point for remote devtools that wish to investigate a particular Browsing Context's contents.
 //! Supports dynamic attaching and detaching which control notifications of navigation, etc.
 
-use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
-use crate::actors::emulation::EmulationActor;
-use crate::actors::inspector::InspectorActor;
-use crate::actors::performance::PerformanceActor;
-use crate::actors::profiler::ProfilerActor;
-use crate::actors::stylesheets::StyleSheetsActor;
-use crate::actors::tab::TabDescriptorActor;
-use crate::actors::thread::ThreadActor;
-use crate::actors::timeline::TimelineActor;
-use crate::protocol::JsonPacketStream;
-use crate::StreamId;
-use devtools_traits::DevtoolScriptControlMsg::{self, WantsLiveNotifications};
-use devtools_traits::DevtoolsPageInfo;
-use devtools_traits::NavigationState;
-use ipc_channel::ipc::IpcSender;
-use msg::constellation_msg::{BrowsingContextId, PipelineId};
-use serde_json::{Map, Value};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::net::TcpStream;
 
-#[derive(Serialize)]
-struct BrowsingContextTraits {
-    isBrowsingContext: bool,
-}
+use base::generic_channel::{self, GenericSender};
+use base::id::PipelineId;
+use devtools_traits::DevtoolScriptControlMsg::{
+    self, GetCssDatabase, SimulateColorScheme, WantsLiveNotifications,
+};
+use devtools_traits::{DevtoolsPageInfo, NavigationState};
+use embedder_traits::Theme;
+use serde::Serialize;
+use serde_json::{Map, Value};
 
-#[derive(Serialize)]
-struct AttachedTraits {
-    reconfigure: bool,
-    frames: bool,
-    logInPage: bool,
-    canRewind: bool,
-    watchpoints: bool,
-}
-
-#[derive(Serialize)]
-struct BrowsingContextAttachedReply {
-    from: String,
-    #[serde(rename = "type")]
-    type_: String,
-    threadActor: String,
-    cacheDisabled: bool,
-    javascriptEnabled: bool,
-    traits: AttachedTraits,
-}
-
-#[derive(Serialize)]
-struct BrowsingContextDetachedReply {
-    from: String,
-    #[serde(rename = "type")]
-    type_: String,
-}
-
-#[derive(Serialize)]
-struct ReconfigureReply {
-    from: String,
-}
-
-#[derive(Serialize)]
-struct ListFramesReply {
-    from: String,
-    frames: Vec<FrameMsg>,
-}
-
-#[derive(Serialize)]
-struct FrameMsg {
-    id: u32,
-    url: String,
-    title: String,
-    parentID: u32,
-}
+use crate::actor::{Actor, ActorEncode, ActorError, ActorRegistry};
+use crate::actors::inspector::InspectorActor;
+use crate::actors::inspector::accessibility::AccessibilityActor;
+use crate::actors::inspector::css_properties::CssPropertiesActor;
+use crate::actors::reflow::ReflowActor;
+use crate::actors::stylesheets::StyleSheetsActor;
+use crate::actors::tab::TabDescriptorActor;
+use crate::actors::thread::ThreadActor;
+use crate::actors::watcher::{SessionContext, SessionContextType, WatcherActor};
+use crate::id::{DevtoolsBrowserId, DevtoolsBrowsingContextId, DevtoolsOuterWindowId, IdMap};
+use crate::protocol::{ClientRequest, JsonPacketStream};
+use crate::resource::ResourceAvailable;
+use crate::{EmptyReplyMsg, StreamId};
 
 #[derive(Serialize)]
 struct ListWorkersReply {
     from: String,
-    workers: Vec<WorkerMsg>,
+    workers: Vec<()>,
 }
 
 #[derive(Serialize)]
-struct WorkerMsg {
+struct FrameUpdateReply {
+    from: String,
+    #[serde(rename = "type")]
+    type_: String,
+    frames: Vec<FrameUpdateMsg>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FrameUpdateMsg {
     id: u32,
-}
-
-#[derive(Serialize)]
-pub struct BrowsingContextActorMsg {
-    actor: String,
-    title: String,
+    is_top_level: bool,
     url: String,
-    outerWindowID: u32,
-    browsingContextId: u32,
-    consoleActor: String,
-    /*emulationActor: String,
-    inspectorActor: String,
-    timelineActor: String,
-    profilerActor: String,
-    performanceActor: String,
-    styleSheetsActor: String,*/
-    traits: BrowsingContextTraits,
-    // Part of the official protocol, but not yet implemented.
-    /*storageActor: String,
-    memoryActor: String,
-    framerateActor: String,
-    reflowActor: String,
-    cssPropertiesActor: String,
-    animationsActor: String,
-    webExtensionInspectedWindowActor: String,
-    accessibilityActor: String,
-    screenshotActor: String,
-    changesActor: String,
-    webSocketActor: String,
-    manifestActor: String,*/
-}
-
-pub(crate) struct BrowsingContextActor {
-    pub name: String,
-    pub title: RefCell<String>,
-    pub url: RefCell<String>,
-    pub console: String,
-    pub _emulation: String,
-    pub _inspector: String,
-    pub _timeline: String,
-    pub _profiler: String,
-    pub _performance: String,
-    pub _styleSheets: String,
-    pub thread: String,
-    pub _tab: String,
-    pub streams: RefCell<HashMap<StreamId, TcpStream>>,
-    pub browsing_context_id: BrowsingContextId,
-    pub active_pipeline: Cell<PipelineId>,
-    pub script_chan: IpcSender<DevtoolScriptControlMsg>,
-}
-
-impl Actor for BrowsingContextActor {
-    fn name(&self) -> String {
-        self.name.clone()
-    }
-
-    fn handle_message(
-        &self,
-        _registry: &ActorRegistry,
-        msg_type: &str,
-        msg: &Map<String, Value>,
-        stream: &mut TcpStream,
-        id: StreamId,
-    ) -> Result<ActorMessageStatus, ()> {
-        Ok(match msg_type {
-            "reconfigure" => {
-                if let Some(options) = msg.get("options").and_then(|o| o.as_object()) {
-                    if let Some(val) = options.get("performReload") {
-                        if val.as_bool().unwrap_or(false) {
-                            let _ = self
-                                .script_chan
-                                .send(DevtoolScriptControlMsg::Reload(self.active_pipeline.get()));
-                        }
-                    }
-                }
-                let _ = stream.write_json_packet(&ReconfigureReply { from: self.name() });
-                ActorMessageStatus::Processed
-            },
-
-            // https://docs.firefox-dev.tools/backend/protocol.html#listing-browser-tabs
-            // (see "To attach to a _targetActor_")
-            "attach" => {
-                let msg = BrowsingContextAttachedReply {
-                    from: self.name(),
-                    type_: "tabAttached".to_owned(),
-                    threadActor: self.thread.clone(),
-                    cacheDisabled: false,
-                    javascriptEnabled: true,
-                    traits: AttachedTraits {
-                        reconfigure: false,
-                        frames: true,
-                        logInPage: false,
-                        canRewind: false,
-                        watchpoints: false,
-                    },
-                };
-
-                if stream.write_json_packet(&msg).is_err() {
-                    return Ok(ActorMessageStatus::Processed);
-                }
-                self.streams
-                    .borrow_mut()
-                    .insert(id, stream.try_clone().unwrap());
-                self.script_chan
-                    .send(WantsLiveNotifications(self.active_pipeline.get(), true))
-                    .unwrap();
-                ActorMessageStatus::Processed
-            },
-
-            "detach" => {
-                let msg = BrowsingContextDetachedReply {
-                    from: self.name(),
-                    type_: "detached".to_owned(),
-                };
-                let _ = stream.write_json_packet(&msg);
-                self.cleanup(id);
-                ActorMessageStatus::Processed
-            },
-
-            "listFrames" => {
-                let msg = ListFramesReply {
-                    from: self.name(),
-                    frames: vec![FrameMsg {
-                        //FIXME: shouldn't ignore pipeline namespace field
-                        id: self.active_pipeline.get().index.0.get(),
-                        parentID: 0,
-                        url: self.url.borrow().clone(),
-                        title: self.title.borrow().clone(),
-                    }],
-                };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
-            },
-
-            "listWorkers" => {
-                let msg = ListWorkersReply {
-                    from: self.name(),
-                    workers: vec![],
-                };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
-            },
-
-            _ => ActorMessageStatus::Ignored,
-        })
-    }
-
-    fn cleanup(&self, id: StreamId) {
-        self.streams.borrow_mut().remove(&id);
-        if self.streams.borrow().is_empty() {
-            self.script_chan
-                .send(WantsLiveNotifications(self.active_pipeline.get(), false))
-                .unwrap();
-        }
-    }
-}
-
-impl BrowsingContextActor {
-    pub(crate) fn new(
-        console: String,
-        id: BrowsingContextId,
-        page_info: DevtoolsPageInfo,
-        pipeline: PipelineId,
-        script_sender: IpcSender<DevtoolScriptControlMsg>,
-        actors: &mut ActorRegistry,
-    ) -> BrowsingContextActor {
-        let emulation = EmulationActor::new(actors.new_name("emulation"));
-
-        let name = actors.new_name("target");
-
-        let inspector = InspectorActor {
-            name: actors.new_name("inspector"),
-            walker: RefCell::new(None),
-            pageStyle: RefCell::new(None),
-            highlighter: RefCell::new(None),
-            script_chan: script_sender.clone(),
-            browsing_context: name.clone(),
-        };
-
-        let timeline =
-            TimelineActor::new(actors.new_name("timeline"), pipeline, script_sender.clone());
-
-        let profiler = ProfilerActor::new(actors.new_name("profiler"));
-        let performance = PerformanceActor::new(actors.new_name("performance"));
-
-        // the strange switch between styleSheets and stylesheets is due
-        // to an inconsistency in devtools. See Bug #1498893 in bugzilla
-        let styleSheets = StyleSheetsActor::new(actors.new_name("stylesheets"));
-        let thread = ThreadActor::new(actors.new_name("context"));
-
-        let DevtoolsPageInfo { title, url } = page_info;
-
-        let tabdesc = TabDescriptorActor::new(actors, name.clone());
-
-        let target = BrowsingContextActor {
-            name: name,
-            script_chan: script_sender,
-            title: RefCell::new(String::from(title)),
-            url: RefCell::new(url.into_string()),
-            console: console,
-            _emulation: emulation.name(),
-            _inspector: inspector.name(),
-            _timeline: timeline.name(),
-            _profiler: profiler.name(),
-            _performance: performance.name(),
-            _styleSheets: styleSheets.name(),
-            _tab: tabdesc.name(),
-            thread: thread.name(),
-            streams: RefCell::new(HashMap::new()),
-            browsing_context_id: id,
-            active_pipeline: Cell::new(pipeline),
-        };
-
-        actors.register(Box::new(emulation));
-        actors.register(Box::new(inspector));
-        actors.register(Box::new(timeline));
-        actors.register(Box::new(profiler));
-        actors.register(Box::new(performance));
-        actors.register(Box::new(styleSheets));
-        actors.register(Box::new(thread));
-        actors.register(Box::new(tabdesc));
-
-        target
-    }
-
-    pub fn encodable(&self) -> BrowsingContextActorMsg {
-        BrowsingContextActorMsg {
-            actor: self.name(),
-            traits: BrowsingContextTraits {
-                isBrowsingContext: true,
-            },
-            title: self.title.borrow().clone(),
-            url: self.url.borrow().clone(),
-            //FIXME: shouldn't ignore pipeline namespace field
-            browsingContextId: self.browsing_context_id.index.0.get(),
-            //FIXME: shouldn't ignore pipeline namespace field
-            outerWindowID: self.active_pipeline.get().index.0.get(),
-            consoleActor: self.console.clone(),
-            /*emulationActor: self.emulation.clone(),
-            inspectorActor: self.inspector.clone(),
-            timelineActor: self.timeline.clone(),
-            profilerActor: self.profiler.clone(),
-            performanceActor: self.performance.clone(),
-            styleSheetsActor: self.styleSheets.clone(),*/
-        }
-    }
-
-    pub(crate) fn navigate(&self, state: NavigationState) {
-        let (pipeline, title, url, state) = match state {
-            NavigationState::Start(url) => (None, None, url, "start"),
-            NavigationState::Stop(pipeline, info) => {
-                (Some(pipeline), Some(info.title), info.url, "stop")
-            },
-        };
-        if let Some(p) = pipeline {
-            self.active_pipeline.set(p);
-        }
-        *self.url.borrow_mut() = url.as_str().to_owned();
-        if let Some(ref t) = title {
-            *self.title.borrow_mut() = t.clone();
-        }
-
-        let msg = TabNavigated {
-            from: self.name(),
-            type_: "tabNavigated".to_owned(),
-            url: url.as_str().to_owned(),
-            title: title,
-            nativeConsoleAPI: true,
-            state: state.to_owned(),
-            isFrameSwitching: false,
-        };
-        for stream in self.streams.borrow_mut().values_mut() {
-            let _ = stream.write_json_packet(&msg);
-        }
-    }
-
-    pub(crate) fn title_changed(&self, pipeline: PipelineId, title: String) {
-        if pipeline != self.active_pipeline.get() {
-            return;
-        }
-        *self.title.borrow_mut() = title;
-    }
+    title: String,
 }
 
 #[derive(Serialize)]
@@ -379,7 +64,304 @@ struct TabNavigated {
     type_: String,
     url: String,
     title: Option<String>,
-    nativeConsoleAPI: bool,
+    #[serde(rename = "nativeConsoleAPI")]
+    native_console_api: bool,
     state: String,
-    isFrameSwitching: bool,
+    is_frame_switching: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowsingContextTraits {
+    frames: bool,
+    is_browsing_context: bool,
+    log_in_page: bool,
+    navigation: bool,
+    supports_top_level_target_flag: bool,
+    watchpoints: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "lowercase")]
+enum TargetType {
+    Frame,
+    // Other target types not implemented yet.
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowsingContextActorMsg {
+    actor: String,
+    title: String,
+    url: String,
+    /// This correspond to webview_id
+    #[serde(rename = "browserId")]
+    browser_id: u32,
+    #[serde(rename = "outerWindowID")]
+    outer_window_id: u32,
+    #[serde(rename = "browsingContextID")]
+    browsing_context_id: u32,
+    is_top_level_target: bool,
+    traits: BrowsingContextTraits,
+    // Implemented actors
+    accessibility_actor: String,
+    console_actor: String,
+    css_properties_actor: String,
+    inspector_actor: String,
+    reflow_actor: String,
+    style_sheets_actor: String,
+    thread_actor: String,
+    target_type: TargetType,
+    // Part of the official protocol, but not yet implemented.
+    // animations_actor: String,
+    // changes_actor: String,
+    // framerate_actor: String,
+    // manifest_actor: String,
+    // memory_actor: String,
+    // network_content_actor: String,
+    // objects_manager: String,
+    // performance_actor: String,
+    // resonsive_actor: String,
+    // storage_actor: String,
+    // tracer_actor: String,
+    // web_extension_inspected_window_actor: String,
+    // web_socket_actor: String,
+}
+
+/// The browsing context actor encompasses all of the other supporting actors when debugging a web
+/// view. To this extent, it contains a watcher actor that helps when communicating with the host,
+/// as well as resource actors that each perform one debugging function.
+pub(crate) struct BrowsingContextActor {
+    pub name: String,
+    pub title: RefCell<String>,
+    pub url: RefCell<String>,
+    /// This corresponds to webview_id
+    pub browser_id: DevtoolsBrowserId,
+    pub active_pipeline_id: Cell<PipelineId>,
+    pub active_outer_window_id: Cell<DevtoolsOuterWindowId>,
+    pub browsing_context_id: DevtoolsBrowsingContextId,
+    pub accessibility: String,
+    pub console: String,
+    pub css_properties: String,
+    pub inspector: String,
+    pub reflow: String,
+    pub style_sheets: String,
+    pub thread: String,
+    pub _tab: String,
+    pub script_chan: GenericSender<DevtoolScriptControlMsg>,
+    pub streams: RefCell<HashMap<StreamId, TcpStream>>,
+    pub watcher: String,
+}
+
+impl ResourceAvailable for BrowsingContextActor {
+    fn actor_name(&self) -> String {
+        self.name.clone()
+    }
+}
+
+impl Actor for BrowsingContextActor {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn handle_message(
+        &self,
+        request: ClientRequest,
+        _registry: &ActorRegistry,
+        msg_type: &str,
+        _msg: &Map<String, Value>,
+        _id: StreamId,
+    ) -> Result<(), ActorError> {
+        match msg_type {
+            "listFrames" => {
+                // TODO: Find out what needs to be listed here
+                let msg = EmptyReplyMsg { from: self.name() };
+                request.reply_final(&msg)?
+            },
+            "listWorkers" => {
+                request.reply_final(&ListWorkersReply {
+                    from: self.name(),
+                    // TODO: Find out what needs to be listed here
+                    workers: vec![],
+                })?
+            },
+            _ => return Err(ActorError::UnrecognizedPacketType),
+        };
+        Ok(())
+    }
+
+    fn cleanup(&self, id: StreamId) {
+        self.streams.borrow_mut().remove(&id);
+        if self.streams.borrow().is_empty() {
+            self.script_chan
+                .send(WantsLiveNotifications(self.active_pipeline_id.get(), false))
+                .unwrap();
+        }
+    }
+}
+
+impl BrowsingContextActor {
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        console: String,
+        browser_id: DevtoolsBrowserId,
+        browsing_context_id: DevtoolsBrowsingContextId,
+        page_info: DevtoolsPageInfo,
+        pipeline_id: PipelineId,
+        outer_window_id: DevtoolsOuterWindowId,
+        script_sender: GenericSender<DevtoolScriptControlMsg>,
+        actors: &mut ActorRegistry,
+    ) -> BrowsingContextActor {
+        let name = actors.new_name("target");
+        let DevtoolsPageInfo {
+            title,
+            url,
+            is_top_level_global,
+        } = page_info;
+
+        let accessibility = AccessibilityActor::new(actors.new_name("accessibility"));
+
+        let properties = (|| {
+            let (properties_sender, properties_receiver) = generic_channel::channel()?;
+            script_sender.send(GetCssDatabase(properties_sender)).ok()?;
+            properties_receiver.recv().ok()
+        })()
+        .unwrap_or_default();
+        let css_properties = CssPropertiesActor::new(actors.new_name("css-properties"), properties);
+
+        let inspector = InspectorActor::register(actors, pipeline_id, script_sender.clone());
+
+        let reflow = ReflowActor::new(actors.new_name("reflow"));
+
+        let style_sheets = StyleSheetsActor::new(actors.new_name("stylesheets"));
+
+        let tabdesc = TabDescriptorActor::new(actors, name.clone(), is_top_level_global);
+
+        let thread = ThreadActor::new(actors.new_name("thread"));
+
+        let watcher = WatcherActor::new(
+            actors,
+            name.clone(),
+            SessionContext::new(SessionContextType::BrowserElement),
+        );
+
+        let target = BrowsingContextActor {
+            name,
+            script_chan: script_sender,
+            title: RefCell::new(title),
+            url: RefCell::new(url.into_string()),
+            active_pipeline_id: Cell::new(pipeline_id),
+            active_outer_window_id: Cell::new(outer_window_id),
+            browser_id,
+            browsing_context_id,
+            accessibility: accessibility.name(),
+            console,
+            css_properties: css_properties.name(),
+            inspector,
+            reflow: reflow.name(),
+            streams: RefCell::new(HashMap::new()),
+            style_sheets: style_sheets.name(),
+            _tab: tabdesc.name(),
+            thread: thread.name(),
+            watcher: watcher.name(),
+        };
+
+        actors.register(accessibility);
+        actors.register(css_properties);
+        actors.register(reflow);
+        actors.register(style_sheets);
+        actors.register(tabdesc);
+        actors.register(thread);
+        actors.register(watcher);
+
+        target
+    }
+
+    pub(crate) fn navigate(&self, state: NavigationState, id_map: &mut IdMap) {
+        let (pipeline_id, title, url, state) = match state {
+            NavigationState::Start(url) => (None, None, url, "start"),
+            NavigationState::Stop(pipeline, info) => {
+                (Some(pipeline), Some(info.title), info.url, "stop")
+            },
+        };
+        if let Some(pipeline_id) = pipeline_id {
+            let outer_window_id = id_map.outer_window_id(pipeline_id);
+            self.active_outer_window_id.set(outer_window_id);
+            self.active_pipeline_id.set(pipeline_id);
+        }
+        url.as_str().clone_into(&mut self.url.borrow_mut());
+        if let Some(ref t) = title {
+            self.title.borrow_mut().clone_from(t);
+        }
+
+        let msg = TabNavigated {
+            from: self.name(),
+            type_: "tabNavigated".to_owned(),
+            url: url.as_str().to_owned(),
+            title,
+            native_console_api: true,
+            state: state.to_owned(),
+            is_frame_switching: false,
+        };
+
+        for stream in self.streams.borrow_mut().values_mut() {
+            let _ = stream.write_json_packet(&msg);
+        }
+    }
+
+    pub(crate) fn title_changed(&self, pipeline_id: PipelineId, title: String) {
+        if pipeline_id != self.active_pipeline_id.get() {
+            return;
+        }
+        *self.title.borrow_mut() = title;
+    }
+
+    pub(crate) fn frame_update(&self, request: &mut ClientRequest) {
+        let _ = request.write_json_packet(&FrameUpdateReply {
+            from: self.name(),
+            type_: "frameUpdate".into(),
+            frames: vec![FrameUpdateMsg {
+                id: self.browsing_context_id.value(),
+                is_top_level: true,
+                title: self.title.borrow().clone(),
+                url: self.url.borrow().clone(),
+            }],
+        });
+    }
+
+    pub fn simulate_color_scheme(&self, theme: Theme) -> Result<(), ()> {
+        self.script_chan
+            .send(SimulateColorScheme(self.active_pipeline_id.get(), theme))
+            .map_err(|_| ())
+    }
+}
+
+impl ActorEncode<BrowsingContextActorMsg> for BrowsingContextActor {
+    fn encode(&self, _: &ActorRegistry) -> BrowsingContextActorMsg {
+        BrowsingContextActorMsg {
+            actor: self.name(),
+            traits: BrowsingContextTraits {
+                is_browsing_context: true,
+                frames: true,
+                log_in_page: false,
+                navigation: true,
+                supports_top_level_target_flag: true,
+                watchpoints: true,
+            },
+            title: self.title.borrow().clone(),
+            url: self.url.borrow().clone(),
+            browser_id: self.browser_id.value(),
+            browsing_context_id: self.browsing_context_id.value(),
+            outer_window_id: self.active_outer_window_id.get().value(),
+            is_top_level_target: true,
+            accessibility_actor: self.accessibility.clone(),
+            console_actor: self.console.clone(),
+            css_properties_actor: self.css_properties.clone(),
+            inspector_actor: self.inspector.clone(),
+            reflow_actor: self.reflow.clone(),
+            style_sheets_actor: self.style_sheets.clone(),
+            thread_actor: self.thread.clone(),
+            target_type: TargetType::Frame,
+        }
+    }
 }

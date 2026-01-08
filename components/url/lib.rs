@@ -6,16 +6,8 @@
 #![crate_name = "servo_url"]
 #![crate_type = "rlib"]
 
-#[macro_use]
-extern crate malloc_size_of;
-#[macro_use]
-extern crate malloc_size_of_derive;
-#[macro_use]
-extern crate serde;
-
+pub mod encoding;
 pub mod origin;
-
-pub use crate::origin::{ImmutableOrigin, MutableOrigin, OpaqueOrigin};
 
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
@@ -23,20 +15,29 @@ use std::hash::Hasher;
 use std::net::IpAddr;
 use std::ops::{Index, Range, RangeFrom, RangeFull, RangeTo};
 use std::path::Path;
-use std::sync::Arc;
-use to_shmem::{SharedMemoryBuilder, ToShmem};
+use std::str::FromStr;
+
+use malloc_size_of_derive::MallocSizeOf;
+use serde::{Deserialize, Serialize};
+use servo_arc::Arc;
+pub use url::Host;
 use url::{Position, Url};
 
-pub use url::Host;
+pub use crate::origin::{ImmutableOrigin, MutableOrigin, OpaqueOrigin};
+
+const DATA_URL_DISPLAY_LENGTH: usize = 40;
+
+#[derive(Debug)]
+pub enum UrlError {
+    SetUsername,
+    SetIpHost,
+    SetPassword,
+    ToFilePath,
+    FromFilePath,
+}
 
 #[derive(Clone, Deserialize, Eq, Hash, MallocSizeOf, Ord, PartialEq, PartialOrd, Serialize)]
-pub struct ServoUrl(#[ignore_malloc_size_of = "Arc"] Arc<Url>);
-
-impl ToShmem for ServoUrl {
-    fn to_shmem(&self, _builder: &mut SharedMemoryBuilder) -> to_shmem::Result<Self> {
-        unimplemented!("If servo wants to share stylesheets across processes, ToShmem for Url must be implemented")
-    }
-}
+pub struct ServoUrl(#[conditional_malloc_size_of] Arc<Url>);
 
 impl ServoUrl {
     pub fn from_url(url: Url) -> Self {
@@ -51,13 +52,15 @@ impl ServoUrl {
     }
 
     pub fn into_string(self) -> String {
-        Arc::try_unwrap(self.0)
-            .unwrap_or_else(|s| (*s).clone())
-            .into_string()
+        String::from(self.into_url())
     }
 
     pub fn into_url(self) -> Url {
-        Arc::try_unwrap(self.0).unwrap_or_else(|s| (*s).clone())
+        self.as_url().clone()
+    }
+
+    pub fn get_arc(&self) -> Arc<Url> {
+        self.0.clone()
     }
 
     pub fn as_url(&self) -> &Url {
@@ -103,12 +106,22 @@ impl ServoUrl {
         scheme == "about" || scheme == "blob" || scheme == "data"
     }
 
-    pub fn chrome_rules_enabled(&self) -> bool {
-        self.is_chrome()
+    /// <https://url.spec.whatwg.org/#special-scheme>
+    pub fn is_special_scheme(&self) -> bool {
+        let scheme = self.scheme();
+        scheme == "ftp" ||
+            scheme == "file" ||
+            scheme == "http" ||
+            scheme == "https" ||
+            scheme == "ws" ||
+            scheme == "wss"
     }
 
-    pub fn is_chrome(&self) -> bool {
-        self.scheme() == "chrome"
+    /// <https://url.spec.whatwg.org/#url-equivalence>
+    /// In the future this may be removed if the helper is added upstream in rust-url
+    /// see <https://github.com/servo/rust-url/issues/1063> for details
+    pub fn is_equal_excluding_fragments(&self, other: &ServoUrl) -> bool {
+        self.0[..Position::AfterQuery] == other.0[..Position::AfterQuery]
     }
 
     pub fn as_str(&self) -> &str {
@@ -119,16 +132,22 @@ impl ServoUrl {
         Arc::make_mut(&mut self.0)
     }
 
-    pub fn set_username(&mut self, user: &str) -> Result<(), ()> {
-        self.as_mut_url().set_username(user)
+    pub fn set_username(&mut self, user: &str) -> Result<(), UrlError> {
+        self.as_mut_url()
+            .set_username(user)
+            .map_err(|_| UrlError::SetUsername)
     }
 
-    pub fn set_ip_host(&mut self, addr: IpAddr) -> Result<(), ()> {
-        self.as_mut_url().set_ip_host(addr)
+    pub fn set_ip_host(&mut self, addr: IpAddr) -> Result<(), UrlError> {
+        self.as_mut_url()
+            .set_ip_host(addr)
+            .map_err(|_| UrlError::SetIpHost)
     }
 
-    pub fn set_password(&mut self, pass: Option<&str>) -> Result<(), ()> {
-        self.as_mut_url().set_password(pass)
+    pub fn set_password(&mut self, pass: Option<&str>) -> Result<(), UrlError> {
+        self.as_mut_url()
+            .set_password(pass)
+            .map_err(|_| UrlError::SetPassword)
     }
 
     pub fn set_fragment(&mut self, fragment: Option<&str>) {
@@ -143,8 +162,8 @@ impl ServoUrl {
         self.0.password()
     }
 
-    pub fn to_file_path(&self) -> Result<::std::path::PathBuf, ()> {
-        self.0.to_file_path()
+    pub fn to_file_path(&self) -> Result<::std::path::PathBuf, UrlError> {
+        self.0.to_file_path().map_err(|_| UrlError::ToFilePath)
     }
 
     pub fn host(&self) -> Option<url::Host<&str>> {
@@ -167,7 +186,7 @@ impl ServoUrl {
         self.0.join(input).map(Self::from_url)
     }
 
-    pub fn path_segments(&self) -> Option<::std::str::Split<char>> {
+    pub fn path_segments(&self) -> Option<::std::str::Split<'_, char>> {
         self.0.path_segments()
     }
 
@@ -175,8 +194,10 @@ impl ServoUrl {
         self.0.query()
     }
 
-    pub fn from_file_path<P: AsRef<Path>>(path: P) -> Result<Self, ()> {
-        Ok(Self::from_url(Url::from_file_path(path)?))
+    pub fn from_file_path<P: AsRef<Path>>(path: P) -> Result<Self, UrlError> {
+        Url::from_file_path(path)
+            .map(Self::from_url)
+            .map_err(|_| UrlError::FromFilePath)
     }
 
     /// Return a non-standard shortened form of the URL. Mainly intended to be
@@ -187,7 +208,7 @@ impl ServoUrl {
                 // Strip `scheme://`, which is hardly useful for identifying websites
                 let mut st = self.as_str();
                 st = st.strip_prefix(self.scheme()).unwrap_or(st);
-                st = st.strip_prefix(":").unwrap_or(st);
+                st = st.strip_prefix(':').unwrap_or(st);
                 st = st.trim_start_matches('/');
 
                 // Don't want to return an empty string
@@ -223,33 +244,27 @@ impl ServoUrl {
             return true;
         }
         // Step 3
-        self.is_origin_trustworthy()
+        self.origin().is_potentially_trustworthy()
     }
 
-    /// <https://w3c.github.io/webappsec-secure-contexts/#is-origin-trustworthy>
-    pub fn is_origin_trustworthy(&self) -> bool {
-        // Step 1
-        if !self.origin().is_tuple() {
-            return false;
-        }
+    /// <https://html.spec.whatwg.org/multipage/#matches-about:blank>
+    pub fn matches_about_blank(&self) -> bool {
+        // A URL matches about:blank if
 
-        // Step 3
-        if self.scheme() == "https" || self.scheme() == "wss" {
-            true
-        // Steps 4-5
-        } else if self.host().is_some() {
-            let host = self.host_str().unwrap();
-            // Step 4
-            if let Ok(ip_addr) = host.parse::<IpAddr>() {
-                ip_addr.is_loopback()
-            // Step 5
-            } else {
-                host == "localhost" || host.ends_with(".localhost")
-            }
-        // Step 6
-        } else {
-            self.scheme() == "file"
-        }
+        // its scheme is "about",
+        let scheme_is_about = self.scheme() == "about";
+
+        // its path contains a single string "blank",
+        let path_is_blank = self.0.path() == "blank";
+
+        // its username and password are the empty string,
+        let empty_username_and_password =
+            self.0.username().is_empty() && self.0.password().is_none();
+
+        // and its host is null.
+        let null_host = self.0.host().is_none();
+
+        scheme_is_about && path_is_blank && empty_username_and_password && null_host
     }
 }
 
@@ -261,14 +276,23 @@ impl fmt::Display for ServoUrl {
 
 impl fmt::Debug for ServoUrl {
     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        if self.0.as_str().len() > 40 {
-            let mut hasher = DefaultHasher::new();
-            hasher.write(self.0.as_str().as_bytes());
-            let truncated: String = self.0.as_str().chars().take(40).collect();
-            let result = format!("{}... ({:x})", truncated, hasher.finish());
-            return result.fmt(formatter);
+        let url_string = self.0.as_str();
+        if self.scheme() != "data" || url_string.len() <= DATA_URL_DISPLAY_LENGTH {
+            return url_string.fmt(formatter);
         }
-        self.0.fmt(formatter)
+
+        let mut hasher = DefaultHasher::new();
+        hasher.write(self.0.as_str().as_bytes());
+
+        format!(
+            "{}... ({:x})",
+            url_string
+                .chars()
+                .take(DATA_URL_DISPLAY_LENGTH)
+                .collect::<String>(),
+            hasher.finish()
+        )
+        .fmt(formatter)
     }
 }
 
@@ -303,5 +327,20 @@ impl Index<Range<Position>> for ServoUrl {
 impl From<Url> for ServoUrl {
     fn from(url: Url) -> Self {
         ServoUrl::from_url(url)
+    }
+}
+
+impl From<Arc<Url>> for ServoUrl {
+    fn from(url: Arc<Url>) -> Self {
+        ServoUrl(url)
+    }
+}
+
+impl FromStr for ServoUrl {
+    type Err = <Url as FromStr>::Err;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let url = Url::from_str(value)?;
+        Ok(url.into())
     }
 }

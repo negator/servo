@@ -2,29 +2,20 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use net::hsts::{HstsEntry, HstsList};
-use net_traits::IncludeSubdomains;
 use std::collections::HashMap;
+use std::num::NonZeroU64;
+use std::time::Duration as StdDuration;
+
+use base64::Engine;
+use net::hsts::{HstsEntry, HstsList, HstsPreloadList};
+use net_traits::IncludeSubdomains;
 
 #[test]
-fn test_hsts_entry_is_not_expired_when_it_has_no_timestamp() {
+fn test_hsts_entry_is_not_expired_when_it_has_no_expires_at() {
     let entry = HstsEntry {
-        host: "mozilla.org".to_owned(),
+        host: "example.com".to_owned(),
         include_subdomains: false,
-        max_age: Some(20),
-        timestamp: None,
-    };
-
-    assert!(!entry.is_expired());
-}
-
-#[test]
-fn test_hsts_entry_is_not_expired_when_it_has_no_max_age() {
-    let entry = HstsEntry {
-        host: "mozilla.org".to_owned(),
-        include_subdomains: false,
-        max_age: None,
-        timestamp: Some(time::get_time().sec as u64),
+        expires_at: None,
     };
 
     assert!(!entry.is_expired());
@@ -33,10 +24,9 @@ fn test_hsts_entry_is_not_expired_when_it_has_no_max_age() {
 #[test]
 fn test_hsts_entry_is_expired_when_it_has_reached_its_max_age() {
     let entry = HstsEntry {
-        host: "mozilla.org".to_owned(),
+        host: "example.com".to_owned(),
         include_subdomains: false,
-        max_age: Some(10),
-        timestamp: Some(time::get_time().sec as u64 - 20u64),
+        expires_at: Some(NonZeroU64::new(1).unwrap()),
     };
 
     assert!(entry.is_expired());
@@ -70,7 +60,7 @@ fn test_base_domain_in_entries_map() {
 
     list.push(
         HstsEntry::new(
-            "servo.mozilla.org".to_owned(),
+            "servo.example.com".to_owned(),
             IncludeSubdomains::NotIncluded,
             None,
         )
@@ -78,7 +68,7 @@ fn test_base_domain_in_entries_map() {
     );
     list.push(
         HstsEntry::new(
-            "firefox.mozilla.org".to_owned(),
+            "firefox.example.com".to_owned(),
             IncludeSubdomains::NotIncluded,
             None,
         )
@@ -86,7 +76,7 @@ fn test_base_domain_in_entries_map() {
     );
     list.push(
         HstsEntry::new(
-            "bugzilla.org".to_owned(),
+            "example.org".to_owned(),
             IncludeSubdomains::NotIncluded,
             None,
         )
@@ -94,20 +84,22 @@ fn test_base_domain_in_entries_map() {
     );
 
     assert_eq!(list.entries_map.len(), 2);
-    assert_eq!(list.entries_map.get("mozilla.org").unwrap().len(), 2);
+    assert_eq!(list.entries_map.get("example.com").unwrap().len(), 2);
 }
 
 #[test]
-fn test_push_entry_with_0_max_age_evicts_entry_from_list() {
+fn test_push_entry_with_0_max_age_is_not_secure() {
     let mut entries_map = HashMap::new();
     entries_map.insert(
-        "mozilla.org".to_owned(),
-        vec![HstsEntry::new(
-            "mozilla.org".to_owned(),
-            IncludeSubdomains::NotIncluded,
-            Some(500000u64),
-        )
-        .unwrap()],
+        "example.com".to_owned(),
+        vec![
+            HstsEntry::new(
+                "example.com".to_owned(),
+                IncludeSubdomains::NotIncluded,
+                Some(StdDuration::from_secs(500000)),
+            )
+            .unwrap(),
+        ],
     );
     let mut list = HstsList {
         entries_map: entries_map,
@@ -115,22 +107,52 @@ fn test_push_entry_with_0_max_age_evicts_entry_from_list() {
 
     list.push(
         HstsEntry::new(
-            "mozilla.org".to_owned(),
+            "example.com".to_owned(),
             IncludeSubdomains::NotIncluded,
-            Some(0),
+            Some(StdDuration::ZERO),
         )
         .unwrap(),
     );
 
-    assert_eq!(list.is_host_secure("mozilla.org"), false)
+    assert_eq!(list.is_host_secure("example.com"), false)
+}
+
+fn test_push_entry_with_0_max_age_evicts_entry_from_list() {
+    let mut entries_map = HashMap::new();
+    entries_map.insert(
+        "example.com".to_owned(),
+        vec![
+            HstsEntry::new(
+                "example.com".to_owned(),
+                IncludeSubdomains::NotIncluded,
+                Some(StdDuration::from_secs(500000)),
+            )
+            .unwrap(),
+        ],
+    );
+    let mut list = HstsList {
+        entries_map: entries_map,
+    };
+
+    assert_eq!(list.entries_map.get("example.com").unwrap().len(), 1);
+
+    list.push(
+        HstsEntry::new(
+            "example.com".to_owned(),
+            IncludeSubdomains::NotIncluded,
+            Some(StdDuration::ZERO),
+        )
+        .unwrap(),
+    );
+    assert_eq!(list.entries_map.get("example.com").unwrap().len(), 0);
 }
 
 #[test]
 fn test_push_entry_to_hsts_list_should_not_add_subdomains_whose_superdomain_is_already_matched() {
     let mut entries_map = HashMap::new();
     entries_map.insert(
-        "mozilla.org".to_owned(),
-        vec![HstsEntry::new("mozilla.org".to_owned(), IncludeSubdomains::Included, None).unwrap()],
+        "example.com".to_owned(),
+        vec![HstsEntry::new("example.com".to_owned(), IncludeSubdomains::Included, None).unwrap()],
     );
     let mut list = HstsList {
         entries_map: entries_map,
@@ -138,52 +160,84 @@ fn test_push_entry_to_hsts_list_should_not_add_subdomains_whose_superdomain_is_a
 
     list.push(
         HstsEntry::new(
-            "servo.mozilla.org".to_owned(),
+            "servo.example.com".to_owned(),
             IncludeSubdomains::NotIncluded,
             None,
         )
         .unwrap(),
     );
 
-    assert_eq!(list.entries_map.get("mozilla.org").unwrap().len(), 1)
+    assert_eq!(list.entries_map.get("example.com").unwrap().len(), 1)
+}
+
+#[test]
+fn test_push_entry_to_hsts_list_should_add_subdomains_whose_superdomain_doesnt_include() {
+    let mut entries_map = HashMap::new();
+    entries_map.insert(
+        "example.com".to_owned(),
+        vec![
+            HstsEntry::new(
+                "example.com".to_owned(),
+                IncludeSubdomains::NotIncluded,
+                None,
+            )
+            .unwrap(),
+        ],
+    );
+    let mut list = HstsList {
+        entries_map: entries_map,
+    };
+
+    list.push(
+        HstsEntry::new(
+            "servo.example.com".to_owned(),
+            IncludeSubdomains::NotIncluded,
+            None,
+        )
+        .unwrap(),
+    );
+
+    assert_eq!(list.entries_map.get("example.com").unwrap().len(), 2)
 }
 
 #[test]
 fn test_push_entry_to_hsts_list_should_update_existing_domain_entrys_include_subdomains() {
     let mut entries_map = HashMap::new();
     entries_map.insert(
-        "mozilla.org".to_owned(),
-        vec![HstsEntry::new("mozilla.org".to_owned(), IncludeSubdomains::Included, None).unwrap()],
+        "example.com".to_owned(),
+        vec![HstsEntry::new("example.com".to_owned(), IncludeSubdomains::Included, None).unwrap()],
     );
     let mut list = HstsList {
         entries_map: entries_map,
     };
 
-    assert!(list.is_host_secure("servo.mozilla.org"));
+    assert!(list.is_host_secure("servo.example.com"));
 
     list.push(
         HstsEntry::new(
-            "mozilla.org".to_owned(),
+            "example.com".to_owned(),
             IncludeSubdomains::NotIncluded,
             None,
         )
         .unwrap(),
     );
 
-    assert!(!list.is_host_secure("servo.mozilla.org"))
+    assert!(!list.is_host_secure("servo.example.com"))
 }
 
 #[test]
 fn test_push_entry_to_hsts_list_should_not_create_duplicate_entry() {
     let mut entries_map = HashMap::new();
     entries_map.insert(
-        "mozilla.org".to_owned(),
-        vec![HstsEntry::new(
-            "mozilla.org".to_owned(),
-            IncludeSubdomains::NotIncluded,
-            None,
-        )
-        .unwrap()],
+        "example.com".to_owned(),
+        vec![
+            HstsEntry::new(
+                "example.com".to_owned(),
+                IncludeSubdomains::NotIncluded,
+                None,
+            )
+            .unwrap(),
+        ],
     );
     let mut list = HstsList {
         entries_map: entries_map,
@@ -191,14 +245,14 @@ fn test_push_entry_to_hsts_list_should_not_create_duplicate_entry() {
 
     list.push(
         HstsEntry::new(
-            "mozilla.org".to_owned(),
+            "example.com".to_owned(),
             IncludeSubdomains::NotIncluded,
             None,
         )
         .unwrap(),
     );
 
-    assert_eq!(list.entries_map.get("mozilla.org").unwrap().len(), 1)
+    assert_eq!(list.entries_map.get("example.com").unwrap().len(), 1)
 }
 
 #[test]
@@ -207,16 +261,14 @@ fn test_push_multiple_entrie_to_hsts_list_should_add_them_all() {
         entries_map: HashMap::new(),
     };
 
-    assert!(!list.is_host_secure("mozilla.org"));
-    assert!(!list.is_host_secure("bugzilla.org"));
+    assert!(!list.is_host_secure("example.com"));
+    assert!(!list.is_host_secure("example.org"));
 
-    list.push(HstsEntry::new("mozilla.org".to_owned(), IncludeSubdomains::Included, None).unwrap());
-    list.push(
-        HstsEntry::new("bugzilla.org".to_owned(), IncludeSubdomains::Included, None).unwrap(),
-    );
+    list.push(HstsEntry::new("example.com".to_owned(), IncludeSubdomains::Included, None).unwrap());
+    list.push(HstsEntry::new("example.org".to_owned(), IncludeSubdomains::Included, None).unwrap());
 
-    assert!(list.is_host_secure("mozilla.org"));
-    assert!(list.is_host_secure("bugzilla.org"));
+    assert!(list.is_host_secure("example.com"));
+    assert!(list.is_host_secure("example.org"));
 }
 
 #[test]
@@ -225,47 +277,35 @@ fn test_push_entry_to_hsts_list_should_add_an_entry() {
         entries_map: HashMap::new(),
     };
 
-    assert!(!list.is_host_secure("mozilla.org"));
+    assert!(!list.is_host_secure("example.com"));
 
-    list.push(HstsEntry::new("mozilla.org".to_owned(), IncludeSubdomains::Included, None).unwrap());
+    list.push(HstsEntry::new("example.com".to_owned(), IncludeSubdomains::Included, None).unwrap());
 
-    assert!(list.is_host_secure("mozilla.org"));
+    assert!(list.is_host_secure("example.com"));
 }
 
 #[test]
 fn test_parse_hsts_preload_should_return_none_when_json_invalid() {
-    let mock_preload_content = "derp";
+    let mock_preload_content = "derp".as_bytes().to_vec();
     assert!(
-        HstsList::from_preload(mock_preload_content).is_none(),
-        "invalid preload list should not have parsed"
-    )
-}
-
-#[test]
-fn test_parse_hsts_preload_should_return_none_when_json_contains_no_entries_map_key() {
-    let mock_preload_content = "{\"nothing\": \"to see here\"}";
-    assert!(
-        HstsList::from_preload(mock_preload_content).is_none(),
+        HstsPreloadList::from_preload(mock_preload_content).is_none(),
         "invalid preload list should not have parsed"
     )
 }
 
 #[test]
 fn test_parse_hsts_preload_should_decode_host_and_includes_subdomains() {
-    let mock_preload_content = "{\
-                                \"entries\": [\
-                                {\"host\": \"mozilla.org\",\
-                                \"include_subdomains\": false}\
-                                ]\
-                                }";
-    let hsts_list = HstsList::from_preload(mock_preload_content);
-    let entries_map = hsts_list.unwrap().entries_map;
+    // Generated with `fst map --sorted` on a csv of "example.com,0\nexample.org,3"
+    let mock_preload_content = base64::engine::general_purpose::STANDARD
+        .decode("AwAAAAAAAAAAAAAAAAAAAAAQkMQAEJfHAwABBW9jEQLNws/J0MXqwgIAAAAAAAAAJwAAAAAAAADVOFe6")
+        .unwrap();
+    let hsts_list = HstsPreloadList::from_preload(mock_preload_content).unwrap();
 
-    assert_eq!(
-        entries_map.get("mozilla.org").unwrap()[0].host,
-        "mozilla.org"
-    );
-    assert!(!entries_map.get("mozilla.org").unwrap()[0].include_subdomains);
+    assert_eq!(hsts_list.is_host_secure("derp"), false);
+    assert_eq!(hsts_list.is_host_secure("example.com"), true);
+    assert_eq!(hsts_list.is_host_secure("servo.example.com"), false);
+    assert_eq!(hsts_list.is_host_secure("example.org"), true);
+    assert_eq!(hsts_list.is_host_secure("servo.example.org"), true);
 }
 
 #[test]
@@ -274,111 +314,114 @@ fn test_hsts_list_with_no_entries_map_does_not_is_host_secure() {
         entries_map: HashMap::new(),
     };
 
-    assert!(!hsts_list.is_host_secure("mozilla.org"));
+    assert!(!hsts_list.is_host_secure("example.com"));
 }
 
 #[test]
 fn test_hsts_list_with_exact_domain_entry_is_is_host_secure() {
     let mut entries_map = HashMap::new();
     entries_map.insert(
-        "mozilla.org".to_owned(),
-        vec![HstsEntry::new(
-            "mozilla.org".to_owned(),
-            IncludeSubdomains::NotIncluded,
-            None,
-        )
-        .unwrap()],
+        "example.com".to_owned(),
+        vec![
+            HstsEntry::new(
+                "example.com".to_owned(),
+                IncludeSubdomains::NotIncluded,
+                None,
+            )
+            .unwrap(),
+        ],
     );
 
     let hsts_list = HstsList {
         entries_map: entries_map,
     };
 
-    assert!(hsts_list.is_host_secure("mozilla.org"));
+    assert!(hsts_list.is_host_secure("example.com"));
 }
 
 #[test]
 fn test_hsts_list_with_subdomain_when_include_subdomains_is_true_is_is_host_secure() {
     let mut entries_map = HashMap::new();
     entries_map.insert(
-        "mozilla.org".to_owned(),
-        vec![HstsEntry::new("mozilla.org".to_owned(), IncludeSubdomains::Included, None).unwrap()],
+        "example.com".to_owned(),
+        vec![HstsEntry::new("example.com".to_owned(), IncludeSubdomains::Included, None).unwrap()],
     );
     let hsts_list = HstsList {
         entries_map: entries_map,
     };
 
-    assert!(hsts_list.is_host_secure("servo.mozilla.org"));
+    assert!(hsts_list.is_host_secure("servo.example.com"));
 }
 
 #[test]
 fn test_hsts_list_with_subdomain_when_include_subdomains_is_false_is_not_is_host_secure() {
     let mut entries_map = HashMap::new();
     entries_map.insert(
-        "mozilla.org".to_owned(),
-        vec![HstsEntry::new(
-            "mozilla.org".to_owned(),
-            IncludeSubdomains::NotIncluded,
-            None,
-        )
-        .unwrap()],
+        "example.com".to_owned(),
+        vec![
+            HstsEntry::new(
+                "example.com".to_owned(),
+                IncludeSubdomains::NotIncluded,
+                None,
+            )
+            .unwrap(),
+        ],
     );
     let hsts_list = HstsList {
         entries_map: entries_map,
     };
 
-    assert!(!hsts_list.is_host_secure("servo.mozilla.org"));
+    assert!(!hsts_list.is_host_secure("servo.example.com"));
 }
 
 #[test]
 fn test_hsts_list_with_subdomain_when_host_is_not_a_subdomain_is_not_is_host_secure() {
     let mut entries_map = HashMap::new();
     entries_map.insert(
-        "mozilla.org".to_owned(),
-        vec![HstsEntry::new("mozilla.org".to_owned(), IncludeSubdomains::Included, None).unwrap()],
+        "example.com".to_owned(),
+        vec![HstsEntry::new("example.com".to_owned(), IncludeSubdomains::Included, None).unwrap()],
     );
     let hsts_list = HstsList {
         entries_map: entries_map,
     };
 
-    assert!(!hsts_list.is_host_secure("servo-mozilla.org"));
+    assert!(!hsts_list.is_host_secure("servo-example.com"));
 }
 
 #[test]
 fn test_hsts_list_with_subdomain_when_host_is_exact_match_is_is_host_secure() {
     let mut entries_map = HashMap::new();
     entries_map.insert(
-        "mozilla.org".to_owned(),
-        vec![HstsEntry::new("mozilla.org".to_owned(), IncludeSubdomains::Included, None).unwrap()],
+        "example.com".to_owned(),
+        vec![HstsEntry::new("example.com".to_owned(), IncludeSubdomains::Included, None).unwrap()],
     );
     let hsts_list = HstsList {
         entries_map: entries_map,
     };
 
-    assert!(hsts_list.is_host_secure("mozilla.org"));
+    assert!(hsts_list.is_host_secure("example.com"));
 }
 
 #[test]
 fn test_hsts_list_with_expired_entry_is_not_is_host_secure() {
     let mut entries_map = HashMap::new();
     entries_map.insert(
-        "mozilla.org".to_owned(),
+        "example.com".to_owned(),
         vec![HstsEntry {
-            host: "mozilla.org".to_owned(),
+            host: "example.com".to_owned(),
             include_subdomains: false,
-            max_age: Some(20),
-            timestamp: Some(time::get_time().sec as u64 - 100u64),
+            expires_at: Some(NonZeroU64::new(1).unwrap()),
         }],
     );
     let hsts_list = HstsList {
         entries_map: entries_map,
     };
 
-    assert!(!hsts_list.is_host_secure("mozilla.org"));
+    assert!(!hsts_list.is_host_secure("example.com"));
 }
 
 #[test]
 fn test_preload_hsts_domains_well_formed() {
-    let hsts_list = HstsList::from_servo_preload();
-    assert!(!hsts_list.entries_map.is_empty());
+    let hsts_list = HstsPreloadList::from_servo_preload();
+    assert_ne!(hsts_list.0.len(), 0);
 }

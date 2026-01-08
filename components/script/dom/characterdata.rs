@@ -3,12 +3,15 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 //! DOM bindings for `CharacterData`.
+use std::cell::LazyCell;
+
+use dom_struct::dom_struct;
+use script_bindings::codegen::InheritTypes::{CharacterDataTypeId, NodeTypeId, TextTypeId};
 
 use crate::dom::bindings::cell::{DomRefCell, Ref};
 use crate::dom::bindings::codegen::Bindings::CharacterDataBinding::CharacterDataMethods;
-use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeBinding::NodeMethods;
+use crate::dom::bindings::codegen::Bindings::NodeBinding::Node_Binding::NodeMethods;
 use crate::dom::bindings::codegen::Bindings::ProcessingInstructionBinding::ProcessingInstructionMethods;
-use crate::dom::bindings::codegen::InheritTypes::{CharacterDataTypeId, NodeTypeId, TextTypeId};
 use crate::dom::bindings::codegen::UnionTypes::NodeOrString;
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::Castable;
@@ -23,49 +26,59 @@ use crate::dom::node::{ChildrenMutation, Node, NodeDamage};
 use crate::dom::processinginstruction::ProcessingInstruction;
 use crate::dom::text::Text;
 use crate::dom::virtualmethods::vtable_for;
-use dom_struct::dom_struct;
+use crate::script_runtime::CanGc;
 
 // https://dom.spec.whatwg.org/#characterdata
 #[dom_struct]
-pub struct CharacterData {
+pub(crate) struct CharacterData {
     node: Node,
-    data: DomRefCell<DOMString>,
+    data: DomRefCell<String>,
 }
 
 impl CharacterData {
-    pub fn new_inherited(data: DOMString, document: &Document) -> CharacterData {
+    pub(crate) fn new_inherited(data: DOMString, document: &Document) -> CharacterData {
         CharacterData {
             node: Node::new_inherited(document),
-            data: DomRefCell::new(data),
+            data: DomRefCell::new(String::from(data.str())),
         }
     }
 
-    pub fn clone_with_data(&self, data: DOMString, document: &Document) -> DomRoot<Node> {
+    pub(crate) fn clone_with_data(
+        &self,
+        data: DOMString,
+        document: &Document,
+        can_gc: CanGc,
+    ) -> DomRoot<Node> {
         match self.upcast::<Node>().type_id() {
             NodeTypeId::CharacterData(CharacterDataTypeId::Comment) => {
-                DomRoot::upcast(Comment::new(data, &document))
+                DomRoot::upcast(Comment::new(data, document, None, can_gc))
             },
             NodeTypeId::CharacterData(CharacterDataTypeId::ProcessingInstruction) => {
                 let pi = self.downcast::<ProcessingInstruction>().unwrap();
-                DomRoot::upcast(ProcessingInstruction::new(pi.Target(), data, &document))
+                DomRoot::upcast(ProcessingInstruction::new(
+                    pi.Target(),
+                    data,
+                    document,
+                    can_gc,
+                ))
             },
             NodeTypeId::CharacterData(CharacterDataTypeId::Text(TextTypeId::CDATASection)) => {
-                DomRoot::upcast(CDATASection::new(data, &document))
+                DomRoot::upcast(CDATASection::new(data, document, can_gc))
             },
             NodeTypeId::CharacterData(CharacterDataTypeId::Text(TextTypeId::Text)) => {
-                DomRoot::upcast(Text::new(data, &document))
+                DomRoot::upcast(Text::new(data, document, can_gc))
             },
             _ => unreachable!(),
         }
     }
 
     #[inline]
-    pub fn data(&self) -> Ref<DOMString> {
+    pub(crate) fn data(&self) -> Ref<'_, String> {
         self.data.borrow()
     }
 
     #[inline]
-    pub fn append_data(&self, data: &str) {
+    pub(crate) fn append_data(&self, data: &str) {
         self.queue_mutation_record();
         self.data.borrow_mut().push_str(data);
         self.content_changed();
@@ -73,7 +86,7 @@ impl CharacterData {
 
     fn content_changed(&self) {
         let node = self.upcast::<Node>();
-        node.dirty(NodeDamage::OtherNodeDamage);
+        node.dirty(NodeDamage::Other);
 
         // If this is a Text node, we might need to re-parse (say, if our parent
         // is a <style> element.) We don't need to if this is a Comment or
@@ -81,114 +94,103 @@ impl CharacterData {
         if self.is::<Text>() {
             if let Some(parent_node) = node.GetParentNode() {
                 let mutation = ChildrenMutation::ChangeText;
-                vtable_for(&parent_node).children_changed(&mutation);
+                vtable_for(&parent_node).children_changed(&mutation, CanGc::note());
             }
         }
     }
 
     // Queue a MutationObserver record before changing the content.
     fn queue_mutation_record(&self) {
-        let mutation = Mutation::CharacterData {
+        let mutation = LazyCell::new(|| Mutation::CharacterData {
             old_value: self.data.borrow().clone(),
-        };
+        });
         MutationObserver::queue_a_mutation_record(self.upcast::<Node>(), mutation);
     }
 }
 
-impl CharacterDataMethods for CharacterData {
-    // https://dom.spec.whatwg.org/#dom-characterdata-data
+impl CharacterDataMethods<crate::DomTypeHolder> for CharacterData {
+    /// <https://dom.spec.whatwg.org/#dom-characterdata-data>
     fn Data(&self) -> DOMString {
-        self.data.borrow().clone()
+        DOMString::from(self.data.borrow().clone())
     }
 
-    // https://dom.spec.whatwg.org/#dom-characterdata-data
+    /// <https://dom.spec.whatwg.org/#dom-characterdata-data>
     fn SetData(&self, data: DOMString) {
         self.queue_mutation_record();
         let old_length = self.Length();
-        let new_length = data.encode_utf16().count() as u32;
-        *self.data.borrow_mut() = data;
+        let new_length = data.str().encode_utf16().count() as u32;
+        *self.data.borrow_mut() = String::from(data.str());
         self.content_changed();
         let node = self.upcast::<Node>();
         node.ranges()
             .replace_code_units(node, 0, old_length, new_length);
     }
 
-    // https://dom.spec.whatwg.org/#dom-characterdata-length
+    /// <https://dom.spec.whatwg.org/#dom-characterdata-length>
     fn Length(&self) -> u32 {
         self.data.borrow().encode_utf16().count() as u32
     }
 
-    // https://dom.spec.whatwg.org/#dom-characterdata-substringdata
+    /// <https://dom.spec.whatwg.org/#dom-characterdata-substringdata>
     fn SubstringData(&self, offset: u32, count: u32) -> Fallible<DOMString> {
-        let replace_surrogates = self
-            .upcast::<Node>()
-            .owner_doc()
-            .window()
-            .replace_surrogates();
         let data = self.data.borrow();
         // Step 1.
         let mut substring = String::new();
-        let remaining;
-        match split_at_utf16_code_unit_offset(&data, offset, replace_surrogates) {
+        let remaining = match split_at_utf16_code_unit_offset(&data, offset) {
             Ok((_, astral, s)) => {
                 // As if we had split the UTF-16 surrogate pair in half
                 // and then transcoded that to UTF-8 lossily,
                 // since our DOMString is currently strict UTF-8.
                 if astral.is_some() {
-                    substring = substring + "\u{FFFD}";
+                    substring += "\u{FFFD}";
                 }
-                remaining = s;
+                s
             },
             // Step 2.
-            Err(()) => return Err(Error::IndexSize),
-        }
-        match split_at_utf16_code_unit_offset(remaining, count, replace_surrogates) {
+            Err(()) => return Err(Error::IndexSize(None)),
+        };
+        match split_at_utf16_code_unit_offset(remaining, count) {
             // Steps 3.
-            Err(()) => substring = substring + remaining,
+            Err(()) => substring += remaining,
             // Steps 4.
             Ok((s, astral, _)) => {
-                substring = substring + s;
+                substring += s;
                 // As if we had split the UTF-16 surrogate pair in half
                 // and then transcoded that to UTF-8 lossily,
                 // since our DOMString is currently strict UTF-8.
                 if astral.is_some() {
-                    substring = substring + "\u{FFFD}";
+                    substring += "\u{FFFD}";
                 }
             },
         };
         Ok(DOMString::from(substring))
     }
 
-    // https://dom.spec.whatwg.org/#dom-characterdata-appenddatadata
+    /// <https://dom.spec.whatwg.org/#dom-characterdata-appenddatadata>
     fn AppendData(&self, data: DOMString) {
         // FIXME(ajeffrey): Efficient append on DOMStrings?
-        self.append_data(&*data);
+        self.append_data(&data.str());
     }
 
-    // https://dom.spec.whatwg.org/#dom-characterdata-insertdataoffset-data
+    /// <https://dom.spec.whatwg.org/#dom-characterdata-insertdataoffset-data>
     fn InsertData(&self, offset: u32, arg: DOMString) -> ErrorResult {
         self.ReplaceData(offset, 0, arg)
     }
 
-    // https://dom.spec.whatwg.org/#dom-characterdata-deletedataoffset-count
+    /// <https://dom.spec.whatwg.org/#dom-characterdata-deletedataoffset-count>
     fn DeleteData(&self, offset: u32, count: u32) -> ErrorResult {
         self.ReplaceData(offset, count, DOMString::new())
     }
 
-    // https://dom.spec.whatwg.org/#dom-characterdata-replacedata
+    /// <https://dom.spec.whatwg.org/#dom-characterdata-replacedata>
     fn ReplaceData(&self, offset: u32, count: u32, arg: DOMString) -> ErrorResult {
         let mut new_data;
         {
-            let replace_surrogates = self
-                .upcast::<Node>()
-                .owner_doc()
-                .window()
-                .replace_surrogates();
             let data = self.data.borrow();
             let prefix;
             let replacement_before;
             let remaining;
-            match split_at_utf16_code_unit_offset(&data, offset, replace_surrogates) {
+            match split_at_utf16_code_unit_offset(&data, offset) {
                 Ok((p, astral, r)) => {
                     prefix = p;
                     // As if we had split the UTF-16 surrogate pair in half
@@ -198,11 +200,11 @@ impl CharacterDataMethods for CharacterData {
                     remaining = r;
                 },
                 // Step 2.
-                Err(()) => return Err(Error::IndexSize),
+                Err(()) => return Err(Error::IndexSize(None)),
             };
             let replacement_after;
             let suffix;
-            match split_at_utf16_code_unit_offset(remaining, count, replace_surrogates) {
+            match split_at_utf16_code_unit_offset(remaining, count) {
                 // Steps 3.
                 Err(()) => {
                     replacement_after = "";
@@ -229,63 +231,65 @@ impl CharacterDataMethods for CharacterData {
             );
             new_data.push_str(prefix);
             new_data.push_str(replacement_before);
-            new_data.push_str(&arg);
+            new_data.push_str(&arg.str());
             new_data.push_str(replacement_after);
             new_data.push_str(suffix);
         }
-        *self.data.borrow_mut() = DOMString::from(new_data);
+        *self.data.borrow_mut() = new_data;
         self.content_changed();
         // Steps 8-11.
         let node = self.upcast::<Node>();
-        node.ranges()
-            .replace_code_units(node, offset, count, arg.encode_utf16().count() as u32);
+        node.ranges().replace_code_units(
+            node,
+            offset,
+            count,
+            arg.str().encode_utf16().count() as u32,
+        );
         Ok(())
     }
 
-    // https://dom.spec.whatwg.org/#dom-childnode-before
-    fn Before(&self, nodes: Vec<NodeOrString>) -> ErrorResult {
-        self.upcast::<Node>().before(nodes)
+    /// <https://dom.spec.whatwg.org/#dom-childnode-before>
+    fn Before(&self, nodes: Vec<NodeOrString>, can_gc: CanGc) -> ErrorResult {
+        self.upcast::<Node>().before(nodes, can_gc)
     }
 
-    // https://dom.spec.whatwg.org/#dom-childnode-after
-    fn After(&self, nodes: Vec<NodeOrString>) -> ErrorResult {
-        self.upcast::<Node>().after(nodes)
+    /// <https://dom.spec.whatwg.org/#dom-childnode-after>
+    fn After(&self, nodes: Vec<NodeOrString>, can_gc: CanGc) -> ErrorResult {
+        self.upcast::<Node>().after(nodes, can_gc)
     }
 
-    // https://dom.spec.whatwg.org/#dom-childnode-replacewith
-    fn ReplaceWith(&self, nodes: Vec<NodeOrString>) -> ErrorResult {
-        self.upcast::<Node>().replace_with(nodes)
+    /// <https://dom.spec.whatwg.org/#dom-childnode-replacewith>
+    fn ReplaceWith(&self, nodes: Vec<NodeOrString>, can_gc: CanGc) -> ErrorResult {
+        self.upcast::<Node>().replace_with(nodes, can_gc)
     }
 
-    // https://dom.spec.whatwg.org/#dom-childnode-remove
-    fn Remove(&self) {
+    /// <https://dom.spec.whatwg.org/#dom-childnode-remove>
+    fn Remove(&self, can_gc: CanGc) {
         let node = self.upcast::<Node>();
-        node.remove_self();
+        node.remove_self(can_gc);
     }
 
-    // https://dom.spec.whatwg.org/#dom-nondocumenttypechildnode-previouselementsibling
+    /// <https://dom.spec.whatwg.org/#dom-nondocumenttypechildnode-previouselementsibling>
     fn GetPreviousElementSibling(&self) -> Option<DomRoot<Element>> {
         self.upcast::<Node>()
             .preceding_siblings()
-            .filter_map(DomRoot::downcast)
-            .next()
+            .find_map(DomRoot::downcast)
     }
 
-    // https://dom.spec.whatwg.org/#dom-nondocumenttypechildnode-nextelementsibling
+    /// <https://dom.spec.whatwg.org/#dom-nondocumenttypechildnode-nextelementsibling>
     fn GetNextElementSibling(&self) -> Option<DomRoot<Element>> {
         self.upcast::<Node>()
             .following_siblings()
-            .filter_map(DomRoot::downcast)
-            .next()
+            .find_map(DomRoot::downcast)
     }
 }
 
-pub trait LayoutCharacterDataHelpers<'dom> {
+pub(crate) trait LayoutCharacterDataHelpers<'dom> {
     fn data_for_layout(self) -> &'dom str;
 }
 
 impl<'dom> LayoutCharacterDataHelpers<'dom> for LayoutDom<'dom, CharacterData> {
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     #[inline]
     fn data_for_layout(self) -> &'dom str {
         unsafe { self.unsafe_get().data.borrow_for_layout() }
@@ -306,17 +310,7 @@ impl<'dom> LayoutCharacterDataHelpers<'dom> for LayoutDom<'dom, CharacterData> {
 ///   The two string slices are such that:
 ///   `before == s.to_utf16()[..offset - 1].to_utf8()` and
 ///   `after == s.to_utf16()[offset + 1..].to_utf8()`
-///
-/// # Panics
-///
-/// Note that the third variant is only ever returned when the `-Z replace-surrogates`
-/// command-line option is specified.
-/// When it *would* be returned but the option is *not* specified, this function panics.
-fn split_at_utf16_code_unit_offset(
-    s: &str,
-    offset: u32,
-    replace_surrogates: bool,
-) -> Result<(&str, Option<char>, &str), ()> {
+fn split_at_utf16_code_unit_offset(s: &str, offset: u32) -> Result<(&str, Option<char>, &str), ()> {
     let mut code_units = 0;
     for (i, c) in s.char_indices() {
         if code_units == offset {
@@ -326,17 +320,9 @@ fn split_at_utf16_code_unit_offset(
         code_units += 1;
         if c > '\u{FFFF}' {
             if code_units == offset {
-                if replace_surrogates {
-                    debug_assert_eq!(c.len_utf8(), 4);
-                    return Ok((&s[..i], Some(c), &s[i + c.len_utf8()..]));
-                }
-                panic!(
-                    "\n\n\
-                     Would split a surrogate pair in CharacterData API.\n\
-                     If you see this in real content, please comment with the URL\n\
-                     on https://github.com/servo/servo/issues/6873\n\
-                     \n"
-                );
+                debug_assert_eq!(c.len_utf8(), 4);
+                warn!("Splitting a surrogate pair in CharacterData API.");
+                return Ok((&s[..i], Some(c), &s[i + c.len_utf8()..]));
             }
             code_units += 1;
         }

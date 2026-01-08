@@ -2,6 +2,11 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use dom_struct::dom_struct;
+use html5ever::{QualName, local_name, ns};
+use script_bindings::error::Error;
+use script_traits::DocumentActivity;
+
 use crate::document_loader::DocumentLoader;
 use crate::dom::bindings::codegen::Bindings::DOMImplementationBinding::DOMImplementationMethods;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
@@ -9,28 +14,24 @@ use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
 };
 use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
 use crate::dom::bindings::codegen::UnionTypes::StringOrElementCreationOptions;
+use crate::dom::bindings::domname::{is_valid_doctype_name, namespace_from_domstring};
 use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
+use crate::dom::bindings::reflector::{Reflector, reflect_dom_object};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
-use crate::dom::bindings::xmlname::{namespace_from_domstring, validate_qualified_name};
-use crate::dom::document::DocumentSource;
-use crate::dom::document::{Document, HasBrowsingContext, IsHTMLDocument};
+use crate::dom::document::{Document, DocumentSource, HasBrowsingContext, IsHTMLDocument};
 use crate::dom::documenttype::DocumentType;
-use crate::dom::htmlbodyelement::HTMLBodyElement;
-use crate::dom::htmlheadelement::HTMLHeadElement;
-use crate::dom::htmlhtmlelement::HTMLHtmlElement;
-use crate::dom::htmltitleelement::HTMLTitleElement;
+use crate::dom::element::{CustomElementCreationMode, ElementCreator};
 use crate::dom::node::Node;
 use crate::dom::text::Text;
+use crate::dom::types::Element;
 use crate::dom::xmldocument::XMLDocument;
-use dom_struct::dom_struct;
-use script_traits::DocumentActivity;
+use crate::script_runtime::CanGc;
 
 // https://dom.spec.whatwg.org/#domimplementation
 #[dom_struct]
-pub struct DOMImplementation {
+pub(crate) struct DOMImplementation {
     reflector_: Reflector,
     document: Dom<Document>,
 }
@@ -43,46 +44,61 @@ impl DOMImplementation {
         }
     }
 
-    pub fn new(document: &Document) -> DomRoot<DOMImplementation> {
+    pub(crate) fn new(document: &Document, can_gc: CanGc) -> DomRoot<DOMImplementation> {
         let window = document.window();
-        reflect_dom_object(Box::new(DOMImplementation::new_inherited(document)), window)
+        reflect_dom_object(
+            Box::new(DOMImplementation::new_inherited(document)),
+            window,
+            can_gc,
+        )
     }
 }
 
 // https://dom.spec.whatwg.org/#domimplementation
-impl DOMImplementationMethods for DOMImplementation {
-    // https://dom.spec.whatwg.org/#dom-domimplementation-createdocumenttype
+impl DOMImplementationMethods<crate::DomTypeHolder> for DOMImplementation {
+    /// <https://dom.spec.whatwg.org/#dom-domimplementation-createdocumenttype>
     fn CreateDocumentType(
         &self,
         qualified_name: DOMString,
         pubid: DOMString,
         sysid: DOMString,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<DocumentType>> {
-        validate_qualified_name(&qualified_name)?;
+        // Step 1. If name is not a valid doctype name, then throw an
+        //      "InvalidCharacterError" DOMException.
+        if !is_valid_doctype_name(&qualified_name) {
+            debug!("Not a valid doctype name");
+            return Err(Error::InvalidCharacter(None));
+        }
+
         Ok(DocumentType::new(
             qualified_name,
             Some(pubid),
             Some(sysid),
             &self.document,
+            can_gc,
         ))
     }
 
-    // https://dom.spec.whatwg.org/#dom-domimplementation-createdocument
+    /// <https://dom.spec.whatwg.org/#dom-domimplementation-createdocument>
     fn CreateDocument(
         &self,
         maybe_namespace: Option<DOMString>,
         qname: DOMString,
         maybe_doctype: Option<&DocumentType>,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<XMLDocument>> {
         let win = self.document.window();
         let loader = DocumentLoader::new(&self.document.loader());
         let namespace = namespace_from_domstring(maybe_namespace.to_owned());
 
         let content_type = match namespace {
-            ns!(html) => "application/xhtml+xml".parse().unwrap(),
-            ns!(svg) => mime::IMAGE_SVG,
-            _ => "application/xml".parse().unwrap(),
-        };
+            ns!(html) => "application/xhtml+xml",
+            ns!(svg) => "image/svg+xml",
+            _ => "application/xml",
+        }
+        .parse()
+        .unwrap();
 
         // Step 1.
         let doc = XMLDocument::new(
@@ -96,8 +112,15 @@ impl DOMImplementationMethods for DOMImplementation {
             DocumentActivity::Inactive,
             DocumentSource::NotFromParser,
             loader,
+            Some(self.document.insecure_requests_policy()),
+            self.document.has_trustworthy_ancestor_or_current_origin(),
+            self.document.custom_element_reaction_stack(),
+            can_gc,
         );
-        // Step 2-3.
+
+        // Step 2. Let element be null.
+        // Step 3. If qualifiedName is not the empty string, then set element to the result of running
+        // the internal createElementNS steps, given document, namespace, qualifiedName, and an empty dictionary.
         let maybe_elem = if qname.is_empty() {
             None
         } else {
@@ -107,7 +130,7 @@ impl DOMImplementationMethods for DOMImplementation {
                 });
             match doc
                 .upcast::<Document>()
-                .CreateElementNS(maybe_namespace, qname, options)
+                .CreateElementNS(maybe_namespace, qname, options, can_gc)
             {
                 Err(error) => return Err(error),
                 Ok(elem) => Some(elem),
@@ -119,12 +142,12 @@ impl DOMImplementationMethods for DOMImplementation {
 
             // Step 4.
             if let Some(doc_type) = maybe_doctype {
-                doc_node.AppendChild(doc_type.upcast()).unwrap();
+                doc_node.AppendChild(doc_type.upcast(), can_gc).unwrap();
             }
 
             // Step 5.
             if let Some(ref elem) = maybe_elem {
-                doc_node.AppendChild(elem.upcast()).unwrap();
+                doc_node.AppendChild(elem.upcast(), can_gc).unwrap();
             }
         }
 
@@ -135,8 +158,8 @@ impl DOMImplementationMethods for DOMImplementation {
         Ok(doc)
     }
 
-    // https://dom.spec.whatwg.org/#dom-domimplementation-createhtmldocument
-    fn CreateHTMLDocument(&self, title: Option<DOMString>) -> DomRoot<Document> {
+    /// <https://dom.spec.whatwg.org/#dom-domimplementation-createhtmldocument>
+    fn CreateHTMLDocument(&self, title: Option<DOMString>, can_gc: CanGc) -> DomRoot<Document> {
         let win = self.document.window();
         let loader = DocumentLoader::new(&self.document.loader());
 
@@ -155,47 +178,82 @@ impl DOMImplementationMethods for DOMImplementation {
             None,
             None,
             Default::default(),
+            false,
+            self.document.allow_declarative_shadow_roots(),
+            Some(self.document.insecure_requests_policy()),
+            self.document.has_trustworthy_ancestor_or_current_origin(),
+            self.document.custom_element_reaction_stack(),
+            self.document.creation_sandboxing_flag_set(),
+            can_gc,
         );
 
         {
             // Step 3.
             let doc_node = doc.upcast::<Node>();
-            let doc_type = DocumentType::new(DOMString::from("html"), None, None, &doc);
-            doc_node.AppendChild(doc_type.upcast()).unwrap();
+            let doc_type = DocumentType::new(DOMString::from("html"), None, None, &doc, can_gc);
+            doc_node.AppendChild(doc_type.upcast(), can_gc).unwrap();
         }
 
         {
             // Step 4.
             let doc_node = doc.upcast::<Node>();
-            let doc_html =
-                DomRoot::upcast::<Node>(HTMLHtmlElement::new(local_name!("html"), None, &doc));
-            doc_node.AppendChild(&doc_html).expect("Appending failed");
+            let doc_html = DomRoot::upcast::<Node>(Element::create(
+                QualName::new(None, ns!(html), local_name!("html")),
+                None,
+                &doc,
+                ElementCreator::ScriptCreated,
+                CustomElementCreationMode::Asynchronous,
+                None,
+                can_gc,
+            ));
+            doc_node
+                .AppendChild(&doc_html, can_gc)
+                .expect("Appending failed");
 
             {
                 // Step 5.
-                let doc_head =
-                    DomRoot::upcast::<Node>(HTMLHeadElement::new(local_name!("head"), None, &doc));
-                doc_html.AppendChild(&doc_head).unwrap();
+                let doc_head = DomRoot::upcast::<Node>(Element::create(
+                    QualName::new(None, ns!(html), local_name!("head")),
+                    None,
+                    &doc,
+                    ElementCreator::ScriptCreated,
+                    CustomElementCreationMode::Asynchronous,
+                    None,
+                    can_gc,
+                ));
+                doc_html.AppendChild(&doc_head, can_gc).unwrap();
 
                 // Step 6.
                 if let Some(title_str) = title {
                     // Step 6.1.
-                    let doc_title = DomRoot::upcast::<Node>(HTMLTitleElement::new(
-                        local_name!("title"),
+                    let doc_title = DomRoot::upcast::<Node>(Element::create(
+                        QualName::new(None, ns!(html), local_name!("title")),
                         None,
                         &doc,
+                        ElementCreator::ScriptCreated,
+                        CustomElementCreationMode::Asynchronous,
+                        None,
+                        can_gc,
                     ));
-                    doc_head.AppendChild(&doc_title).unwrap();
+                    doc_head.AppendChild(&doc_title, can_gc).unwrap();
 
                     // Step 6.2.
-                    let title_text = Text::new(title_str, &doc);
-                    doc_title.AppendChild(title_text.upcast()).unwrap();
+                    let title_text = Text::new(title_str, &doc, can_gc);
+                    doc_title.AppendChild(title_text.upcast(), can_gc).unwrap();
                 }
             }
 
             // Step 7.
-            let doc_body = HTMLBodyElement::new(local_name!("body"), None, &doc);
-            doc_html.AppendChild(doc_body.upcast()).unwrap();
+            let doc_body = Element::create(
+                QualName::new(None, ns!(html), local_name!("body")),
+                None,
+                &doc,
+                ElementCreator::ScriptCreated,
+                CustomElementCreationMode::Asynchronous,
+                None,
+                can_gc,
+            );
+            doc_html.AppendChild(doc_body.upcast(), can_gc).unwrap();
         }
 
         // Step 8.
@@ -205,7 +263,7 @@ impl DOMImplementationMethods for DOMImplementation {
         doc
     }
 
-    // https://dom.spec.whatwg.org/#dom-domimplementation-hasfeature
+    /// <https://dom.spec.whatwg.org/#dom-domimplementation-hasfeature>
     fn HasFeature(&self) -> bool {
         true
     }

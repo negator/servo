@@ -2,108 +2,82 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use crate::canvas_data::*;
-use canvas_traits::canvas::*;
-use canvas_traits::ConstellationCanvasMsg;
-use crossbeam_channel::{select, unbounded, Sender};
-use euclid::default::Size2D;
-use gfx::font_cache_thread::FontCacheThread;
-use ipc_channel::ipc::{self, IpcSender};
-use ipc_channel::router::ROUTER;
 use std::borrow::ToOwned;
-use std::collections::HashMap;
-use std::thread;
-use webrender_api::{ImageData, ImageDescriptor, ImageKey};
+use std::{f32, thread};
 
-pub enum AntialiasMode {
-    Default,
-    None,
-}
+use base::generic_channel::GenericSender;
+use base::{Epoch, generic_channel};
+use canvas_traits::ConstellationCanvasMsg;
+use canvas_traits::canvas::*;
+use compositing_traits::CrossProcessPaintApi;
+use crossbeam_channel::{Sender, select, unbounded};
+use euclid::default::{Rect, Size2D, Transform2D};
+use log::warn;
+use pixels::Snapshot;
+use rustc_hash::FxHashMap;
+use webrender_api::ImageKey;
 
-pub enum ImageUpdate {
-    Add(ImageKey, ImageDescriptor, ImageData),
-    Update(ImageKey, ImageDescriptor, ImageData),
-    Delete(ImageKey),
-}
+use crate::canvas_data::*;
 
-pub trait WebrenderApi {
-    fn generate_key(&self) -> Result<webrender_api::ImageKey, ()>;
-    fn update_images(&self, updates: Vec<ImageUpdate>);
-    fn clone(&self) -> Box<dyn WebrenderApi>;
-}
-
-pub struct CanvasPaintThread<'a> {
-    canvases: HashMap<CanvasId, CanvasData<'a>>,
+pub struct CanvasPaintThread {
+    canvases: FxHashMap<CanvasId, Canvas>,
     next_canvas_id: CanvasId,
-    webrender_api: Box<dyn WebrenderApi>,
-    font_cache_thread: FontCacheThread,
+    paint_api: CrossProcessPaintApi,
 }
 
-impl<'a> CanvasPaintThread<'a> {
-    fn new(
-        webrender_api: Box<dyn WebrenderApi>,
-        font_cache_thread: FontCacheThread,
-    ) -> CanvasPaintThread<'a> {
+impl CanvasPaintThread {
+    fn new(paint_api: CrossProcessPaintApi) -> CanvasPaintThread {
         CanvasPaintThread {
-            canvases: HashMap::new(),
+            canvases: FxHashMap::default(),
             next_canvas_id: CanvasId(0),
-            webrender_api,
-            font_cache_thread,
+            paint_api: paint_api.clone(),
         }
     }
 
     /// Creates a new `CanvasPaintThread` and returns an `IpcSender` to
     /// communicate with it.
     pub fn start(
-        webrender_api: Box<dyn WebrenderApi + Send>,
-        font_cache_thread: FontCacheThread,
-    ) -> (Sender<ConstellationCanvasMsg>, IpcSender<CanvasMsg>) {
-        let (ipc_sender, ipc_receiver) = ipc::channel::<CanvasMsg>().unwrap();
-        let msg_receiver = ROUTER.route_ipc_receiver_to_new_crossbeam_receiver(ipc_receiver);
+        paint_api: CrossProcessPaintApi,
+    ) -> (Sender<ConstellationCanvasMsg>, GenericSender<CanvasMsg>) {
+        let (ipc_sender, ipc_receiver) = generic_channel::channel::<CanvasMsg>().unwrap();
+        let msg_receiver = ipc_receiver.route_preserving_errors();
         let (create_sender, create_receiver) = unbounded();
         thread::Builder::new()
             .name("Canvas".to_owned())
             .spawn(move || {
-                let mut canvas_paint_thread = CanvasPaintThread::new(webrender_api, font_cache_thread);
+                let mut canvas_paint_thread = CanvasPaintThread::new(
+                    paint_api);
                 loop {
                     select! {
                         recv(msg_receiver) -> msg => {
                             match msg {
-                                Ok(CanvasMsg::Canvas2d(message, canvas_id)) => {
+                                Ok(Ok(CanvasMsg::Canvas2d(message, canvas_id))) => {
                                     canvas_paint_thread.process_canvas_2d_message(message, canvas_id);
                                 },
-                                Ok(CanvasMsg::Close(canvas_id)) => {
+                                Ok(Ok(CanvasMsg::Close(canvas_id))) => {
                                     canvas_paint_thread.canvases.remove(&canvas_id);
                                 },
-                                Ok(CanvasMsg::Recreate(size, canvas_id)) => {
+                                Ok(Ok(CanvasMsg::Recreate(size, canvas_id))) => {
                                     canvas_paint_thread.canvas(canvas_id).recreate(size);
                                 },
-                                Ok(CanvasMsg::FromScript(message, canvas_id)) => match message {
-                                    FromScriptMsg::SendPixels(chan) => {
-                                        canvas_paint_thread.canvas(canvas_id).send_pixels(chan);
-                                    },
-                                },
-                                Ok(CanvasMsg::FromLayout(message, canvas_id)) => match message {
-                                    FromLayoutMsg::SendData(chan) => {
-                                        canvas_paint_thread.canvas(canvas_id).send_data(chan);
-                                    },
-                                },
-                                Err(e) => {
-                                    warn!("Error on CanvasPaintThread receive ({})", e);
+                                Ok(Err(e)) => {
+                                    warn!("CanvasPaintThread message deserialization error: {e:?}");
+                                }
+                                Err(_disconnected) => {
+                                    warn!("CanvasMsg receiver disconnected");
+                                    break;
                                 },
                             }
                         }
                         recv(create_receiver) -> msg => {
                             match msg {
-                                Ok(ConstellationCanvasMsg::Create {
-                                    id_sender: creator,
-                                    size,
-                                    antialias
-                                }) => {
-                                    let canvas_id = canvas_paint_thread.create_canvas(size, antialias);
-                                    creator.send(canvas_id).unwrap();
+                                Ok(ConstellationCanvasMsg::Create { sender: creator, size }) => {
+                                    creator.send(canvas_paint_thread.create_canvas(size)).unwrap();
                                 },
-                                Ok(ConstellationCanvasMsg::Exit) => break,
+                                Ok(ConstellationCanvasMsg::Exit(exit_sender)) => {
+                                    let _ = exit_sender.send(());
+                                    break;
+                                },
                                 Err(e) => {
                                     warn!("Error on CanvasPaintThread receive ({})", e);
                                     break;
@@ -118,156 +92,510 @@ impl<'a> CanvasPaintThread<'a> {
         (create_sender, ipc_sender)
     }
 
-    pub fn create_canvas(&mut self, size: Size2D<u64>, antialias: bool) -> CanvasId {
-        let antialias = if antialias {
-            AntialiasMode::Default
-        } else {
-            AntialiasMode::None
-        };
-
-        let font_cache_thread = self.font_cache_thread.clone();
-
-        let canvas_id = self.next_canvas_id.clone();
+    #[servo_tracing::instrument(skip_all)]
+    pub fn create_canvas(&mut self, size: Size2D<u64>) -> Option<CanvasId> {
+        let canvas_id = self.next_canvas_id;
         self.next_canvas_id.0 += 1;
 
-        let canvas_data = CanvasData::new(
-            size,
-            self.webrender_api.clone(),
-            antialias,
-            font_cache_thread,
-        );
-        self.canvases.insert(canvas_id.clone(), canvas_data);
+        let canvas = Canvas::new(size, self.paint_api.clone())?;
+        self.canvases.insert(canvas_id, canvas);
 
-        canvas_id
+        Some(canvas_id)
     }
 
+    #[servo_tracing::instrument(
+        skip_all,
+        fields(message = message.to_string())
+    )]
     fn process_canvas_2d_message(&mut self, message: Canvas2dMsg, canvas_id: CanvasId) {
         match message {
-            Canvas2dMsg::FillText(text, x, y, max_width, style, is_rtl) => {
-                self.canvas(canvas_id).set_fill_style(style);
+            Canvas2dMsg::SetImageKey(image_key) => {
+                self.canvas(canvas_id).set_image_key(image_key);
+            },
+            Canvas2dMsg::FillText(
+                text_bounds,
+                text_runs,
+                fill_or_stroke_style,
+                shadow_options,
+                composition_options,
+                transform,
+            ) => {
+                self.canvas(canvas_id).fill_text(
+                    text_bounds,
+                    text_runs,
+                    fill_or_stroke_style,
+                    shadow_options,
+                    composition_options,
+                    transform,
+                );
+            },
+            Canvas2dMsg::StrokeText(
+                text_bounds,
+                text_runs,
+                fill_or_stroke_style,
+                line_options,
+                shadow_options,
+                composition_options,
+                transform,
+            ) => {
+                self.canvas(canvas_id).stroke_text(
+                    text_bounds,
+                    text_runs,
+                    fill_or_stroke_style,
+                    line_options,
+                    shadow_options,
+                    composition_options,
+                    transform,
+                );
+            },
+            Canvas2dMsg::FillRect(rect, style, shadow_options, composition_options, transform) => {
+                self.canvas(canvas_id).fill_rect(
+                    &rect,
+                    style,
+                    shadow_options,
+                    composition_options,
+                    transform,
+                );
+            },
+            Canvas2dMsg::StrokeRect(
+                rect,
+                style,
+                line_options,
+                shadow_options,
+                composition_options,
+                transform,
+            ) => {
+                self.canvas(canvas_id).stroke_rect(
+                    &rect,
+                    style,
+                    line_options,
+                    shadow_options,
+                    composition_options,
+                    transform,
+                );
+            },
+            Canvas2dMsg::ClearRect(ref rect, transform) => {
+                self.canvas(canvas_id).clear_rect(rect, transform)
+            },
+            Canvas2dMsg::FillPath(
+                style,
+                path,
+                fill_rule,
+                shadow_options,
+                composition_options,
+                transform,
+            ) => {
+                self.canvas(canvas_id).fill_path(
+                    &path,
+                    fill_rule,
+                    style,
+                    shadow_options,
+                    composition_options,
+                    transform,
+                );
+            },
+            Canvas2dMsg::StrokePath(
+                path,
+                style,
+                line_options,
+                shadow_options,
+                composition_options,
+                transform,
+            ) => {
+                self.canvas(canvas_id).stroke_path(
+                    &path,
+                    style,
+                    line_options,
+                    shadow_options,
+                    composition_options,
+                    transform,
+                );
+            },
+            Canvas2dMsg::ClipPath(path, fill_rule, transform) => {
                 self.canvas(canvas_id)
-                    .fill_text(text, x, y, max_width, is_rtl);
+                    .clip_path(&path, fill_rule, transform);
             },
-            Canvas2dMsg::FillRect(rect, style) => {
-                self.canvas(canvas_id).set_fill_style(style);
-                self.canvas(canvas_id).fill_rect(&rect);
-            },
-            Canvas2dMsg::StrokeRect(rect, style) => {
-                self.canvas(canvas_id).set_stroke_style(style);
-                self.canvas(canvas_id).stroke_rect(&rect);
-            },
-            Canvas2dMsg::ClearRect(ref rect) => self.canvas(canvas_id).clear_rect(rect),
-            Canvas2dMsg::BeginPath => self.canvas(canvas_id).begin_path(),
-            Canvas2dMsg::ClosePath => self.canvas(canvas_id).close_path(),
-            Canvas2dMsg::Fill(style) => {
-                self.canvas(canvas_id).set_fill_style(style);
-                self.canvas(canvas_id).fill();
-            },
-            Canvas2dMsg::Stroke(style) => {
-                self.canvas(canvas_id).set_stroke_style(style);
-                self.canvas(canvas_id).stroke();
-            },
-            Canvas2dMsg::Clip => self.canvas(canvas_id).clip(),
-            Canvas2dMsg::IsPointInPath(x, y, fill_rule, chan) => self
-                .canvas(canvas_id)
-                .is_point_in_path(x, y, fill_rule, chan),
             Canvas2dMsg::DrawImage(
-                imagedata,
-                image_size,
+                snapshot,
                 dest_rect,
                 source_rect,
                 smoothing_enabled,
-            ) => {
-                let data = imagedata.map_or_else(
-                    || vec![0; image_size.width as usize * image_size.height as usize * 4],
-                    |bytes| bytes.into_vec(),
-                );
-                self.canvas(canvas_id).draw_image(
-                    data,
-                    image_size,
-                    dest_rect,
-                    source_rect,
-                    smoothing_enabled,
-                )
-            },
-            Canvas2dMsg::DrawImageInOther(
-                other_canvas_id,
+                shadow_options,
+                composition_options,
+                transform,
+            ) => self.canvas(canvas_id).draw_image(
+                snapshot.to_owned(),
+                dest_rect,
+                source_rect,
+                smoothing_enabled,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
+            Canvas2dMsg::DrawEmptyImage(
                 image_size,
                 dest_rect,
                 source_rect,
+                shadow_options,
+                composition_options,
+                transform,
+            ) => self.canvas(canvas_id).draw_image(
+                Snapshot::cleared(image_size),
+                dest_rect,
+                source_rect,
+                false,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
+            Canvas2dMsg::DrawImageInOther(
+                other_canvas_id,
+                dest_rect,
+                source_rect,
                 smoothing,
+                shadow_options,
+                composition_options,
+                transform,
             ) => {
-                let image_data = self
+                let snapshot = self
                     .canvas(canvas_id)
-                    .read_pixels(source_rect.to_u64(), image_size.to_u64());
+                    .read_pixels(Some(source_rect.to_u32()));
                 self.canvas(other_canvas_id).draw_image(
-                    image_data.into(),
-                    source_rect.size,
+                    snapshot,
                     dest_rect,
                     source_rect,
                     smoothing,
+                    shadow_options,
+                    composition_options,
+                    transform,
                 );
             },
-            Canvas2dMsg::MoveTo(ref point) => self.canvas(canvas_id).move_to(point),
-            Canvas2dMsg::LineTo(ref point) => self.canvas(canvas_id).line_to(point),
-            Canvas2dMsg::Rect(ref rect) => self.canvas(canvas_id).rect(rect),
-            Canvas2dMsg::QuadraticCurveTo(ref cp, ref pt) => {
-                self.canvas(canvas_id).quadratic_curve_to(cp, pt)
+            Canvas2dMsg::GetImageData(dest_rect, sender) => {
+                let snapshot = self.canvas(canvas_id).read_pixels(dest_rect);
+                sender.send(snapshot.to_shared()).unwrap();
             },
-            Canvas2dMsg::BezierCurveTo(ref cp1, ref cp2, ref pt) => {
-                self.canvas(canvas_id).bezier_curve_to(cp1, cp2, pt)
-            },
-            Canvas2dMsg::Arc(ref center, radius, start, end, ccw) => {
-                self.canvas(canvas_id).arc(center, radius, start, end, ccw)
-            },
-            Canvas2dMsg::ArcTo(ref cp1, ref cp2, radius) => {
-                self.canvas(canvas_id).arc_to(cp1, cp2, radius)
-            },
-            Canvas2dMsg::Ellipse(ref center, radius_x, radius_y, rotation, start, end, ccw) => self
-                .canvas(canvas_id)
-                .ellipse(center, radius_x, radius_y, rotation, start, end, ccw),
-            Canvas2dMsg::RestoreContext => self.canvas(canvas_id).restore_context_state(),
-            Canvas2dMsg::SaveContext => self.canvas(canvas_id).save_context_state(),
-            Canvas2dMsg::SetLineWidth(width) => self.canvas(canvas_id).set_line_width(width),
-            Canvas2dMsg::SetLineCap(cap) => self.canvas(canvas_id).set_line_cap(cap),
-            Canvas2dMsg::SetLineJoin(join) => self.canvas(canvas_id).set_line_join(join),
-            Canvas2dMsg::SetMiterLimit(limit) => self.canvas(canvas_id).set_miter_limit(limit),
-            Canvas2dMsg::GetTransform(sender) => {
-                let transform = self.canvas(canvas_id).get_transform();
-                sender.send(transform).unwrap();
-            },
-            Canvas2dMsg::SetTransform(ref matrix) => self.canvas(canvas_id).set_transform(matrix),
-            Canvas2dMsg::SetGlobalAlpha(alpha) => self.canvas(canvas_id).set_global_alpha(alpha),
-            Canvas2dMsg::SetGlobalComposition(op) => {
-                self.canvas(canvas_id).set_global_composition(op)
-            },
-            Canvas2dMsg::GetImageData(dest_rect, canvas_size, sender) => {
-                let pixels = self.canvas(canvas_id).read_pixels(dest_rect, canvas_size);
-                sender.send(&pixels).unwrap();
-            },
-            Canvas2dMsg::PutImageData(rect, receiver) => {
+            Canvas2dMsg::PutImageData(rect, snapshot) => {
                 self.canvas(canvas_id)
-                    .put_image_data(receiver.recv().unwrap(), rect);
+                    .put_image_data(snapshot.to_owned(), rect);
             },
-            Canvas2dMsg::SetShadowOffsetX(value) => {
-                self.canvas(canvas_id).set_shadow_offset_x(value)
+            Canvas2dMsg::UpdateImage(canvas_epoch) => {
+                self.canvas(canvas_id).update_image_rendering(canvas_epoch);
             },
-            Canvas2dMsg::SetShadowOffsetY(value) => {
-                self.canvas(canvas_id).set_shadow_offset_y(value)
-            },
-            Canvas2dMsg::SetShadowBlur(value) => self.canvas(canvas_id).set_shadow_blur(value),
-            Canvas2dMsg::SetShadowColor(color) => self.canvas(canvas_id).set_shadow_color(color),
-            Canvas2dMsg::SetFont(font_style) => self.canvas(canvas_id).set_font(font_style),
-            Canvas2dMsg::SetTextAlign(text_align) => {
-                self.canvas(canvas_id).set_text_align(text_align)
-            },
-            Canvas2dMsg::SetTextBaseline(text_baseline) => {
-                self.canvas(canvas_id).set_text_baseline(text_baseline)
+            Canvas2dMsg::PopClips(clips) => self.canvas(canvas_id).pop_clips(clips),
+        }
+    }
+
+    fn canvas(&mut self, canvas_id: CanvasId) -> &mut Canvas {
+        self.canvases.get_mut(&canvas_id).expect("Bogus canvas id")
+    }
+}
+
+enum Canvas {
+    #[cfg(feature = "vello")]
+    Vello(CanvasData<crate::vello_backend::VelloDrawTarget>),
+    #[cfg(feature = "vello_cpu")]
+    VelloCPU(CanvasData<crate::vello_cpu_backend::VelloCPUDrawTarget>),
+}
+
+impl Canvas {
+    fn new(size: Size2D<u64>, paint_api: CrossProcessPaintApi) -> Option<Self> {
+        match servo_config::pref!(dom_canvas_backend)
+            .to_lowercase()
+            .as_str()
+        {
+            #[cfg(feature = "vello_cpu")]
+            "" | "auto" | "vello_cpu" => Some(Self::VelloCPU(CanvasData::new(size, paint_api))),
+            #[cfg(feature = "vello")]
+            "" | "auto" | "vello" => Some(Self::Vello(CanvasData::new(size, paint_api))),
+            s => {
+                warn!("Unknown 2D canvas backend: `{s}`");
+                None
             },
         }
     }
 
-    fn canvas(&mut self, canvas_id: CanvasId) -> &mut CanvasData<'a> {
-        self.canvases.get_mut(&canvas_id).expect("Bogus canvas id")
+    fn set_image_key(&mut self, image_key: ImageKey) {
+        match self {
+            #[cfg(feature = "vello")]
+            Canvas::Vello(canvas_data) => canvas_data.set_image_key(image_key),
+            #[cfg(feature = "vello_cpu")]
+            Canvas::VelloCPU(canvas_data) => canvas_data.set_image_key(image_key),
+        }
+    }
+
+    fn pop_clips(&mut self, clips: usize) {
+        match self {
+            #[cfg(feature = "vello")]
+            Canvas::Vello(canvas_data) => canvas_data.pop_clips(clips),
+            #[cfg(feature = "vello_cpu")]
+            Canvas::VelloCPU(canvas_data) => canvas_data.pop_clips(clips),
+        }
+    }
+
+    fn stroke_text(
+        &mut self,
+        text_bounds: Rect<f64>,
+        text_runs: Vec<TextRun>,
+        fill_or_stroke_style: FillOrStrokeStyle,
+        line_options: LineOptions,
+        shadow_options: ShadowOptions,
+        composition_options: CompositionOptions,
+        transform: Transform2D<f64>,
+    ) {
+        match self {
+            #[cfg(feature = "vello")]
+            Canvas::Vello(canvas_data) => canvas_data.stroke_text(
+                text_bounds,
+                text_runs,
+                fill_or_stroke_style,
+                line_options,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
+            #[cfg(feature = "vello_cpu")]
+            Canvas::VelloCPU(canvas_data) => canvas_data.stroke_text(
+                text_bounds,
+                text_runs,
+                fill_or_stroke_style,
+                line_options,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
+        }
+    }
+
+    fn fill_text(
+        &mut self,
+        text_bounds: Rect<f64>,
+        text_runs: Vec<TextRun>,
+        fill_or_stroke_style: FillOrStrokeStyle,
+        shadow_options: ShadowOptions,
+        composition_options: CompositionOptions,
+        transform: Transform2D<f64>,
+    ) {
+        match self {
+            #[cfg(feature = "vello")]
+            Canvas::Vello(canvas_data) => canvas_data.fill_text(
+                text_bounds,
+                text_runs,
+                fill_or_stroke_style,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
+            #[cfg(feature = "vello_cpu")]
+            Canvas::VelloCPU(canvas_data) => canvas_data.fill_text(
+                text_bounds,
+                text_runs,
+                fill_or_stroke_style,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
+        }
+    }
+
+    fn fill_rect(
+        &mut self,
+        rect: &Rect<f32>,
+        style: FillOrStrokeStyle,
+        shadow_options: ShadowOptions,
+        composition_options: CompositionOptions,
+        transform: Transform2D<f64>,
+    ) {
+        match self {
+            #[cfg(feature = "vello")]
+            Canvas::Vello(canvas_data) => {
+                canvas_data.fill_rect(rect, style, shadow_options, composition_options, transform)
+            },
+            #[cfg(feature = "vello_cpu")]
+            Canvas::VelloCPU(canvas_data) => {
+                canvas_data.fill_rect(rect, style, shadow_options, composition_options, transform)
+            },
+        }
+    }
+
+    fn stroke_rect(
+        &mut self,
+        rect: &Rect<f32>,
+        style: FillOrStrokeStyle,
+        line_options: LineOptions,
+        shadow_options: ShadowOptions,
+        composition_options: CompositionOptions,
+        transform: Transform2D<f64>,
+    ) {
+        match self {
+            #[cfg(feature = "vello")]
+            Canvas::Vello(canvas_data) => canvas_data.stroke_rect(
+                rect,
+                style,
+                line_options,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
+            #[cfg(feature = "vello_cpu")]
+            Canvas::VelloCPU(canvas_data) => canvas_data.stroke_rect(
+                rect,
+                style,
+                line_options,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
+        }
+    }
+
+    fn fill_path(
+        &mut self,
+        path: &Path,
+        fill_rule: FillRule,
+        style: FillOrStrokeStyle,
+        shadow_options: ShadowOptions,
+        composition_options: CompositionOptions,
+        transform: Transform2D<f64>,
+    ) {
+        match self {
+            #[cfg(feature = "vello")]
+            Canvas::Vello(canvas_data) => canvas_data.fill_path(
+                path,
+                fill_rule,
+                style,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
+            #[cfg(feature = "vello_cpu")]
+            Canvas::VelloCPU(canvas_data) => canvas_data.fill_path(
+                path,
+                fill_rule,
+                style,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
+        }
+    }
+
+    fn stroke_path(
+        &mut self,
+        path: &Path,
+        style: FillOrStrokeStyle,
+        line_options: LineOptions,
+        shadow_options: ShadowOptions,
+        composition_options: CompositionOptions,
+        transform: Transform2D<f64>,
+    ) {
+        match self {
+            #[cfg(feature = "vello")]
+            Canvas::Vello(canvas_data) => canvas_data.stroke_path(
+                path,
+                style,
+                line_options,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
+            #[cfg(feature = "vello_cpu")]
+            Canvas::VelloCPU(canvas_data) => canvas_data.stroke_path(
+                path,
+                style,
+                line_options,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
+        }
+    }
+
+    fn clear_rect(&mut self, rect: &Rect<f32>, transform: Transform2D<f64>) {
+        match self {
+            #[cfg(feature = "vello")]
+            Canvas::Vello(canvas_data) => canvas_data.clear_rect(rect, transform),
+            #[cfg(feature = "vello_cpu")]
+            Canvas::VelloCPU(canvas_data) => canvas_data.clear_rect(rect, transform),
+        }
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn draw_image(
+        &mut self,
+        snapshot: Snapshot,
+        dest_rect: Rect<f64>,
+        source_rect: Rect<f64>,
+        smoothing_enabled: bool,
+        shadow_options: ShadowOptions,
+        composition_options: CompositionOptions,
+        transform: Transform2D<f64>,
+    ) {
+        match self {
+            #[cfg(feature = "vello")]
+            Canvas::Vello(canvas_data) => canvas_data.draw_image(
+                snapshot,
+                dest_rect,
+                source_rect,
+                smoothing_enabled,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
+            #[cfg(feature = "vello_cpu")]
+            Canvas::VelloCPU(canvas_data) => canvas_data.draw_image(
+                snapshot,
+                dest_rect,
+                source_rect,
+                smoothing_enabled,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
+        }
+    }
+
+    fn read_pixels(&mut self, read_rect: Option<Rect<u32>>) -> Snapshot {
+        match self {
+            #[cfg(feature = "vello")]
+            Canvas::Vello(canvas_data) => canvas_data.read_pixels(read_rect),
+            #[cfg(feature = "vello_cpu")]
+            Canvas::VelloCPU(canvas_data) => canvas_data.read_pixels(read_rect),
+        }
+    }
+
+    fn clip_path(&mut self, path: &Path, fill_rule: FillRule, transform: Transform2D<f64>) {
+        match self {
+            #[cfg(feature = "vello")]
+            Canvas::Vello(canvas_data) => canvas_data.clip_path(path, fill_rule, transform),
+            #[cfg(feature = "vello_cpu")]
+            Canvas::VelloCPU(canvas_data) => canvas_data.clip_path(path, fill_rule, transform),
+        }
+    }
+
+    fn put_image_data(&mut self, snapshot: Snapshot, rect: Rect<u32>) {
+        match self {
+            #[cfg(feature = "vello")]
+            Canvas::Vello(canvas_data) => canvas_data.put_image_data(snapshot, rect),
+            #[cfg(feature = "vello_cpu")]
+            Canvas::VelloCPU(canvas_data) => canvas_data.put_image_data(snapshot, rect),
+        }
+    }
+
+    fn update_image_rendering(&mut self, canvas_epoch: Option<Epoch>) {
+        match self {
+            #[cfg(feature = "vello")]
+            Canvas::Vello(canvas_data) => canvas_data.update_image_rendering(canvas_epoch),
+            #[cfg(feature = "vello_cpu")]
+            Canvas::VelloCPU(canvas_data) => canvas_data.update_image_rendering(canvas_epoch),
+        }
+    }
+
+    fn recreate(&mut self, size: Option<Size2D<u64>>) {
+        match self {
+            #[cfg(feature = "vello")]
+            Canvas::Vello(canvas_data) => canvas_data.recreate(size),
+            #[cfg(feature = "vello_cpu")]
+            Canvas::VelloCPU(canvas_data) => canvas_data.recreate(size),
+        }
     }
 }

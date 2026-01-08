@@ -2,18 +2,31 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use crate::dom::bindings::codegen::Bindings::DOMExceptionBinding::DOMExceptionConstants;
-use crate::dom::bindings::codegen::Bindings::DOMExceptionBinding::DOMExceptionMethods;
-use crate::dom::bindings::error::Error;
-use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
-use crate::dom::bindings::root::DomRoot;
-use crate::dom::bindings::str::DOMString;
-use crate::dom::globalscope::GlobalScope;
+use base::id::{DomExceptionId, DomExceptionIndex};
+use constellation_traits::DomException;
 use dom_struct::dom_struct;
+use js::rust::HandleObject;
+use rustc_hash::FxHashMap;
+use script_bindings::match_domstring_ascii;
+
+use crate::dom::bindings::codegen::Bindings::DOMExceptionBinding::{
+    DOMExceptionConstants, DOMExceptionMethods,
+};
+use crate::dom::bindings::error::Error;
+use crate::dom::bindings::reflector::{
+    Reflector, reflect_dom_object, reflect_dom_object_with_proto,
+};
+use crate::dom::bindings::root::DomRoot;
+use crate::dom::bindings::serializable::Serializable;
+use crate::dom::bindings::str::DOMString;
+use crate::dom::bindings::structuredclone::StructuredData;
+use crate::dom::globalscope::GlobalScope;
+use crate::script_runtime::CanGc;
 
 #[repr(u16)]
+#[expect(clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug, Eq, JSTraceable, MallocSizeOf, Ord, PartialEq, PartialOrd)]
-pub enum DOMErrorName {
+pub(crate) enum DOMErrorName {
     IndexSizeError = DOMExceptionConstants::INDEX_SIZE_ERR,
     HierarchyRequestError = DOMExceptionConstants::HIERARCHY_REQUEST_ERR,
     WrongDocumentError = DOMExceptionConstants::WRONG_DOCUMENT_ERR,
@@ -36,13 +49,20 @@ pub enum DOMErrorName {
     TimeoutError = DOMExceptionConstants::TIMEOUT_ERR,
     InvalidNodeTypeError = DOMExceptionConstants::INVALID_NODE_TYPE_ERR,
     DataCloneError = DOMExceptionConstants::DATA_CLONE_ERR,
+    DataError,
+    TransactionInactiveError,
+    ReadOnlyError,
+    VersionError,
+    EncodingError,
     NotReadableError,
     OperationError,
+    NotAllowedError,
+    ConstraintError,
 }
 
 impl DOMErrorName {
-    pub fn from(s: &DOMString) -> Option<DOMErrorName> {
-        match s.as_ref() {
+    pub(crate) fn from(s: &DOMString) -> Option<DOMErrorName> {
+        match_domstring_ascii!(s,
             "IndexSizeError" => Some(DOMErrorName::IndexSizeError),
             "HierarchyRequestError" => Some(DOMErrorName::HierarchyRequestError),
             "WrongDocumentError" => Some(DOMErrorName::WrongDocumentError),
@@ -65,15 +85,22 @@ impl DOMErrorName {
             "TimeoutError" => Some(DOMErrorName::TimeoutError),
             "InvalidNodeTypeError" => Some(DOMErrorName::InvalidNodeTypeError),
             "DataCloneError" => Some(DOMErrorName::DataCloneError),
+            "DataError" => Some(DOMErrorName::DataError),
+            "TransactionInactiveError" => Some(DOMErrorName::TransactionInactiveError),
+            "ReadOnlyError" => Some(DOMErrorName::ReadOnlyError),
+            "VersionError" => Some(DOMErrorName::VersionError),
+            "EncodingError" => Some(DOMErrorName::EncodingError),
             "NotReadableError" => Some(DOMErrorName::NotReadableError),
             "OperationError" => Some(DOMErrorName::OperationError),
+            "NotAllowedError" => Some(DOMErrorName::NotAllowedError),
+            "ConstraintError" => Some(DOMErrorName::ConstraintError),
             _ => None,
-        }
+        )
     }
 }
 
 #[dom_struct]
-pub struct DOMException {
+pub(crate) struct DOMException {
     reflector_: Reflector,
     message: DOMString,
     name: DOMString,
@@ -95,7 +122,7 @@ impl DOMException {
             DOMErrorName::InvalidStateError => "The object is in an invalid state.",
             DOMErrorName::SyntaxError => "The string did not match the expected pattern.",
             DOMErrorName::InvalidModificationError => "The object can not be modified in this way.",
-            DOMErrorName::NamespaceError => "The operation is not allowed by Namespaces in XML.",
+            DOMErrorName::NamespaceError => "The operation is incorrect with regard to namespaces.",
             DOMErrorName::InvalidAccessError => {
                 "The object does not support the operation or argument."
             },
@@ -110,9 +137,29 @@ impl DOMException {
                 "The supplied node is incorrect or has an incorrect ancestor for this operation."
             },
             DOMErrorName::DataCloneError => "The object can not be cloned.",
+            DOMErrorName::DataError => "Provided data is inadequate.",
+            DOMErrorName::TransactionInactiveError => {
+                "A request was placed against a transaction which is currently not active, or which is finished."
+            },
+            DOMErrorName::ReadOnlyError => {
+                "The mutating operation was attempted in a \"readonly\" transaction."
+            },
+            DOMErrorName::VersionError => {
+                "An attempt was made to open a database using a lower version than the existing version."
+            },
+            DOMErrorName::EncodingError => {
+                "The encoding operation (either encoded or decoding) failed."
+            },
             DOMErrorName::NotReadableError => "The I/O read operation failed.",
             DOMErrorName::OperationError => {
                 "The operation failed for an operation-specific reason."
+            },
+            DOMErrorName::NotAllowedError => {
+                r#"The request is not allowed by the user agent or the platform in the current context,
+                possibly because the user denied permission."#
+            },
+            DOMErrorName::ConstraintError => {
+                "A mutation operation in a transaction failed because a constraint was not satisfied."
             },
         };
 
@@ -122,40 +169,67 @@ impl DOMException {
         )
     }
 
-    fn new_inherited(message_: DOMString, name_: DOMString) -> DOMException {
+    pub(crate) fn new_inherited(message: DOMString, name: DOMString) -> DOMException {
         DOMException {
             reflector_: Reflector::new(),
-            message: message_,
-            name: name_,
+            message,
+            name,
         }
     }
 
-    pub fn new(global: &GlobalScope, code: DOMErrorName) -> DomRoot<DOMException> {
+    pub(crate) fn new(
+        global: &GlobalScope,
+        code: DOMErrorName,
+        can_gc: CanGc,
+    ) -> DomRoot<DOMException> {
         let (message, name) = DOMException::get_error_data_by_code(code);
 
-        reflect_dom_object(Box::new(DOMException::new_inherited(message, name)), global)
-    }
-
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        global: &GlobalScope,
-        message: DOMString,
-        name: DOMString,
-    ) -> Result<DomRoot<DOMException>, Error> {
-        Ok(reflect_dom_object(
+        reflect_dom_object(
             Box::new(DOMException::new_inherited(message, name)),
             global,
-        ))
+            can_gc,
+        )
+    }
+
+    pub(crate) fn new_with_custom_message(
+        global: &GlobalScope,
+        code: DOMErrorName,
+        message: String,
+        can_gc: CanGc,
+    ) -> DomRoot<DOMException> {
+        let (_, name) = DOMException::get_error_data_by_code(code);
+
+        reflect_dom_object(
+            Box::new(DOMException::new_inherited(DOMString::from(message), name)),
+            global,
+            can_gc,
+        )
     }
 
     // not an IDL stringifier, used internally
-    pub fn stringifier(&self) -> DOMString {
+    pub(crate) fn stringifier(&self) -> DOMString {
         DOMString::from(format!("{}: {}", self.name, self.message))
     }
 }
 
-impl DOMExceptionMethods for DOMException {
-    // https://heycam.github.io/webidl/#dom-domexception-code
+impl DOMExceptionMethods<crate::DomTypeHolder> for DOMException {
+    /// <https://webidl.spec.whatwg.org/#dom-domexception-domexception>
+    fn Constructor(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+        message: DOMString,
+        name: DOMString,
+    ) -> Result<DomRoot<DOMException>, Error> {
+        Ok(reflect_dom_object_with_proto(
+            Box::new(DOMException::new_inherited(message, name)),
+            global,
+            proto,
+            can_gc,
+        ))
+    }
+
+    /// <https://webidl.spec.whatwg.org/#dom-domexception-code>
     fn Code(&self) -> u16 {
         match DOMErrorName::from(&self.name) {
             Some(code) if code <= DOMErrorName::DataCloneError => code as u16,
@@ -163,13 +237,53 @@ impl DOMExceptionMethods for DOMException {
         }
     }
 
-    // https://heycam.github.io/webidl/#idl-DOMException-error-names
+    /// <https://webidl.spec.whatwg.org/#dom-domexception-name>
     fn Name(&self) -> DOMString {
         self.name.clone()
     }
 
-    // https://heycam.github.io/webidl/#error-names
+    /// <https://webidl.spec.whatwg.org/#dom-domexception-message>
     fn Message(&self) -> DOMString {
         self.message.clone()
+    }
+}
+
+impl Serializable for DOMException {
+    type Index = DomExceptionIndex;
+    type Data = DomException;
+
+    /// <https://webidl.spec.whatwg.org/#idl-DOMException>
+    fn serialize(&self) -> Result<(DomExceptionId, Self::Data), ()> {
+        let serialized = DomException {
+            message: self.message.to_string(),
+            name: self.name.to_string(),
+        };
+        Ok((DomExceptionId::new(), serialized))
+    }
+
+    /// <https://webidl.spec.whatwg.org/#idl-DOMException>
+    fn deserialize(
+        owner: &GlobalScope,
+        serialized: Self::Data,
+        can_gc: CanGc,
+    ) -> Result<DomRoot<Self>, ()>
+    where
+        Self: Sized,
+    {
+        Ok(Self::new_with_custom_message(
+            owner,
+            DOMErrorName::from(&DOMString::from_string(serialized.name)).ok_or(())?,
+            serialized.message,
+            can_gc,
+        ))
+    }
+
+    fn serialized_storage<'a>(
+        data: StructuredData<'a, '_>,
+    ) -> &'a mut Option<FxHashMap<DomExceptionId, Self::Data>> {
+        match data {
+            StructuredData::Reader(reader) => &mut reader.exceptions,
+            StructuredData::Writer(writer) => &mut writer.exceptions,
+        }
     }
 }

@@ -1,169 +1,52 @@
 [configs]
-skip-check-length = false
 skip-check-licenses = false
-check-alphabetical-order = true
-check-ordered-json-keys = [
-  "./resources/prefs.json",
-]
-lint-scripts = [
-  "./python/servo/lints/wpt_lint.py",
-]
-
-# Packages which we avoid using in Servo.
-# For each blocked package, we can list the exceptions,
-# which are packages allowed to use the blocked package.
-[blocked-packages]
-num = []
-rand = [
-  "hashglobe", # Only used in tests
-  "ipc-channel",
-  "phf_generator",
-  "quickcheck", # Only used in tests
-  "servo_rand",
-  "tungstenite",
-  "ws",
-]
 
 [ignore]
-# Ignored packages with duplicated versions
-packages = [
-  "adler",
-  "arrayvec",
-  "base64",
-  "cfg-if",
-  "cloudabi",
-  "cocoa",
-  "crossbeam-channel",
-  "crossbeam-utils",
-  "deflate",
-  "fixedbitset",
-  "getrandom",
-  "gleam",
-  "h2",
-  "image",
-  "itoa",
-  "jpeg-decoder",
-  "libloading",
-  "lock_api",
-  "metal",
-  "miniz_oxide",
-  "num-rational",
-  "parking_lot",
-  "parking_lot_core",
-  "petgraph",
-  "phf",
-  "phf_codegen",
-  "phf_generator",
-  "phf_shared",
-  "png",
-  "rand",
-  "rand_chacha",
-  "rand_core",
-  "redox_syscall",
-  "ron",
-  "wasi",
-  "wayland-sys",
-
-  # https://github.com/servo/servo/issues/26933
-  "futures",
-  "mio",
-  "tokio-openssl",
-  "tokio",
-  "tokio-macros",
-  "tokio-util",
-  "http-body",
-  "httpdate",
-  "hyper",
-  "bytes",
-  "pin-project",
-  "pin-project-lite",
-  "pin-project-internal",
-  "socket2",
-
-  # https://github.com/servo/servo/pull/23288#issuecomment-494687746
-  "gl_generator",
-
-  # Lots of crates to update.
-  "smallvec",
-
-  # https://github.com/servo/servo/pull/25518
-  "core-foundation",
-  "core-foundation-sys",
-  "core-graphics",
-  "lyon_geom",
-
-  # https://github.com/servo/servo/pull/28236
-  "dlib",
-  "nix",
-  "nom",
-  "strsim",
-
-  # Duplicated by webrender debugger via ws
-  "digest",
-  "generic-array",
-  "opaque-debug",
-  "sha-1",
-  "block-buffer",
-]
 # Files that are ignored for all tidy and lint checks.
 files = [
-  "./components/net/tests/parsable_mime/text",
-  # Mako does not lend itself easily to splitting long lines
-  "./components/style/properties/helpers/animated_properties.mako.rs",
-  "./components/style/properties/shorthands/text.mako.rs",
-  # Long regexes are long.
-  "./components/style/gecko/regen_atoms.py",
-  # Helper macro where actually a pseudo-element per line makes sense.
-  "./components/style/gecko/non_ts_pseudo_class_list.rs",
-  "./resources/hsts_preload.json",
-  "./tests/wpt/metadata/MANIFEST.json",
-  "./tests/wpt/mozilla/meta/MANIFEST.json",
-  # Long encoded string
-  "./tests/wpt/mozilla/tests/mozilla/resources/brotli.py",
-  "./tests/wpt/webgl/meta/MANIFEST.json",
-  "./support/android/openssl.sh",
-  # Upstream code from Khronos/WebGL uses tabs for indentation
-  "./tests/wpt/webgl/tests",
-  # Our import script is not currently respecting the lint.
-  "./tests/wpt/webgl/tools/import-conformance-tests.py",
-  # Ignore those files since the issues reported are on purpose
-  "./tests/html/bad-line-ends.html",
-  "./tests/wpt/mozilla/tests/css/fonts",
-  "./tests/wpt/mozilla/tests/css/pre_with_tab.html",
-  "./tests/wpt/mozilla/tests/mozilla/textarea_placeholder.html",
-  # Python 3 syntax causes "E901 SyntaxError" when flake8 runs in Python 2
-  "./etc/taskcluster/decision_task.py",
-  "./etc/taskcluster/decisionlib.py",
-  "./tests/wpt/reftests-report/gen.py",
-  "./components/style/properties/build.py",
+    "./components/shared/net/tests/parsable_mime/text",
+    "./resources/hsts_preload.fstmap",
+    "./tests/wpt/meta/MANIFEST.json",
+    "./tests/wpt/mozilla/meta/MANIFEST.json",
+    # Long encoded string
+    "./tests/wpt/mozilla/tests/mozilla/resources/brotli.py",
+    "./tests/wpt/webgl/meta/MANIFEST.json",
+    # Upstream code from Khronos/WebGL uses tabs for indentation
+    "./tests/wpt/webgl/tests",
+    # Vendored from upstream
+    "./tests/blink_perf_tests/perf_tests",
+    "./tests/wpt/webgpu/tests",
+    # Our import script is not currently respecting the lint.
+    "./tests/wpt/webgl/tools/import-conformance-tests.py",
+    # Ignore those files since the issues reported are on purpose
+    "./tests/html/bad-line-ends.html",
+    "./tests/wpt/mozilla/tests/css/fonts",
+    "./tests/wpt/mozilla/tests/css/pre_with_tab.html",
+    "./tests/wpt/mozilla/tests/mozilla/textarea_placeholder.html",
 ]
 # Directories that are ignored for the non-WPT tidy check.
 directories = [
-  # Upstream
-  "./support/android/apk",
-  "./support/hololens",
-  "./support/linux/gstreamer",
-  "./support/magicleap/Servo2D/.vscode",
-  "./support/magicleap/Servo2D/code/inc.gen",
-  "./support/magicleap/Servo2D/code/src.gen",
-  "./support/magicleap/Servo2D/pipeline",
-  "./tests/wpt/harness",
-  "./tests/wpt/update",
-  "./tests/wpt/web-platform-tests",
-  "./tests/wpt/mozilla/tests/mozilla/referrer-policy",
-  "./tests/wpt/mozilla/tests/webgl",
-  "./tests/wpt/sync",
-  "./python/tidy/servo_tidy_tests",
-  "./components/script/dom/bindings/codegen/parser",
-  "./components/script/dom/bindings/codegen/ply",
-  "./python/_virtualenv*",
-  "./python/mach",
-  "./components/hashglobe/src",
-  # Generated and upstream code combined with our own. Could use cleanup
-  "./target",
+    # Test have expectations in them, causing tidy to fail.
+    "./support/crown/tests",
+    # Upstream
+    "./support/android/apk",
+    "./tests/wpt/harness",
+    "./tests/wpt/tests",
+    "./tests/wpt/mozilla/tests/mozilla/referrer-policy",
+    "./tests/wpt/mozilla/tests/webgl",
+    "./python/tidy/tests",
+    "./python/mach",
+    # Generated and upstream code combined with our own. Could use cleanup
+    "./target",
+    "./support/crown/target",
+    "./third_party",
+    # Cache files generated by wptrunner which fail the EOF newlines check.
+    "./tests/wpt/meta/.cache",
+    "./tests/wpt/mozilla/meta/.cache",
+    "./tests/wpt/webgl/meta/.cache",
 ]
 
 # Directories that are checked for correct file extension
 [check_ext]
 # directory, list of expected file extensions
-"./components/script/dom/webidls" = [".webidl"]
+"./components/script_bindings/webidls" = [".webidl", "noidl"]

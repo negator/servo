@@ -2,15 +2,15 @@
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Product Id="*"
            Name="Servo Tech Demo"
-           Manufacturer="Mozilla Research"
+           Manufacturer="The Servo Authors"
            UpgradeCode="060cd15d-eab1-4614-b438-3988e3efdcf1"
            Language="1033"
            Codepage="1252"
-           Version="1.0.0">
+           Version="0.0.4">
     <Package Id="*"
              Keywords="Installer"
              Description="Servo Tech Demo Installer"
-             Manufacturer="Mozilla Research"
+             Manufacturer="The Servo Authors"
              InstallerVersion="200"
              Platform="x64"
              Languages="1033"
@@ -22,7 +22,7 @@
            EmbedCab="yes"/>
     <Directory Id="TARGETDIR" Name="SourceDir">
       <Directory Id="ProgramFiles64Folder" Name="PFiles">
-        <Directory Id="MozResearch" Name="Mozilla Research">
+        <Directory Id="Servo" Name="Servo">
           <Directory Id="INSTALLDIR" Name="Servo Tech Demo">
             <Component Id="Servo"
                        Guid="95bcea71-78bb-4ec8-9766-44bc01443840"
@@ -52,7 +52,7 @@
           <Component Id="ProgramMenuDir" Guid="e04737ce-16eb-4977-9b4c-ed2db8a5a77d">
             <RemoveFolder Id="ProgramMenuDir" On="both"/>
             <RegistryValue Root="HKCU"
-                           Key="Software\Mozilla Research\Servo Tech Demo"
+                           Key="Software\Servo\Servo Tech Demo"
                            Type="string"
                            Value=""
                            KeyPath="yes"/>
@@ -77,7 +77,7 @@ import os
 import os.path as path
 import re
 import uuid
-from servo.command_base import host_triple
+from servo.platform import host_triple
 
 def make_id(s):
     s = s.replace("-", "_").replace("/", "_").replace("\\", "_")

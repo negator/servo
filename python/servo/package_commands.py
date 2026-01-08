@@ -7,23 +7,23 @@
 # option. This file may not be copied, modified, or distributed
 # except according to those terms.
 
-from __future__ import absolute_import, print_function, unicode_literals
-
 from datetime import datetime
-import base64
+import random
+import time
+from collections.abc import Generator
+from github import Github
+
 import hashlib
 import io
 import json
+import re
 import os
 import os.path as path
-import platform
 import shutil
 import subprocess
 import sys
-import tempfile
-import six.moves.urllib as urllib
-import xml
 
+import servo.gstreamer
 from mach.decorators import (
     CommandArgument,
     CommandProvider,
@@ -32,337 +32,250 @@ from mach.decorators import (
 from mach.registrar import Registrar
 
 from servo.command_base import (
+    BuildType,
     archive_deterministically,
     BuildNotFound,
     cd,
+    check_output,
     CommandBase,
-    is_macosx,
     is_windows,
 )
-from servo.gstreamer import macos_dylibs, macos_plugins
-from servo.util import delete
+from servo.util import delete, get_target_dir
 
-# Note: mako cannot be imported at the top level because it breaks mach bootstrap
-sys.path.append(path.join(path.dirname(__file__), "..", "..",
-                          "components", "style", "properties", "Mako-1.1.2-py2.py3-none-any.whl"))
+from python.servo.platform.build_target import SanitizerKind
+from servo.platform.build_target import is_android, is_openharmony
 
 PACKAGES = {
-    'android': [
-        'target/android/armv7-linux-androideabi/release/servoapp.apk',
-        'target/android/armv7-linux-androideabi/release/servoview.aar',
+    "android": [
+        "android/aarch64-linux-android/release/servoapp.apk",
+        "android/aarch64-linux-android/release/servoview.aar",
     ],
-    'linux': [
-        'target/release/servo-tech-demo.tar.gz',
+    "linux": [
+        "production/servo-tech-demo.tar.gz",
     ],
-    'mac': [
-        'target/release/servo-tech-demo.dmg',
+    "mac": [
+        "production/servo-tech-demo.dmg",
     ],
-    'macbrew': [
-        'target/release/brew/servo.tar.gz',
+    "mac-arm64": [
+        "production/servo-tech-demo.dmg",
     ],
-    'magicleap': [
-        'target/magicleap/aarch64-linux-android/release/Servo.mpk',
+    "windows-msvc": [
+        r"production\msi\Servo.exe",
+        r"production\msi\Servo.zip",
     ],
-    'maven': [
-        'target/android/gradle/servoview/maven/org/mozilla/servoview/servoview-armv7/',
-        'target/android/gradle/servoview/maven/org/mozilla/servoview/servoview-x86/',
-    ],
-    'windows-msvc': [
-        r'target\release\msi\Servo.exe',
-        r'target\release\msi\Servo.zip',
-    ],
-    'uwp': [
-        r'support\hololens\AppPackages\ServoApp\FirefoxReality.zip',
+    "ohos": [
+        "aarch64-unknown-linux-ohos/production/libservoshell.so",
+        "openharmony/aarch64-unknown-linux-ohos/production/entry/build/"
+        + "default/outputs/default/servoshell-default-signed.hap",
     ],
 }
 
 
-TemporaryDirectory = None
-if sys.version_info >= (3, 2):
-    TemporaryDirectory = tempfile.TemporaryDirectory
-else:
-    import contextlib
+def packages_for_platform(platform: str) -> Generator[str]:
+    target_dir = get_target_dir()
 
-    # Not quite as robust as tempfile.TemporaryDirectory,
-    # but good enough for most purposes
-    @contextlib.contextmanager
-    def TemporaryDirectory(**kwargs):
-        dir_name = tempfile.mkdtemp(**kwargs)
-        try:
-            yield dir_name
-        except Exception as e:
-            shutil.rmtree(dir_name)
-            raise e
+    for package in PACKAGES[platform]:
+        yield path.join(target_dir, package)
 
 
-def get_taskcluster_secret(name):
-    url = (
-        os.environ.get("TASKCLUSTER_PROXY_URL", "http://taskcluster")
-        + "/api/secrets/v1/secret/project/servo/"
-        + name
-    )
-    return json.load(urllib.request.urlopen(url))["secret"]
+def listfiles(directory: str) -> list[str]:
+    return [f for f in os.listdir(directory) if path.isfile(path.join(directory, f))]
 
 
-def otool(s):
-    o = subprocess.Popen(['/usr/bin/otool', '-L', s], stdout=subprocess.PIPE)
-    for line in map(lambda s: s.decode('ascii'), o.stdout):
-        if line[0] == '\t':
-            yield line.split(' ', 1)[0][1:]
-
-
-def listfiles(directory):
-    return [f for f in os.listdir(directory)
-            if path.isfile(path.join(directory, f))]
-
-
-def install_name_tool(old, new, binary):
-    try:
-        subprocess.check_call(['install_name_tool', '-change', old, '@executable_path/' + new, binary])
-    except subprocess.CalledProcessError as e:
-        print("install_name_tool exited with return value %d" % e.returncode)
-
-
-def is_system_library(lib):
-    return lib.startswith("/System/Library") or lib.startswith("/usr/lib")
-
-
-def change_non_system_libraries_path(libraries, relative_path, binary):
-    for lib in libraries:
-        if is_system_library(lib):
-            continue
-        new_path = path.join(relative_path, path.basename(lib))
-        install_name_tool(lib, new_path, binary)
-
-
-def copy_dependencies(binary_path, lib_path):
-    relative_path = path.relpath(lib_path, path.dirname(binary_path)) + "/"
-
-    # Update binary libraries
-    binary_dependencies = set(otool(binary_path))
-    binary_dependencies = binary_dependencies.union(macos_dylibs())
-    binary_dependencies = binary_dependencies.union(macos_plugins())
-    change_non_system_libraries_path(binary_dependencies, relative_path, binary_path)
-
-    # Update dependencies libraries
-    need_checked = binary_dependencies
-    checked = set()
-    while need_checked:
-        checking = set(need_checked)
-        need_checked = set()
-        for f in checking:
-            # No need to check these for their dylibs
-            if is_system_library(f):
-                continue
-            need_relinked = set(otool(f))
-            new_path = path.join(lib_path, path.basename(f))
-            if not path.exists(new_path):
-                shutil.copyfile(f, new_path)
-            change_non_system_libraries_path(need_relinked, relative_path, new_path)
-            need_checked.update(need_relinked)
-        checked.update(checking)
-        need_checked.difference_update(checked)
-
-
-def copy_windows_dependencies(binary_path, destination):
+def copy_windows_dependencies(binary_path: str, destination: str) -> None:
     for f in os.listdir(binary_path):
         if os.path.isfile(path.join(binary_path, f)) and f.endswith(".dll"):
             shutil.copy(path.join(binary_path, f), destination)
 
 
-def change_prefs(resources_path, platform, vr=False):
-    print("Swapping prefs")
-    prefs_path = path.join(resources_path, "prefs.json")
-    package_prefs_path = path.join(resources_path, "package-prefs.json")
-    with open(prefs_path) as prefs, open(package_prefs_path) as package_prefs:
-        prefs = json.load(prefs)
-        pref_sets = []
-        package_prefs = json.load(package_prefs)
-        if "all" in package_prefs:
-            pref_sets += [package_prefs["all"]]
-        if vr and "vr" in package_prefs:
-            pref_sets += [package_prefs["vr"]]
-        if platform in package_prefs:
-            pref_sets += [package_prefs[platform]]
-        for pref_set in pref_sets:
-            for pref in pref_set:
-                if pref in prefs:
-                    prefs[pref] = pref_set[pref]
-        with open(prefs_path, "w") as out:
-            json.dump(prefs, out, sort_keys=True, indent=2)
-    delete(package_prefs_path)
+def check_call_with_randomized_backoff(args: list[str], retries: int) -> int:
+    """
+    Run the given command-line arguments via `subprocess.check_call()`. If the command
+    fails sleep for a random number of seconds between 2 and 5 and then try to the command
+    again, the given number of times.
+    """
+    try:
+        return subprocess.check_call(args)
+    except subprocess.CalledProcessError as e:
+        if retries == 0:
+            raise e
+
+        sleep_time = random.uniform(2, 5)
+        print(f"Running {args} failed with {e.returncode}. Trying again in {sleep_time}s")
+        time.sleep(sleep_time)
+        return check_call_with_randomized_backoff(args, retries - 1)
 
 
 @CommandProvider
 class PackageCommands(CommandBase):
-    @Command('package',
-             description='Package Servo',
-             category='package')
-    @CommandArgument('--release', '-r', action='store_true',
-                     help='Package the release build')
-    @CommandArgument('--dev', '-d', action='store_true',
-                     help='Package the dev build')
-    @CommandArgument('--android',
-                     default=None,
-                     action='store_true',
-                     help='Package Android')
-    @CommandArgument('--magicleap',
-                     default=None,
-                     action='store_true',
-                     help='Package Magic Leap')
-    @CommandArgument('--target', '-t',
-                     default=None,
-                     help='Package for given target platform')
-    @CommandArgument('--flavor', '-f',
-                     default=None,
-                     help='Package using the given Gradle flavor')
-    @CommandArgument('--maven',
-                     default=None,
-                     action='store_true',
-                     help='Create a local Maven repository')
-    @CommandArgument('--uwp',
-                     default=None,
-                     action='append',
-                     help='Create an APPX package')
-    @CommandArgument('--ms-app-store', default=None, action='store_true')
-    def package(self, release=False, dev=False, android=None, magicleap=None, debug=False,
-                debugger=None, target=None, flavor=None, maven=False, uwp=None, ms_app_store=False):
-        if android is None:
-            android = self.config["build"]["android"]
-        if target and android:
-            print("Please specify either --target or --android.")
-            sys.exit(1)
-        if not android:
-            android = self.handle_android_target(target)
-        else:
-            target = self.config["android"]["target"]
-        if target and magicleap:
-            print("Please specify either --target or --magicleap.")
-            sys.exit(1)
-        if magicleap:
-            target = "aarch64-linux-android"
-        env = self.build_env(target=target)
-        binary_path = self.get_binary_path(
-            release, dev, target=target, android=android, magicleap=magicleap,
-            simpleservo=uwp is not None
-        )
+    @Command("package", description="Package Servo", category="package")
+    @CommandArgument("--android", default=None, action="store_true", help="Package Android")
+    @CommandArgument("--ohos", default=None, action="store_true", help="Package OpenHarmony")
+    @CommandArgument("--target", "-t", default=None, help="Package for given target platform")
+    @CommandBase.common_command_arguments(build_configuration=False, build_type=True, package_configuration=True)
+    @CommandBase.allow_target_configuration
+    def package(
+        self, build_type: BuildType, flavor: str | None = None, sanitizer: SanitizerKind = SanitizerKind.NONE
+    ) -> int | None:
+        env = self.build_env()
+        binary_path = self.get_binary_path(build_type, sanitizer=sanitizer)
         dir_to_root = self.get_top_dir()
         target_dir = path.dirname(binary_path)
-        if uwp:
-            vs_info = self.vs_dirs()
-            build_uwp(uwp, dev, vs_info['msbuild'], ms_app_store)
-        elif magicleap:
-            if platform.system() not in ["Darwin"]:
-                raise Exception("Magic Leap builds are only supported on macOS.")
-            if not env.get("MAGICLEAP_SDK"):
-                raise Exception("Magic Leap builds need the MAGICLEAP_SDK environment variable")
-            if not env.get("MLCERT"):
-                raise Exception("Magic Leap builds need the MLCERT environment variable")
-            # GStreamer configuration
-            env.setdefault("GSTREAMER_DIR", path.join(
-                self.get_target_dir(), "magicleap", target, "native", "gstreamer-1.16.0"
-            ))
-
-            mabu = path.join(env.get("MAGICLEAP_SDK"), "mabu")
-            packages = [
-                "./support/magicleap/Servo.package",
-            ]
-            if dev:
-                build_type = "lumin_debug"
+        if is_android(self.target):
+            target_triple = self.target.triple()
+            if "aarch64" in target_triple:
+                arch_string = "Arm64"
+            elif "armv7" in target_triple:
+                arch_string = "Armv7"
+            elif "i686" in target_triple:
+                arch_string = "x86"
+            elif "x86_64" in target_triple:
+                arch_string = "x64"
             else:
-                build_type = "lumin_release"
-            for package in packages:
-                argv = [
-                    mabu,
-                    "-o", target_dir,
-                    "-t", build_type,
-                    "-r",
-                    "GSTREAMER_DIR=" + env["GSTREAMER_DIR"],
-                    package
-                ]
-                try:
-                    subprocess.check_call(argv, env=env)
-                except subprocess.CalledProcessError as e:
-                    print("Packaging Magic Leap exited with return value %d" % e.returncode)
-                    return e.returncode
-        elif android:
-            android_target = self.config["android"]["target"]
-            if "aarch64" in android_target:
-                build_type = "Arm64"
-            elif "armv7" in android_target:
-                build_type = "Armv7"
-            elif "i686" in android_target:
-                build_type = "x86"
-            else:
-                build_type = "Arm"
+                arch_string = "Arm"
 
-            if dev:
-                build_mode = "Debug"
+            if build_type.is_dev():
+                build_type_string = "Debug"
+            elif build_type.is_release() or build_type.is_prod():
+                build_type_string = "Release"
             else:
-                build_mode = "Release"
+                print(f"Servo was built with custom cargo profile `{build_type.profile}`.")
+                print("Using Debug build for gradle.")
+                build_type_string = "Debug"
+            # Inform the android build of where `libservoshell.so` is located.
+            env["SERVO_TARGET_DIR"] = target_dir
 
-            flavor_name = "Main"
+            flavor_name = "Basic"
             if flavor is not None:
                 flavor_name = flavor.title()
 
-            vr = flavor == "googlevr" or flavor == "oculusvr"
-
-            dir_to_resources = path.join(self.get_top_dir(), 'target', 'android', 'resources')
+            dir_to_resources = path.join(self.get_top_dir(), "target", "android", "resources")
             if path.exists(dir_to_resources):
                 delete(dir_to_resources)
 
-            shutil.copytree(path.join(dir_to_root, 'resources'), dir_to_resources)
-            change_prefs(dir_to_resources, "android", vr=vr)
+            shutil.copytree(path.join(dir_to_root, "resources"), dir_to_resources)
 
-            variant = ":assemble" + flavor_name + build_type + build_mode
+            variant = ":assemble" + flavor_name + arch_string + build_type_string
             apk_task_name = ":servoapp" + variant
             aar_task_name = ":servoview" + variant
-            maven_task_name = ":servoview:uploadArchive"
             argv = ["./gradlew", "--no-daemon", apk_task_name, aar_task_name]
-            if maven:
-                argv.append(maven_task_name)
             try:
                 with cd(path.join("support", "android", "apk")):
                     subprocess.check_call(argv, env=env)
             except subprocess.CalledProcessError as e:
                 print("Packaging Android exited with return value %d" % e.returncode)
                 return e.returncode
-        elif is_macosx():
+        elif is_openharmony(self.target):
+            # hvigor doesn't support an option to place output files in a specific directory
+            # so copy the source files into the target/openharmony directory first.
+            ohos_app_dir = path.join(self.get_top_dir(), "support", "openharmony")
+            build_mode = build_type.directory_name()
+            ohos_target_dir = path.join(self.get_top_dir(), "target", "openharmony", self.target.triple(), build_mode)
+            if path.exists(ohos_target_dir):
+                print("Cleaning up from previous packaging")
+                delete(ohos_target_dir)
+            shutil.copytree(ohos_app_dir, ohos_target_dir)
+            resources_src_dir = path.join(self.get_top_dir(), "resources")
+            resources_app_dir = path.join(ohos_target_dir, "AppScope", "resources", "resfile", "servo")
+            os.makedirs(resources_app_dir, exist_ok=True)
+            shutil.copytree(resources_src_dir, resources_app_dir, dirs_exist_ok=True)
+
+            # Map non-debug profiles to 'release' buildMode HAP.
+            if build_type.is_custom():
+                build_mode = "release"
+
+            flavor_name = "default"
+            if flavor is not None:
+                flavor_name = flavor
+
+            hvigor_command = [
+                "--no-daemon",
+                "assembleHap",
+                "-p",
+                f"product={flavor_name}",
+                "-p",
+                f"buildMode={build_mode}",
+            ]
+            if sanitizer.is_asan():
+                hvigor_command.extend(["-p", "ohos-debug-asan=true"])
+            elif sanitizer.is_tsan():
+                hvigor_command.extend(["-p", "ohos-enable-tsan=true"])
+
+            # Detect if PATH already has hvigor, or else fallback to npm installation
+            # provided via HVIGOR_PATH
+            if "HVIGOR_PATH" not in env:
+                try:
+                    with cd(ohos_target_dir):
+                        version = check_output(["hvigorw", "--version", "--no-daemon"])
+                    print(f"Found `hvigorw` with version {version.strip()} in system PATH")
+                    hvigor_command[0:0] = ["hvigorw"]
+                except FileNotFoundError:
+                    print(
+                        "Unable to find `hvigor` tool. Please either modify PATH to include the"
+                        "path to hvigorw or set the HVIGOR_PATH environment variable to the npm"
+                        "installation containing `node_modules` directory with hvigor modules."
+                    )
+                    sys.exit(1)
+                except subprocess.CalledProcessError as e:
+                    print(f"hvigor exited with the following error: {e}")
+                    print(f"stdout: `{e.stdout}`")
+                    print(f"stderr: `{e.stderr}`")
+                    sys.exit(1)
+
+            else:
+                env["NODE_PATH"] = env["HVIGOR_PATH"] + "/node_modules"
+                hvigor_script = f"{env['HVIGOR_PATH']}/node_modules/@ohos/hvigor/bin/hvigor.js"
+                hvigor_command[0:0] = ["node", hvigor_script]
+            abi_string = self.target.abi_string()
+            ohos_libs_dir = path.join(ohos_target_dir, "entry", "libs", abi_string)
+            os.makedirs(ohos_libs_dir)
+            # The libservoshell.so binary that was built needs to be copied
+            # into the app folder heirarchy where hvigor expects it.
+            print(f"Copying {binary_path} to {ohos_libs_dir}")
+            shutil.copy(binary_path, ohos_libs_dir)
+            try:
+                with cd(ohos_target_dir):
+                    print("Calling", hvigor_command)
+                    subprocess.check_call(hvigor_command, env=env)
+            except subprocess.CalledProcessError as e:
+                print("Packaging OpenHarmony exited with return value %d" % e.returncode)
+                return e.returncode
+        elif "darwin" in self.target.triple():
             print("Creating Servo.app")
-            dir_to_dmg = path.join(target_dir, 'dmg')
-            dir_to_app = path.join(dir_to_dmg, 'Servo.app')
-            dir_to_resources = path.join(dir_to_app, 'Contents', 'Resources')
+            dir_to_dmg = path.join(target_dir, "dmg")
+            dir_to_app = path.join(dir_to_dmg, "Servo.app")
+            dir_to_resources = path.join(dir_to_app, "Contents", "Resources")
             if path.exists(dir_to_dmg):
                 print("Cleaning up from previous packaging")
                 delete(dir_to_dmg)
 
             print("Copying files")
-            shutil.copytree(path.join(dir_to_root, 'resources'), dir_to_resources)
-            shutil.copy2(path.join(dir_to_root, 'Info.plist'), path.join(dir_to_app, 'Contents', 'Info.plist'))
+            shutil.copytree(path.join(dir_to_root, "resources"), dir_to_resources)
+            shutil.copy2(path.join(dir_to_root, "Info.plist"), path.join(dir_to_app, "Contents", "Info.plist"))
 
-            content_dir = path.join(dir_to_app, 'Contents', 'MacOS')
-            os.makedirs(content_dir)
+            content_dir = path.join(dir_to_app, "Contents", "MacOS")
+            lib_dir = path.join(content_dir, "lib")
+            os.makedirs(lib_dir)
             shutil.copy2(binary_path, content_dir)
 
-            change_prefs(dir_to_resources, "macosx")
-
-            print("Finding dylibs and relinking")
-            copy_dependencies(path.join(content_dir, 'servo'), content_dir)
+            print("Packaging GStreamer...")
+            dmg_binary = path.join(content_dir, "servo")
+            servo.gstreamer.package_gstreamer_dylibs(dmg_binary, lib_dir, self.target)
 
             print("Adding version to Credits.rtf")
-            version_command = [binary_path, '--version']
-            p = subprocess.Popen(version_command,
-                                 stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE,
-                                 universal_newlines=True)
+            version_command = [binary_path, "--version"]
+            p = subprocess.Popen(
+                version_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
+            )
             version, stderr = p.communicate()
             if p.returncode != 0:
                 raise Exception("Error occurred when getting Servo version: " + stderr)
             version = "Nightly version: " + version
 
             import mako.template
-            template_path = path.join(dir_to_resources, 'Credits.rtf.mako')
-            credits_path = path.join(dir_to_resources, 'Credits.rtf')
+
+            template_path = path.join(dir_to_resources, "Credits.rtf.mako")
+            credits_path = path.join(dir_to_resources, "Credits.rtf")
             with open(template_path) as template_file:
                 template = mako.template.Template(template_file.read())
                 with open(credits_path, "w") as credits_file:
@@ -370,86 +283,65 @@ class PackageCommands(CommandBase):
             delete(template_path)
 
             print("Creating dmg")
-            os.symlink('/Applications', path.join(dir_to_dmg, 'Applications'))
+            os.symlink("/Applications", path.join(dir_to_dmg, "Applications"))
             dmg_path = path.join(target_dir, "servo-tech-demo.dmg")
 
             if path.exists(dmg_path):
                 print("Deleting existing dmg")
                 os.remove(dmg_path)
 
+            # `hdiutil` gives "Resource busy" failures on GitHub Actions at times. This
+            # is an attempt to get around those issues by retrying the command a few times
+            # after a random wait.
             try:
-                subprocess.check_call(['hdiutil', 'create',
-                                       '-volname', 'Servo',
-                                       '-megabytes', '900',
-                                       dmg_path,
-                                       '-srcfolder', dir_to_dmg])
+                check_call_with_randomized_backoff(
+                    ["hdiutil", "create", "-volname", "Servo", "-megabytes", "900", dmg_path, "-srcfolder", dir_to_dmg],
+                    retries=3,
+                )
             except subprocess.CalledProcessError as e:
                 print("Packaging MacOS dmg exited with return value %d" % e.returncode)
                 return e.returncode
+
             print("Cleaning up")
             delete(dir_to_dmg)
             print("Packaged Servo into " + dmg_path)
 
-            print("Creating brew package")
-            dir_to_brew = path.join(target_dir, 'brew_tmp')
-            dir_to_tar = path.join(target_dir, 'brew')
-            if not path.exists(dir_to_tar):
-                os.makedirs(dir_to_tar)
-            tar_path = path.join(dir_to_tar, "servo.tar.gz")
-            if path.exists(dir_to_brew):
-                print("Cleaning up from previous packaging")
-                delete(dir_to_brew)
-            if path.exists(tar_path):
-                print("Deleting existing package")
-                os.remove(tar_path)
-            shutil.copytree(path.join(dir_to_root, 'resources'), path.join(dir_to_brew, 'resources'))
-            os.makedirs(path.join(dir_to_brew, 'bin'))
-            shutil.copy2(binary_path, path.join(dir_to_brew, 'bin', 'servo'))
-            # Note that in the context of Homebrew, libexec is reserved for private use by the formula
-            # and therefore is not symlinked into HOMEBREW_PREFIX.
-            os.makedirs(path.join(dir_to_brew, 'libexec'))
-            copy_dependencies(path.join(dir_to_brew, 'bin', 'servo'), path.join(dir_to_brew, 'libexec'))
-            archive_deterministically(dir_to_brew, tar_path, prepend_path='servo/')
-            delete(dir_to_brew)
-            print("Packaged Servo into " + tar_path)
-        elif is_windows():
-            dir_to_msi = path.join(target_dir, 'msi')
+        elif "windows" in self.target.triple():
+            dir_to_msi = path.join(target_dir, "msi")
             if path.exists(dir_to_msi):
                 print("Cleaning up from previous packaging")
                 delete(dir_to_msi)
             os.makedirs(dir_to_msi)
 
             print("Copying files")
-            dir_to_temp = path.join(dir_to_msi, 'temp')
-            dir_to_resources = path.join(dir_to_temp, 'resources')
-            shutil.copytree(path.join(dir_to_root, 'resources'), dir_to_resources)
+            dir_to_temp = path.join(dir_to_msi, "temp")
+            dir_to_resources = path.join(dir_to_temp, "resources")
+            shutil.copytree(path.join(dir_to_root, "resources"), dir_to_resources)
             shutil.copy(binary_path, dir_to_temp)
             copy_windows_dependencies(target_dir, dir_to_temp)
 
-            change_prefs(dir_to_resources, "windows")
-
             # generate Servo.wxs
             import mako.template
+
             template_path = path.join(dir_to_root, "support", "windows", "Servo.wxs.mako")
             template = mako.template.Template(open(template_path).read())
             wxs_path = path.join(dir_to_msi, "Installer.wxs")
-            open(wxs_path, "w").write(template.render(
-                exe_path=target_dir,
-                dir_to_temp=dir_to_temp,
-                resources_path=dir_to_resources))
+            open(wxs_path, "w").write(
+                template.render(exe_path=target_dir, dir_to_temp=dir_to_temp, resources_path=dir_to_resources)
+            )
 
             # run candle and light
             print("Creating MSI")
             try:
                 with cd(dir_to_msi):
-                    subprocess.check_call(['candle', wxs_path])
+                    subprocess.check_call(["candle", wxs_path])
             except subprocess.CalledProcessError as e:
                 print("WiX candle exited with return value %d" % e.returncode)
                 return e.returncode
             try:
                 wxsobj_path = "{}.wixobj".format(path.splitext(wxs_path)[0])
                 with cd(dir_to_msi):
-                    subprocess.check_call(['light', wxsobj_path])
+                    subprocess.check_call(["light", wxsobj_path])
             except subprocess.CalledProcessError as e:
                 print("WiX light exited with return value %d" % e.returncode)
                 return e.returncode
@@ -458,18 +350,18 @@ class PackageCommands(CommandBase):
 
             # Generate bundle with Servo installer.
             print("Creating bundle")
-            shutil.copy(path.join(dir_to_root, 'support', 'windows', 'Servo.wxs'), dir_to_msi)
-            bundle_wxs_path = path.join(dir_to_msi, 'Servo.wxs')
+            shutil.copy(path.join(dir_to_root, "support", "windows", "Servo.wxs"), dir_to_msi)
+            bundle_wxs_path = path.join(dir_to_msi, "Servo.wxs")
             try:
                 with cd(dir_to_msi):
-                    subprocess.check_call(['candle', bundle_wxs_path, '-ext', 'WixBalExtension'])
+                    subprocess.check_call(["candle", bundle_wxs_path, "-ext", "WixBalExtension"])
             except subprocess.CalledProcessError as e:
                 print("WiX candle exited with return value %d" % e.returncode)
                 return e.returncode
             try:
                 wxsobj_path = "{}.wixobj".format(path.splitext(bundle_wxs_path)[0])
                 with cd(dir_to_msi):
-                    subprocess.check_call(['light', wxsobj_path, '-ext', 'WixBalExtension'])
+                    subprocess.check_call(["light", wxsobj_path, "-ext", "WixBalExtension"])
             except subprocess.CalledProcessError as e:
                 print("WiX light exited with return value %d" % e.returncode)
                 return e.returncode
@@ -477,97 +369,65 @@ class PackageCommands(CommandBase):
 
             print("Creating ZIP")
             zip_path = path.join(dir_to_msi, "Servo.zip")
-            archive_deterministically(dir_to_temp, zip_path, prepend_path='servo/')
+            archive_deterministically(dir_to_temp, zip_path, prepend_path="servo/")
             print("Packaged Servo into " + zip_path)
 
             print("Cleaning up")
             delete(dir_to_temp)
             delete(dir_to_installer)
         else:
-            dir_to_temp = path.join(target_dir, 'packaging-temp')
+            dir_to_temp = path.join(target_dir, "packaging-temp")
             if path.exists(dir_to_temp):
                 # TODO(aneeshusa): lock dir_to_temp to prevent simultaneous builds
                 print("Cleaning up from previous packaging")
                 delete(dir_to_temp)
 
             print("Copying files")
-            dir_to_resources = path.join(dir_to_temp, 'resources')
-            shutil.copytree(path.join(dir_to_root, 'resources'), dir_to_resources)
+            dir_to_resources = path.join(dir_to_temp, "resources")
+            shutil.copytree(path.join(dir_to_root, "resources"), dir_to_resources)
             shutil.copy(binary_path, dir_to_temp)
 
-            change_prefs(dir_to_resources, "linux")
-
             print("Creating tarball")
-            tar_path = path.join(target_dir, 'servo-tech-demo.tar.gz')
+            tar_path = path.join(target_dir, "servo-tech-demo.tar.gz")
 
-            archive_deterministically(dir_to_temp, tar_path, prepend_path='servo/')
+            archive_deterministically(dir_to_temp, tar_path, prepend_path="servo/")
 
             print("Cleaning up")
             delete(dir_to_temp)
             print("Packaged Servo into " + tar_path)
 
-    @Command('install',
-             description='Install Servo (currently, Android and Windows only)',
-             category='package')
-    @CommandArgument('--release', '-r', action='store_true',
-                     help='Install the release build')
-    @CommandArgument('--dev', '-d', action='store_true',
-                     help='Install the dev build')
-    @CommandArgument('--android',
-                     action='store_true',
-                     help='Install on Android')
-    @CommandArgument('--magicleap',
-                     default=None,
-                     action='store_true',
-                     help='Install on Magic Leap')
-    @CommandArgument('--emulator',
-                     action='store_true',
-                     help='For Android, install to the only emulated device')
-    @CommandArgument('--usb',
-                     action='store_true',
-                     help='For Android, install to the only USB device')
-    @CommandArgument('--target', '-t',
-                     default=None,
-                     help='Install the given target platform')
-    def install(self, release=False, dev=False, android=False, magicleap=False, emulator=False, usb=False, target=None):
-        if target and android:
-            print("Please specify either --target or --android.")
-            sys.exit(1)
-        if not android:
-            android = self.handle_android_target(target)
-        if target and magicleap:
-            print("Please specify either --target or --magicleap.")
-            sys.exit(1)
-        if magicleap:
-            target = "aarch64-linux-android"
-        env = self.build_env(target=target)
+    @Command("install", description="Install Servo (currently, Android and Windows only)", category="package")
+    @CommandArgument("--android", action="store_true", help="Install on Android")
+    @CommandArgument("--ohos", action="store_true", help="Install on OpenHarmony")
+    @CommandArgument("--emulator", action="store_true", help="For Android, install to the only emulated device")
+    @CommandArgument("--usb", action="store_true", help="For Android, install to the only USB device")
+    @CommandArgument("--target", "-t", default=None, help="Install the given target platform")
+    @CommandBase.common_command_arguments(build_configuration=False, build_type=True, package_configuration=True)
+    @CommandBase.allow_target_configuration
+    def install(
+        self,
+        build_type: BuildType,
+        emulator: bool = False,
+        usb: bool = False,
+        sanitizer: SanitizerKind = SanitizerKind.NONE,
+        flavor: str | None = None,
+    ) -> int:
+        env = self.build_env()
         try:
-            binary_path = self.get_binary_path(release, dev, android=android, magicleap=magicleap)
+            binary_path = self.get_binary_path(build_type, sanitizer=sanitizer)
         except BuildNotFound:
             print("Servo build not found. Building servo...")
-            result = Registrar.dispatch(
-                "build", context=self.context, release=release, dev=dev, android=android, magicleap=magicleap,
-            )
+            result = Registrar.dispatch("build", context=self.context, build_type=build_type, flavor=flavor)
             if result:
                 return result
             try:
-                binary_path = self.get_binary_path(release, dev, android=android, magicleap=magicleap)
+                binary_path = self.get_binary_path(build_type, sanitizer=sanitizer)
             except BuildNotFound:
                 print("Rebuilding Servo did not solve the missing build problem.")
                 return 1
 
-        if magicleap:
-            if not env.get("MAGICLEAP_SDK"):
-                raise Exception("Magic Leap installs need the MAGICLEAP_SDK environment variable")
-            mldb = path.join(env.get("MAGICLEAP_SDK"), "tools", "mldb", "mldb")
-            pkg_path = path.join(path.dirname(binary_path), "Servo.mpk")
-            exec_command = [
-                mldb,
-                "install", "-u",
-                pkg_path,
-            ]
-        elif android:
-            pkg_path = self.get_apk_path(release)
+        if is_android(self.target):
+            pkg_path = self.target.get_package_path(build_type.directory_name())
             exec_command = [self.android_adb_path(env)]
             if emulator and usb:
                 print("Cannot install to both emulator and USB at the same time.")
@@ -577,300 +437,226 @@ class PackageCommands(CommandBase):
             if usb:
                 exec_command += ["-d"]
             exec_command += ["install", "-r", pkg_path]
+        elif is_openharmony(self.target):
+            pkg_path = self.target.get_package_path(build_type.directory_name(), flavor=flavor)
+            hdc_path = path.join(env["OHOS_SDK_NATIVE"], "../", "toolchains", "hdc")
+            exec_command = [hdc_path, "install", "-r", pkg_path]
         elif is_windows():
-            pkg_path = path.join(path.dirname(binary_path), 'msi', 'Servo.msi')
+            pkg_path = path.join(path.dirname(binary_path), "msi", "Servo.msi")
             exec_command = ["msiexec", "/i", pkg_path]
 
         if not path.exists(pkg_path):
             print("Servo package not found. Packaging servo...")
-            result = Registrar.dispatch(
-                "package", context=self.context, release=release, dev=dev, android=android, magicleap=magicleap,
-            )
+            result = Registrar.dispatch("package", context=self.context, build_type=build_type, flavor=flavor)
             if result != 0:
                 return result
 
         print(" ".join(exec_command))
         return subprocess.call(exec_command, env=env)
 
-    @Command('upload-nightly',
-             description='Upload Servo nightly to S3',
-             category='package')
-    @CommandArgument('platform',
-                     choices=PACKAGES.keys(),
-                     help='Package platform type to upload')
-    @CommandArgument('--secret-from-taskcluster',
-                     action='store_true',
-                     help='Retrieve the appropriate secrets from taskcluster.')
-    @CommandArgument('--secret-from-environment',
-                     action='store_true',
-                     help='Retrieve the appropriate secrets from the environment.')
-    def upload_nightly(self, platform, secret_from_taskcluster, secret_from_environment):
+    @Command("upload-nightly", description="Upload Servo nightly to S3", category="package")
+    @CommandArgument("platform", choices=PACKAGES.keys(), help="Package platform type to upload")
+    @CommandArgument(
+        "--secret-from-environment", action="store_true", help="Retrieve the appropriate secrets from the environment."
+    )
+    @CommandArgument(
+        "--github-release-id", default=None, type=int, help="The github release to upload the nightly builds."
+    )
+    def upload_nightly(self, platform: str, secret_from_environment: bool, github_release_id: int | None) -> int:
         import boto3
 
-        def get_s3_secret():
+        def get_s3_secret() -> tuple:
             aws_access_key = None
             aws_secret_access_key = None
-            if secret_from_taskcluster:
-                secret = get_taskcluster_secret("s3-upload-credentials")
-                aws_access_key = secret["aws_access_key_id"]
-                aws_secret_access_key = secret["aws_secret_access_key"]
-            elif secret_from_environment:
-                secret = json.loads(os.environ['S3_UPLOAD_CREDENTIALS'])
+            if secret_from_environment:
+                secret = json.loads(os.environ["S3_UPLOAD_CREDENTIALS"])
                 aws_access_key = secret["aws_access_key_id"]
                 aws_secret_access_key = secret["aws_secret_access_key"]
             return (aws_access_key, aws_secret_access_key)
 
-        def nightly_filename(package, timestamp):
-            return '{}-{}'.format(
-                timestamp.isoformat() + 'Z',  # The `Z` denotes UTC
-                path.basename(package)
+        def nightly_filename(package: str, timestamp: datetime) -> str:
+            return "{}-{}".format(
+                timestamp.isoformat() + "Z",  # The `Z` denotes UTC
+                path.basename(package),
             )
 
-        def upload_to_s3(platform, package, timestamp):
+        # Map the default platform shorthand to a name containing architecture.
+        def map_platform(platform: str) -> str:
+            if platform == "android":
+                return "aarch64-android"
+            elif platform == "linux":
+                return "x86_64-linux-gnu"
+            elif platform == "windows-msvc":
+                return "x86_64-windows-msvc"
+            elif platform == "mac":
+                return "x86_64-apple-darwin"
+            elif platform == "mac-arm64":
+                return "aarch64-apple-darwin"
+            elif platform == "ohos":
+                return "aarch64-linux-ohos"
+            raise Exception("Unknown platform: {}".format(platform))
+
+        def upload_to_github_release(platform: str, package: str, package_hash: str) -> None:
+            if not github_release_id:
+                return
+
+            extension = path.basename(package).partition(".")[2]
+            g = Github(os.environ["NIGHTLY_REPO_TOKEN"])
+            nightly_repo = g.get_repo(os.environ["NIGHTLY_REPO"])
+            release = nightly_repo.get_release(github_release_id)
+
+            if platform != "mac-arm64":
+                # Legacy assetname. Will be removed after a period with duplicate assets.
+                asset_name = f"servo-latest.{extension}"
+                package_hash_fileobj = io.BytesIO(f"{package_hash}  {asset_name}".encode("utf-8"))
+                release.upload_asset(package, name=asset_name)
+                # pyrefly: ignore[missing-attribute]
+                release.upload_asset_from_memory(
+                    package_hash_fileobj, package_hash_fileobj.getbuffer().nbytes, name=f"{asset_name}.sha256"
+                )
+            asset_platform = map_platform(platform)
+            asset_name = f"servo-{asset_platform}.{extension}"
+            package_hash_fileobj = io.BytesIO(f"{package_hash}  {asset_name}".encode("utf-8"))
+            release.upload_asset(package, name=asset_name)
+            # pyrefly: ignore[missing-attribute]
+            release.upload_asset_from_memory(
+                package_hash_fileobj, package_hash_fileobj.getbuffer().nbytes, name=f"{asset_name}.sha256"
+            )
+
+        def upload_to_s3(platform: str, package: str, package_hash: str, timestamp: datetime) -> None:
             (aws_access_key, aws_secret_access_key) = get_s3_secret()
-            s3 = boto3.client(
-                's3',
-                aws_access_key_id=aws_access_key,
-                aws_secret_access_key=aws_secret_access_key
-            )
-            BUCKET = 'servo-builds2'
+            s3 = boto3.client("s3", aws_access_key_id=aws_access_key, aws_secret_access_key=aws_secret_access_key)
 
-            nightly_dir = 'nightly/{}'.format(platform)
+            cloudfront = boto3.client(
+                "cloudfront", aws_access_key_id=aws_access_key, aws_secret_access_key=aws_secret_access_key
+            )
+
+            BUCKET = "servo-builds2"
+            DISTRIBUTION_ID = "EJ8ZWSJKFCJS2"
+
+            nightly_dir = f"nightly/{platform}"
             filename = nightly_filename(package, timestamp)
-            package_upload_key = '{}/{}'.format(nightly_dir, filename)
-            extension = path.basename(package).partition('.')[2]
-            latest_upload_key = '{}/servo-latest.{}'.format(nightly_dir, extension)
+            package_upload_key = "{}/{}".format(nightly_dir, filename)
+            extension = path.basename(package).partition(".")[2]
+            latest_upload_key = "{}/servo-latest.{}".format(nightly_dir, extension)
+
+            package_hash_fileobj = io.BytesIO(f"{package_hash}  {filename}".encode("utf-8"))
+            latest_hash_upload_key = f"{latest_upload_key}.sha256"
+
+            s3.upload_file(package, BUCKET, package_upload_key)
+
+            copy_source = {
+                "Bucket": BUCKET,
+                "Key": package_upload_key,
+            }
+            s3.copy(copy_source, BUCKET, latest_upload_key)
+            s3.upload_fileobj(
+                package_hash_fileobj, BUCKET, latest_hash_upload_key, ExtraArgs={"ContentType": "text/plain"}
+            )
+
+            # Invalidate previous "latest" nightly files from
+            # CloudFront edge caches
+            cloudfront.create_invalidation(
+                DistributionId=DISTRIBUTION_ID,
+                InvalidationBatch={
+                    "CallerReference": f"{latest_upload_key}-{timestamp}",
+                    "Paths": {"Quantity": 1, "Items": [f"/{latest_upload_key}*"]},
+                },
+            )
+
+        timestamp = datetime.utcnow().replace(microsecond=0)
+        for package in packages_for_platform(platform):
+            if path.isdir(package):
+                continue
+            if not path.isfile(package):
+                print("Could not find package for {} at {}".format(platform, package), file=sys.stderr)
+                return 1
 
             # Compute the hash
             SHA_BUF_SIZE = 1048576  # read in 1 MiB chunks
             sha256_digest = hashlib.sha256()
-            with open(package, 'rb') as package_file:
+            with open(package, "rb") as package_file:
                 while True:
                     data = package_file.read(SHA_BUF_SIZE)
                     if not data:
                         break
                     sha256_digest.update(data)
             package_hash = sha256_digest.hexdigest()
-            package_hash_fileobj = io.BytesIO(package_hash.encode('utf-8'))
-            latest_hash_upload_key = '{}/servo-latest.{}.sha256'.format(nightly_dir, extension)
 
-            s3.upload_file(package, BUCKET, package_upload_key)
-
-            copy_source = {
-                'Bucket': BUCKET,
-                'Key': package_upload_key,
-            }
-            s3.copy(copy_source, BUCKET, latest_upload_key)
-            s3.upload_fileobj(
-                package_hash_fileobj, BUCKET, latest_hash_upload_key, ExtraArgs={'ContentType': 'text/plain'}
-            )
-
-        def update_maven(directory):
-            (aws_access_key, aws_secret_access_key) = get_s3_secret()
-            s3 = boto3.client(
-                's3',
-                aws_access_key_id=aws_access_key,
-                aws_secret_access_key=aws_secret_access_key
-            )
-            BUCKET = 'servo-builds2'
-
-            nightly_dir = 'nightly/maven'
-            dest_key_base = directory.replace("target/android/gradle/servoview/maven", nightly_dir)
-            if dest_key_base[-1] == '/':
-                dest_key_base = dest_key_base[:-1]
-
-            # Given a directory with subdirectories like 0.0.1.20181005.caa4d190af...
-            for artifact_dir in os.listdir(directory):
-                base_dir = os.path.join(directory, artifact_dir)
-                if not os.path.isdir(base_dir):
-                    continue
-                package_upload_base = "{}/{}".format(dest_key_base, artifact_dir)
-                # Upload all of the files inside the subdirectory.
-                for f in os.listdir(base_dir):
-                    file_upload_key = "{}/{}".format(package_upload_base, f)
-                    print("Uploading %s to %s" % (os.path.join(base_dir, f), file_upload_key))
-                    s3.upload_file(os.path.join(base_dir, f), BUCKET, file_upload_key)
-
-        def update_brew(package, timestamp):
-            print("Updating brew formula")
-
-            package_url = 'https://download.servo.org/nightly/macbrew/{}'.format(
-                nightly_filename(package, timestamp)
-            )
-            with open(package) as p:
-                digest = hashlib.sha256(p.read()).hexdigest()
-
-            brew_version = timestamp.strftime('%Y.%m.%d')
-
-            with TemporaryDirectory(prefix='homebrew-servo') as tmp_dir:
-                def call_git(cmd, **kwargs):
-                    subprocess.check_call(
-                        ['git', '-C', tmp_dir] + cmd,
-                        **kwargs
-                    )
-
-                call_git([
-                    'clone',
-                    'https://github.com/servo/homebrew-servo.git',
-                    '.',
-                ])
-
-                script_dir = path.dirname(path.realpath(__file__))
-                with open(path.join(script_dir, 'servo-binary-formula.rb.in')) as f:
-                    formula = f.read()
-                formula = formula.replace('PACKAGEURL', package_url)
-                formula = formula.replace('SHA', digest)
-                formula = formula.replace('VERSION', brew_version)
-                with open(path.join(tmp_dir, 'Formula', 'servo-bin.rb'), 'w') as f:
-                    f.write(formula)
-
-                call_git(['add', path.join('.', 'Formula', 'servo-bin.rb')])
-                call_git([
-                    '-c', 'user.name=Tom Servo',
-                    '-c', 'user.email=servo@servo.org',
-                    'commit',
-                    '--message=Version Bump: {}'.format(brew_version),
-                ])
-
-                if secret_from_taskcluster:
-                    token = get_taskcluster_secret('github-homebrew-token')["token"]
-                else:
-                    token = os.environ['GITHUB_HOMEBREW_TOKEN']
-
-                push_url = 'https://{}@github.com/servo/homebrew-servo.git'
-                # TODO(aneeshusa): Use subprocess.DEVNULL with Python 3.3+
-                with open(os.devnull, 'wb') as DEVNULL:
-                    call_git([
-                        'push',
-                        '-qf',
-                        push_url.format(token),
-                        'master',
-                    ], stdout=DEVNULL, stderr=DEVNULL)
-
-        timestamp = datetime.utcnow().replace(microsecond=0)
-        for package in PACKAGES[platform]:
-            if path.isdir(package):
-                continue
-            if not path.isfile(package):
-                print("Could not find package for {} at {}".format(
-                    platform,
-                    package
-                ), file=sys.stderr)
-                return 1
-            upload_to_s3(platform, package, timestamp)
-
-        if platform == 'maven':
-            for package in PACKAGES[platform]:
-                update_maven(package)
-
-        if platform == 'macbrew':
-            packages = PACKAGES[platform]
-            assert(len(packages) == 1)
-            update_brew(packages[0], timestamp)
+            upload_to_s3(platform, package, package_hash, timestamp)
+            upload_to_github_release(platform, package, package_hash)
 
         return 0
 
+    @Command(
+        "release", description="Perform necessary updates before release a new servoshell version", category="package"
+    )
+    @CommandArgument("target", type=str, help="Target version to bump to")
+    @CommandArgument("--allow-dirty", action="store_true", help="Allow working directory to be dirty")
+    def bump_version(self, target: str, allow_dirty: bool) -> int:
+        if not allow_dirty:
+            # Check if the working directory is clean
+            status_output = check_output(["git", "status", "--porcelain"]).strip()
+            if status_output:
+                print("Working directory is dirty. Please commit or stash your changes before bumping version.")
+                print("To bypass this check, use --allow-dirty.")
+                return 1
+        print("\r ➤  Bumping version number...")
+        # Todo: Also update assemblyIdentity.version in ports/servoshell/platform/windows/servo.exe.manifest
+        #   Note: assemblyIdentity requires 4 version components, while we usually use 3.
+        replacements = {
+            "ports/servoshell/Cargo.toml": r'^version ?= ?"(?P<version>.*?)"',
+            "support/windows/Servo.wxs.mako": r'<Product(.|\n)*Version="(?P<version>.*?)".*>',
+            "Info.plist": r"<key>CFBundleShortVersionString</key>\n\s*<string>(?P<version>.*?)</string>",
+            "support/android/apk/servoapp/build.gradle.kts": r'versionName\s*=\s*"(?P<version>.*?)"',
+            "support/openharmony/oh-package.json5": r'"version"\s*:\s*"(?P<version>.*?)"',
+            "support/openharmony/entry/oh-package.json5": r'"version"\s*:\s*"(?P<version>.*?)"',
+        }
 
-def setup_uwp_signing(ms_app_store, publisher):
-    # App package needs to be signed. If we find a certificate that has been installed
-    # already, we use it. Otherwise we create and install a temporary certificate.
+        for filename, expression in replacements.items():
+            filepath = path.join(self.get_top_dir(), filename)
+            with open(filepath, "r") as file:
+                content = file.read()
 
-    if ms_app_store:
-        return ["/p:AppxPackageSigningEnabled=false"]
+            compiled_pattern = re.compile(expression, re.MULTILINE)
 
-    is_tc = "TASKCLUSTER_PROXY_URL" in os.environ
-
-    def run_powershell_cmd(cmd):
-        try:
-            return (
-                subprocess
-                .check_output(['powershell.exe', '-NoProfile', '-Command', cmd])
-                .decode('utf-8')
+            new_content, count = compiled_pattern.subn(
+                lambda m: m.group(0).replace(m.group("version"), target),
+                content,
             )
-        except subprocess.CalledProcessError:
-            print("ERROR: PowerShell command failed: ", cmd)
-            exit(1)
 
-    pfx = None
-    if is_tc:
-        print("Packaging on TC. Using secret certificate")
-        pfx = get_taskcluster_secret("windows-codesign-cert/latest")["pfx"]["base64"]
-    elif 'CODESIGN_CERT' in os.environ:
-        pfx = os.environ['CODESIGN_CERT']
+            if count == 0:
+                print(f"No occurrences found in {filename} to replace.")
+                return 1
+            elif count > 1:
+                print(f"Warning: Multiple ({count}) occurrences found in {filename}. Only one expected.")
+                # Print all occurrences for debugging
+                matches = compiled_pattern.findall(content)
+                for match in matches:
+                    print(f"Found occurrence: {match}")
+                return 1
 
-    if pfx:
-        open("servo.pfx", "wb").write(base64.b64decode(pfx))
-        run_powershell_cmd('Import-PfxCertificate -FilePath .\\servo.pfx -CertStoreLocation Cert:\\CurrentUser\\My')
-        os.remove("servo.pfx")
+            with open(filepath, "w") as file:
+                file.write(new_content)
 
-    # Powershell command that lists all certificates for publisher
-    cmd = '(dir cert: -Recurse | Where-Object {$_.Issuer -eq "' + publisher + '"}).Thumbprint'
-    certs = list(set(run_powershell_cmd(cmd).splitlines()))
-    if not certs and is_tc:
-        print("Error: No certificate installed for publisher " + publisher)
-        exit(1)
-    if not certs and not is_tc:
-        print("No certificate installed for publisher " + publisher)
-        print("Creating and installing a temporary certificate")
-        # PowerShell command that creates and install signing certificate for publisher
-        cmd = '(New-SelfSignedCertificate -Type Custom -Subject ' + publisher + \
-              ' -FriendlyName "Allizom Signing Certificate (temporary)"' + \
-              ' -KeyUsage DigitalSignature -CertStoreLocation "Cert:\\CurrentUser\\My"' + \
-              ' -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")).Thumbprint'
-        thumbprint = run_powershell_cmd(cmd)
-    elif len(certs) > 1:
-        print("Warning: multiple signing certificate are installed for " + publisher)
-        print("Warning: Using first one")
-        thumbprint = certs[0]
-    else:
-        thumbprint = certs[0]
-    return ["/p:AppxPackageSigningEnabled=true", "/p:PackageCertificateThumbprint=" + thumbprint]
-
-
-def build_uwp(platforms, dev, msbuild_dir, ms_app_store):
-    if any(map(lambda p: p not in ['x64', 'x86', 'arm64'], platforms)):
-        raise Exception("Unsupported appx platforms: " + str(platforms))
-    if dev and len(platforms) > 1:
-        raise Exception("Debug package with multiple architectures is unsupported")
-
-    if dev:
-        Configuration = "Debug"
-    else:
-        Configuration = "Release"
-
-    # Parse appxmanifest to find the publisher name and version
-    manifest_file = path.join(os.getcwd(), 'support', 'hololens', 'ServoApp', 'Package.appxmanifest')
-    manifest = xml.etree.ElementTree.parse(manifest_file)
-    namespace = "{http://schemas.microsoft.com/appx/manifest/foundation/windows10}"
-    identity = manifest.getroot().find(namespace + "Identity")
-    publisher = identity.attrib["Publisher"]
-    version = identity.attrib["Version"]
-
-    msbuild = path.join(msbuild_dir, "msbuild.exe")
-    build_file_template = path.join('support', 'hololens', 'package.msbuild')
-    with open(build_file_template) as f:
-        template_contents = f.read()
-        build_file = tempfile.NamedTemporaryFile(delete=False)
-        build_file.write(
-            template_contents
-            .replace("%%BUILD_PLATFORMS%%", ';'.join(platforms))
-            .replace("%%PACKAGE_PLATFORMS%%", '|'.join(platforms))
-            .replace("%%CONFIGURATION%%", Configuration)
-            .replace("%%SOLUTION%%", path.join(os.getcwd(), 'support', 'hololens', 'ServoApp.sln'))
-            .encode('utf-8')
-        )
-        build_file.close()
-        # Generate an appxbundle.
-        msbuild_args = setup_uwp_signing(ms_app_store, publisher)
-        subprocess.check_call([msbuild, "/m", build_file.name] + msbuild_args)
-        os.unlink(build_file.name)
-
-    # Don't bother creating an archive that contains unsigned app packages.
-    if not ms_app_store:
-        print("Creating ZIP")
-        out_dir = path.join(os.getcwd(), 'support', 'hololens', 'AppPackages', 'ServoApp')
-        name = 'ServoApp_%s_%sTest' % (version, 'Debug_' if dev else '')
-        artifacts_dir = path.join(out_dir, name)
-        zip_path = path.join(out_dir, "FirefoxReality.zip")
-        archive_deterministically(artifacts_dir, zip_path, prepend_path='servo/')
-        print("Packaged Servo into " + zip_path)
+            print(f"Updated occurrence in {filename}.")
+        print("\r ➤  Updating license.html...")
+        # cargo about generate etc/about.hbs > resources/resource_protocol/license.html
+        try:
+            # Remove resources/resource_protocol/license.html before regenerating it
+            license_html_path = path.join("resources", "resource_protocol", "license.html")
+            if path.exists(license_html_path):
+                os.remove(license_html_path)
+            subprocess.check_call(
+                [
+                    "cargo",
+                    "about",
+                    "generate",
+                    "etc/about.hbs",
+                ],
+                stdout=open("resources/resource_protocol/license.html", "w"),
+            )
+        except subprocess.CalledProcessError as e:
+            print("Updating license.html exited with return value %d" % e.returncode)
+            return e.returncode
+        return 0

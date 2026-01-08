@@ -4,23 +4,10 @@
 
 #![deny(unsafe_code)]
 
-#[macro_use]
-extern crate lazy_static;
-#[macro_use]
-extern crate log;
-#[macro_use]
-extern crate malloc_size_of_derive;
-#[macro_use]
-extern crate profile_traits;
-#[macro_use]
-extern crate serde;
-#[macro_use]
-extern crate servo_config;
-
+pub mod async_runtime;
 pub mod connector;
 pub mod cookie;
 pub mod cookie_storage;
-mod data_loader;
 mod decoder;
 pub mod filemanager_thread;
 mod hosts;
@@ -28,24 +15,26 @@ pub mod hsts;
 pub mod http_cache;
 pub mod http_loader;
 pub mod image_cache;
-pub mod mime_classifier;
+pub mod local_directory_listing;
+pub mod protocols;
+pub mod request_interceptor;
 pub mod resource_thread;
-mod storage_thread;
 pub mod subresource_integrity;
+#[cfg(feature = "test-util")]
+pub mod test_util;
 mod websocket_loader;
 
 /// An implementation of the [Fetch specification](https://fetch.spec.whatwg.org/)
 pub mod fetch {
     pub mod cors_cache;
+    pub mod fetch_params;
     pub mod headers;
     pub mod methods;
 }
 
 /// A module for re-exports of items used in unit tests.
 pub mod test {
-    pub use crate::hosts::{parse_hostsfile, replace_host_table};
+    pub use crate::decoder::DECODER_BUFFER_SIZE;
+    pub use crate::hosts::parse_hostsfile;
     pub use crate::http_loader::HttpState;
 }
-
-// This dependency gives `build.rs` access to the `DEP_OPENSSL_VERSION_NUMBER` env variable.
-use openssl_sys as _;

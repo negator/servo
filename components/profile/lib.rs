@@ -4,12 +4,8 @@
 
 #![deny(unsafe_code)]
 
-#[macro_use]
-extern crate profile_traits;
-#[macro_use]
-extern crate serde;
-
-#[allow(unsafe_code)]
 pub mod mem;
+#[cfg_attr(not(target_os = "windows"), expect(unsafe_code))]
+pub mod system_reporter;
 pub mod time;
 pub mod trace_dump;

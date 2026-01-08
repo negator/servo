@@ -2,6 +2,24 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::Cell;
+use std::mem;
+use std::str::{Chars, FromStr};
+use std::time::Duration;
+
+use dom_struct::dom_struct;
+use headers::ContentType;
+use http::StatusCode;
+use http::header::{self, HeaderName, HeaderValue};
+use js::jsval::UndefinedValue;
+use js::rust::HandleObject;
+use mime::{self, Mime};
+use net_traits::request::{CacheMode, CorsSettings, Destination, RequestBuilder, RequestId};
+use net_traits::{FetchMetadata, FilteredMetadata, NetworkError, ResourceFetchTiming};
+use script_bindings::conversions::SafeToJSValConvertible;
+use servo_url::ServoUrl;
+use stylo_atoms::Atom;
+
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::EventSourceBinding::{
     EventSourceInit, EventSourceMethods,
@@ -9,41 +27,22 @@ use crate::dom::bindings::codegen::Bindings::EventSourceBinding::{
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject};
+use crate::dom::bindings::reflector::{DomGlobal, reflect_dom_object_with_proto};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
+use crate::dom::csp::{GlobalCspReporting, Violation};
 use crate::dom::event::Event;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::messageevent::MessageEvent;
-use crate::dom::performanceresourcetiming::InitiatorType;
-use crate::fetch::{create_a_potential_cors_request, FetchCanceller};
-use crate::network_listener::{self, NetworkListener, PreInvoke, ResourceTimingListener};
+use crate::dom::performance::performanceresourcetiming::InitiatorType;
+use crate::fetch::{FetchCanceller, RequestWithGlobalScope, create_a_potential_cors_request};
+use crate::network_listener::{self, FetchResponseListener, ResourceTimingListener};
 use crate::realms::enter_realm;
-use crate::task_source::{TaskSource, TaskSourceName};
+use crate::script_runtime::CanGc;
 use crate::timers::OneshotTimerCallback;
-use dom_struct::dom_struct;
-use euclid::Length;
-use headers::ContentType;
-use http::header::{self, HeaderName, HeaderValue};
-use ipc_channel::ipc;
-use ipc_channel::router::ROUTER;
-use js::conversions::ToJSValConvertible;
-use js::jsval::UndefinedValue;
-use mime::{self, Mime};
-use net_traits::request::{CacheMode, CorsSettings, Destination, RequestBuilder};
-use net_traits::{CoreResourceMsg, FetchChannels, FetchMetadata, FilteredMetadata};
-use net_traits::{FetchResponseListener, FetchResponseMsg, NetworkError};
-use net_traits::{ResourceFetchTiming, ResourceTimingType};
-use servo_atoms::Atom;
-use servo_url::ServoUrl;
-use std::cell::Cell;
-use std::mem;
-use std::str::{Chars, FromStr};
-use std::sync::{Arc, Mutex};
-use utf8;
 
-const DEFAULT_RECONNECTION_TIME: u64 = 5000;
+const DEFAULT_RECONNECTION_TIME: Duration = Duration::from_millis(5000);
 
 #[derive(Clone, Copy, Debug, JSTraceable, MallocSizeOf, PartialEq)]
 struct GenerationId(u32);
@@ -56,20 +55,51 @@ enum ReadyState {
     Closed = 2,
 }
 
+#[derive(JSTraceable, MallocSizeOf)]
+struct DroppableEventSource {
+    canceller: DomRefCell<FetchCanceller>,
+}
+
+impl DroppableEventSource {
+    pub(crate) fn new(canceller: DomRefCell<FetchCanceller>) -> Self {
+        DroppableEventSource { canceller }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.canceller.borrow_mut().abort();
+    }
+
+    pub(crate) fn set_canceller(&self, data: FetchCanceller) {
+        *self.canceller.borrow_mut() = data;
+    }
+}
+
+// https://html.spec.whatwg.org/multipage/#garbage-collection-2
+impl Drop for DroppableEventSource {
+    fn drop(&mut self) {
+        // If an EventSource object is garbage collected while its connection is still open,
+        // the user agent must abort any instance of the fetch algorithm opened by this EventSource.
+        self.cancel();
+    }
+}
+
 #[dom_struct]
-pub struct EventSource {
+pub(crate) struct EventSource {
     eventtarget: EventTarget,
+    #[no_trace]
     url: ServoUrl,
+    #[no_trace]
     request: DomRefCell<Option<RequestBuilder>>,
     last_event_id: DomRefCell<DOMString>,
-    reconnection_time: Cell<u64>,
+    reconnection_time: Cell<Duration>,
     generation_id: Cell<GenerationId>,
 
     ready_state: Cell<ReadyState>,
     with_credentials: bool,
-    canceller: DomRefCell<FetchCanceller>,
+    droppable: DroppableEventSource,
 }
 
+#[derive(Clone, MallocSizeOf)]
 enum ParserState {
     Field,
     Comment,
@@ -77,23 +107,18 @@ enum ParserState {
     Eol,
 }
 
+#[derive(Clone, MallocSizeOf)]
 struct EventSourceContext {
     incomplete_utf8: Option<utf8::Incomplete>,
-
     event_source: Trusted<EventSource>,
     gen_id: GenerationId,
-    action_sender: ipc::IpcSender<FetchResponseMsg>,
-
     parser_state: ParserState,
     field: String,
     value: String,
     origin: String,
-
     event_type: String,
     data: String,
     last_event_id: String,
-
-    resource_timing: ResourceFetchTiming,
 }
 
 impl EventSourceContext {
@@ -105,16 +130,14 @@ impl EventSourceContext {
         }
         let global = event_source.global();
         let event_source = self.event_source.clone();
-        // FIXME(nox): Why are errors silenced here?
-        let _ = global.remote_event_task_source().queue(
+        global.task_manager().remote_event_task_source().queue(
             task!(announce_the_event_source_connection: move || {
                 let event_source = event_source.root();
                 if event_source.ready_state.get() != ReadyState::Closed {
                     event_source.ready_state.set(ReadyState::Open);
-                    event_source.upcast::<EventTarget>().fire_event(atom!("open"));
+                    event_source.upcast::<EventTarget>().fire_event(atom!("open"), CanGc::note());
                 }
             }),
-            &global,
         );
     }
 
@@ -127,7 +150,7 @@ impl EventSourceContext {
         event_source.fail_the_connection();
     }
 
-    // https://html.spec.whatwg.org/multipage/#reestablish-the-connection
+    /// <https://html.spec.whatwg.org/multipage/#reestablish-the-connection>
     fn reestablish_the_connection(&self) {
         let event_source = self.event_source.root();
 
@@ -136,10 +159,9 @@ impl EventSourceContext {
         }
 
         let trusted_event_source = self.event_source.clone();
-        let action_sender = self.action_sender.clone();
         let global = event_source.global();
-        // FIXME(nox): Why are errors silenced here?
-        let _ = global.remote_event_task_source().queue(
+        let event_source_context = self.clone();
+        global.task_manager().remote_event_task_source().queue(
             task!(reestablish_the_event_source_onnection: move || {
                 let event_source = trusted_event_source.root();
 
@@ -152,10 +174,10 @@ impl EventSourceContext {
                 event_source.ready_state.set(ReadyState::Connecting);
 
                 // Step 1.3.
-                event_source.upcast::<EventTarget>().fire_event(atom!("error"));
+                event_source.upcast::<EventTarget>().fire_event(atom!("error"), CanGc::note());
 
                 // Step 2.
-                let duration = Length::new(event_source.reconnection_time.get());
+                let duration = event_source.reconnection_time.get();
 
                 // Step 3.
                 // TODO: Optionally wait some more.
@@ -164,17 +186,15 @@ impl EventSourceContext {
                 let callback = OneshotTimerCallback::EventSourceTimeout(
                     EventSourceTimeoutCallback {
                         event_source: trusted_event_source,
-                        action_sender,
+                        event_source_context,
                     }
                 );
-                // FIXME(nox): Why are errors silenced here?
-                let _ = event_source.global().schedule_callback(callback, duration);
+                event_source.global().schedule_callback(callback, duration);
             }),
-            &global,
         );
     }
 
-    // https://html.spec.whatwg.org/multipage/#processField
+    /// <https://html.spec.whatwg.org/multipage/#processField>
     fn process_field(&mut self) {
         match &*self.field {
             "event" => mem::swap(&mut self.event_type, &mut self.value),
@@ -182,10 +202,15 @@ impl EventSourceContext {
                 self.data.push_str(&self.value);
                 self.data.push('\n');
             },
-            "id" => mem::swap(&mut self.last_event_id, &mut self.value),
+            "id" if !self.value.contains('\0') => {
+                mem::swap(&mut self.last_event_id, &mut self.value);
+            },
             "retry" => {
                 if let Ok(time) = u64::from_str(&self.value) {
-                    self.event_source.root().reconnection_time.set(time);
+                    self.event_source
+                        .root()
+                        .reconnection_time
+                        .set(Duration::from_millis(time));
                 }
             },
             _ => (),
@@ -195,9 +220,8 @@ impl EventSourceContext {
         self.value.clear();
     }
 
-    // https://html.spec.whatwg.org/multipage/#dispatchMessage
-    #[allow(unsafe_code)]
-    fn dispatch_event(&mut self) {
+    /// <https://html.spec.whatwg.org/multipage/#dispatchMessage>
+    fn dispatch_event(&mut self, can_gc: CanGc) {
         let event_source = self.event_source.root();
         // Step 1
         *event_source.last_event_id.borrow_mut() = DOMString::from(self.last_event_id.clone());
@@ -222,13 +246,11 @@ impl EventSourceContext {
         // Steps 4-5
         let event = {
             let _ac = enter_realm(&*event_source);
-            rooted!(in(*event_source.global().get_cx()) let mut data = UndefinedValue());
-            unsafe {
-                self.data
-                    .to_jsval(*event_source.global().get_cx(), data.handle_mut())
-            };
+            rooted!(in(*GlobalScope::get_cx()) let mut data = UndefinedValue());
+            self.data
+                .safe_to_jsval(GlobalScope::get_cx(), data.handle_mut(), can_gc);
             MessageEvent::new(
-                &*event_source.global(),
+                &event_source.global(),
                 type_,
                 false,
                 false,
@@ -237,6 +259,7 @@ impl EventSourceContext {
                 None,
                 event_source.last_event_id.borrow().clone(),
                 Vec::with_capacity(0),
+                can_gc,
             )
         };
         // Step 7
@@ -247,20 +270,18 @@ impl EventSourceContext {
         let global = event_source.global();
         let event_source = self.event_source.clone();
         let event = Trusted::new(&*event);
-        // FIXME(nox): Why are errors silenced here?
-        let _ = global.remote_event_task_source().queue(
+        global.task_manager().remote_event_task_source().queue(
             task!(dispatch_the_event_source_event: move || {
                 let event_source = event_source.root();
                 if event_source.ready_state.get() != ReadyState::Closed {
-                    event.root().upcast::<Event>().fire(&event_source.upcast());
+                    event.root().upcast::<Event>().fire(event_source.upcast(), CanGc::note());
                 }
             }),
-            &global,
         );
     }
 
-    // https://html.spec.whatwg.org/multipage/#event-stream-interpretation
-    fn parse(&mut self, stream: Chars) {
+    /// <https://html.spec.whatwg.org/multipage/#event-stream-interpretation>
+    fn parse(&mut self, stream: Chars, can_gc: CanGc) {
         let mut stream = stream.peekable();
 
         while let Some(ch) = stream.next() {
@@ -297,12 +318,12 @@ impl EventSourceContext {
                     self.process_field();
                 },
 
-                ('\n', &ParserState::Eol) => self.dispatch_event(),
+                ('\n', &ParserState::Eol) => self.dispatch_event(can_gc),
                 ('\r', &ParserState::Eol) => {
                     if let Some(&'\n') = stream.peek() {
                         continue;
                     }
-                    self.dispatch_event();
+                    self.dispatch_event(can_gc);
                 },
 
                 ('\n', &ParserState::Comment) => self.parser_state = ParserState::Eol,
@@ -326,26 +347,35 @@ impl EventSourceContext {
 }
 
 impl FetchResponseListener for EventSourceContext {
-    fn process_request_body(&mut self) {
+    fn should_invoke(&self) -> bool {
+        self.event_source.root().generation_id.get() == self.gen_id
+    }
+
+    fn process_request_body(&mut self, _: RequestId) {
         // TODO
     }
 
-    fn process_request_eof(&mut self) {
+    fn process_request_eof(&mut self, _: RequestId) {
         // TODO
     }
 
-    fn process_response(&mut self, metadata: Result<FetchMetadata, NetworkError>) {
+    fn process_response(&mut self, _: RequestId, metadata: Result<FetchMetadata, NetworkError>) {
         match metadata {
             Ok(fm) => {
                 let meta = match fm {
                     FetchMetadata::Unfiltered(m) => m,
                     FetchMetadata::Filtered { unsafe_, filtered } => match filtered {
                         FilteredMetadata::Opaque | FilteredMetadata::OpaqueRedirect(_) => {
-                            return self.fail_the_connection()
+                            return self.fail_the_connection();
                         },
                         _ => unsafe_,
                     },
                 };
+                // Step 15.3 if res's status is not 200, or if res's `Content-Type` is not
+                // `text/event-stream`, then fail the connection.
+                if meta.status.code() != StatusCode::OK {
+                    return self.fail_the_connection();
+                }
                 let mime = match meta.content_type {
                     None => return self.fail_the_connection(),
                     Some(ct) => <ContentType as Into<Mime>>::into(ct.into_inner()),
@@ -354,36 +384,38 @@ impl FetchResponseListener for EventSourceContext {
                     return self.fail_the_connection();
                 }
                 self.origin = meta.final_url.origin().ascii_serialization();
+                // Step 15.4 announce the connection and interpret res's body line by line.
                 self.announce_the_connection();
             },
-            Err(_) => {
-                // The spec advises failing here if reconnecting would be
-                // "futile", with no more specific advice; WPT tests
-                // consider a non-http(s) scheme to be futile.
-                match self.event_source.root().url.scheme() {
-                    "http" | "https" => self.reestablish_the_connection(),
-                    _ => self.fail_the_connection(),
+            Err(error) => {
+                // Step 15.2 if res is a network error, then reestablish the connection, unless
+                // the user agent knows that to be futile, in which case the user agent may
+                // fail the connection.
+                if error.is_permanent_failure() {
+                    self.fail_the_connection()
+                } else {
+                    self.reestablish_the_connection()
                 }
             },
         }
     }
 
-    fn process_response_chunk(&mut self, chunk: Vec<u8>) {
+    fn process_response_chunk(&mut self, _: RequestId, chunk: Vec<u8>) {
         let mut input = &*chunk;
         if let Some(mut incomplete) = self.incomplete_utf8.take() {
             match incomplete.try_complete(input) {
                 None => return,
                 Some((result, remaining_input)) => {
-                    self.parse(result.unwrap_or("\u{FFFD}").chars());
+                    self.parse(result.unwrap_or("\u{FFFD}").chars(), CanGc::note());
                     input = remaining_input;
                 },
             }
         }
 
         while !input.is_empty() {
-            match utf8::decode(&input) {
+            match utf8::decode(input) {
                 Ok(s) => {
-                    self.parse(s.chars());
+                    self.parse(s.chars(), CanGc::note());
                     return;
                 },
                 Err(utf8::DecodeError::Invalid {
@@ -391,15 +423,15 @@ impl FetchResponseListener for EventSourceContext {
                     remaining_input,
                     ..
                 }) => {
-                    self.parse(valid_prefix.chars());
-                    self.parse("\u{FFFD}".chars());
+                    self.parse(valid_prefix.chars(), CanGc::note());
+                    self.parse("\u{FFFD}".chars(), CanGc::note());
                     input = remaining_input;
                 },
                 Err(utf8::DecodeError::Incomplete {
                     valid_prefix,
                     incomplete_suffix,
                 }) => {
-                    self.parse(valid_prefix.chars());
+                    self.parse(valid_prefix.chars(), CanGc::note());
                     self.incomplete_utf8 = Some(incomplete_suffix);
                     return;
                 },
@@ -407,23 +439,23 @@ impl FetchResponseListener for EventSourceContext {
         }
     }
 
-    fn process_response_eof(&mut self, _response: Result<ResourceFetchTiming, NetworkError>) {
-        if let Some(_) = self.incomplete_utf8.take() {
-            self.parse("\u{FFFD}".chars());
+    fn process_response_eof(
+        mut self,
+        _: RequestId,
+        response: Result<ResourceFetchTiming, NetworkError>,
+    ) {
+        if self.incomplete_utf8.take().is_some() {
+            self.parse("\u{FFFD}".chars(), CanGc::note());
         }
-        self.reestablish_the_connection();
+        if let Ok(response) = response {
+            self.reestablish_the_connection();
+            network_listener::submit_timing(&self, &response, CanGc::note());
+        }
     }
 
-    fn resource_timing_mut(&mut self) -> &mut ResourceFetchTiming {
-        &mut self.resource_timing
-    }
-
-    fn resource_timing(&self) -> &ResourceFetchTiming {
-        &self.resource_timing
-    }
-
-    fn submit_resource_timing(&mut self) {
-        network_listener::submit_timing(self)
+    fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<Violation>) {
+        let global = &self.resource_timing_global();
+        global.report_csp_violations(violations, None, None);
     }
 }
 
@@ -437,125 +469,140 @@ impl ResourceTimingListener for EventSourceContext {
     }
 }
 
-impl PreInvoke for EventSourceContext {
-    fn should_invoke(&self) -> bool {
-        self.event_source.root().generation_id.get() == self.gen_id
-    }
-}
-
 impl EventSource {
     fn new_inherited(url: ServoUrl, with_credentials: bool) -> EventSource {
         EventSource {
             eventtarget: EventTarget::new_inherited(),
-            url: url,
+            url,
             request: DomRefCell::new(None),
             last_event_id: DomRefCell::new(DOMString::from("")),
             reconnection_time: Cell::new(DEFAULT_RECONNECTION_TIME),
             generation_id: Cell::new(GenerationId(0)),
 
             ready_state: Cell::new(ReadyState::Connecting),
-            with_credentials: with_credentials,
-            canceller: DomRefCell::new(Default::default()),
+            with_credentials,
+            droppable: DroppableEventSource::new(DomRefCell::new(Default::default())),
         }
     }
 
-    fn new(global: &GlobalScope, url: ServoUrl, with_credentials: bool) -> DomRoot<EventSource> {
-        reflect_dom_object(
+    fn new(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        url: ServoUrl,
+        with_credentials: bool,
+        can_gc: CanGc,
+    ) -> DomRoot<EventSource> {
+        reflect_dom_object_with_proto(
             Box::new(EventSource::new_inherited(url, with_credentials)),
             global,
+            proto,
+            can_gc,
         )
     }
 
     // https://html.spec.whatwg.org/multipage/#sse-processing-model:fail-the-connection-3
-    pub fn cancel(&self) {
-        self.canceller.borrow_mut().cancel();
+    pub(crate) fn cancel(&self) {
+        self.droppable.cancel();
         self.fail_the_connection();
     }
 
     /// <https://html.spec.whatwg.org/multipage/#fail-the-connection>
-    pub fn fail_the_connection(&self) {
+    pub(crate) fn fail_the_connection(&self) {
         let global = self.global();
         let event_source = Trusted::new(self);
-        // FIXME(nox): Why are errors silenced here?
-        let _ = global.remote_event_task_source().queue(
+        global.task_manager().remote_event_task_source().queue(
             task!(fail_the_event_source_connection: move || {
                 let event_source = event_source.root();
                 if event_source.ready_state.get() != ReadyState::Closed {
                     event_source.ready_state.set(ReadyState::Closed);
-                    event_source.upcast::<EventTarget>().fire_event(atom!("error"));
+                    event_source.upcast::<EventTarget>().fire_event(atom!("error"), CanGc::note());
                 }
             }),
-            &global,
         );
     }
 
-    pub fn request(&self) -> RequestBuilder {
+    pub(crate) fn request(&self) -> RequestBuilder {
         self.request.borrow().clone().unwrap()
     }
 
-    pub fn url(&self) -> &ServoUrl {
+    pub(crate) fn url(&self) -> &ServoUrl {
         &self.url
     }
+}
 
-    // https://html.spec.whatwg.org/multipage/#dom-eventsource
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+impl EventSourceMethods<crate::DomTypeHolder> for EventSource {
+    /// <https://html.spec.whatwg.org/multipage/#dom-eventsource>
+    fn Constructor(
         global: &GlobalScope,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
         url: DOMString,
         event_source_init: &EventSourceInit,
     ) -> Fallible<DomRoot<EventSource>> {
         // TODO: Step 2 relevant settings object
-        // Step 3
+        // Step 3 Let urlRecord be the result of encoding-parsing a URL given url,
+        // relative to settings.
         let base_url = global.api_base_url();
-        let url_record = match base_url.join(&*url) {
+        let url_record = match base_url.join(&url.str()) {
             Ok(u) => u,
-            //  Step 4
-            Err(_) => return Err(Error::Syntax),
+            // Step 4 If urlRecord is failure, then throw a "SyntaxError" DOMException.
+            Err(_) => return Err(Error::Syntax(None)),
         };
-        // Step 1, 5
-        let ev = EventSource::new(
+        // Step 1 Let ev be a new EventSource object.
+        let event_source = EventSource::new(
             global,
+            proto,
+            // Step 5 Set ev's url to urlRecord.
             url_record.clone(),
             event_source_init.withCredentials,
+            can_gc,
         );
-        global.track_event_source(&ev);
-        // Steps 6-7
+        global.track_event_source(&event_source);
         let cors_attribute_state = if event_source_init.withCredentials {
+            // Step 7 If the value of eventSourceInitDict's withCredentials member is true,
+            // then set corsAttributeState to Use Credentials and set ev's withCredentials
+            // attribute to true.
             CorsSettings::UseCredentials
         } else {
+            // Step 6 Let corsAttributeState be Anonymous.
             CorsSettings::Anonymous
         };
-        // Step 8
+        // Step 8 Let request be the result of creating a potential-CORS request
+        // given urlRecord, the empty string, and corsAttributeState.
         // TODO: Step 9 set request's client settings
         let mut request = create_a_potential_cors_request(
+            global.webview_id(),
             url_record,
             Destination::None,
             Some(cors_attribute_state),
             Some(true),
             global.get_referrer(),
         )
-        .origin(global.origin().immutable().clone())
-        .pipeline_id(Some(global.pipeline_id()));
+        .with_global_scope(global);
 
-        // Step 10
+        // Step 10 User agents may set (`Accept`, `text/event-stream`) in request's header list.
         // TODO(eijebong): Replace once typed headers allow it
         request.headers.insert(
             header::ACCEPT,
             HeaderValue::from_static("text/event-stream"),
         );
-        // Step 11
+        // Step 11 Set request's cache mode to "no-store".
         request.cache_mode = CacheMode::NoStore;
-        // Step 12
-        *ev.request.borrow_mut() = Some(request.clone());
-        // Step 14
-        let (action_sender, action_receiver) = ipc::channel().unwrap();
+        // Step 13 Set ev's request to request.
+        *event_source.request.borrow_mut() = Some(request.clone());
+        // Step 14 Let processEventSourceEndOfBody given response res be the following step:
+        // if res is not a network error, then reestablish the connection.
+
+        event_source.droppable.set_canceller(FetchCanceller::new(
+            request.id,
+            false,
+            global.core_resource_thread(),
+        ));
+
         let context = EventSourceContext {
             incomplete_utf8: None,
-
-            event_source: Trusted::new(&ev),
-            gen_id: ev.generation_id.get(),
-            action_sender: action_sender.clone(),
-
+            event_source: Trusted::new(&event_source),
+            gen_id: event_source.generation_id.get(),
             parser_state: ParserState::Eol,
             field: String::new(),
             value: String::new(),
@@ -564,42 +611,15 @@ impl EventSource {
             event_type: String::new(),
             data: String::new(),
             last_event_id: String::new(),
-            resource_timing: ResourceFetchTiming::new(ResourceTimingType::Resource),
         };
-        let listener = NetworkListener {
-            context: Arc::new(Mutex::new(context)),
-            task_source: global.networking_task_source(),
-            canceller: Some(global.task_canceller(TaskSourceName::Networking)),
-        };
-        ROUTER.add_route(
-            action_receiver.to_opaque(),
-            Box::new(move |message| {
-                listener.notify_fetch(message.to().unwrap());
-            }),
-        );
-        let cancel_receiver = ev.canceller.borrow_mut().initialize();
-        global
-            .core_resource_thread()
-            .send(CoreResourceMsg::Fetch(
-                request,
-                FetchChannels::ResponseMsg(action_sender, Some(cancel_receiver)),
-            ))
-            .unwrap();
-        // Step 13
-        Ok(ev)
-    }
-}
 
-// https://html.spec.whatwg.org/multipage/#garbage-collection-2
-impl Drop for EventSource {
-    fn drop(&mut self) {
-        // If an EventSource object is garbage collected while its connection is still open,
-        // the user agent must abort any instance of the fetch algorithm opened by this EventSource.
-        self.canceller.borrow_mut().cancel();
-    }
-}
+        let task_source = global.task_manager().networking_task_source().into();
+        global.fetch(request, context, task_source);
 
-impl EventSourceMethods for EventSource {
+        // Step 16 Return ev.
+        Ok(event_source)
+    }
+
     // https://html.spec.whatwg.org/multipage/#handler-eventsource-onopen
     event_handler!(open, GetOnopen, SetOnopen);
 
@@ -609,65 +629,67 @@ impl EventSourceMethods for EventSource {
     // https://html.spec.whatwg.org/multipage/#handler-eventsource-onerror
     event_handler!(error, GetOnerror, SetOnerror);
 
-    // https://html.spec.whatwg.org/multipage/#dom-eventsource-url
+    /// <https://html.spec.whatwg.org/multipage/#dom-eventsource-url>
     fn Url(&self) -> DOMString {
         DOMString::from(self.url.as_str())
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-eventsource-withcredentials
+    /// <https://html.spec.whatwg.org/multipage/#dom-eventsource-withcredentials>
     fn WithCredentials(&self) -> bool {
         self.with_credentials
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-eventsource-readystate
+    /// <https://html.spec.whatwg.org/multipage/#dom-eventsource-readystate>
     fn ReadyState(&self) -> u16 {
         self.ready_state.get() as u16
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-eventsource-close
+    /// <https://html.spec.whatwg.org/multipage/#dom-eventsource-close>
     fn Close(&self) {
         let GenerationId(prev_id) = self.generation_id.get();
         self.generation_id.set(GenerationId(prev_id + 1));
-        self.canceller.borrow_mut().cancel();
+        self.droppable.cancel();
         self.ready_state.set(ReadyState::Closed);
     }
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
-pub struct EventSourceTimeoutCallback {
+pub(crate) struct EventSourceTimeoutCallback {
     #[ignore_malloc_size_of = "Because it is non-owning"]
     event_source: Trusted<EventSource>,
-    #[ignore_malloc_size_of = "Because it is non-owning"]
-    action_sender: ipc::IpcSender<FetchResponseMsg>,
+    #[no_trace]
+    event_source_context: EventSourceContext,
 }
 
 impl EventSourceTimeoutCallback {
-    // https://html.spec.whatwg.org/multipage/#reestablish-the-connection
-    pub fn invoke(self) {
+    /// <https://html.spec.whatwg.org/multipage/#reestablish-the-connection>
+    pub(crate) fn invoke(self) {
         let event_source = self.event_source.root();
         let global = event_source.global();
-        // Step 5.1
+
+        // Step 5.1: If the EventSource object's readyState attribute is not set to CONNECTING, then return.
         if event_source.ready_state.get() != ReadyState::Connecting {
             return;
         }
-        // Step 5.2
+
+        // Step 5.2: Let request be the EventSource object's request.
         let mut request = event_source.request();
-        // Step 5.3
+
+        // Step 5.3: If the EventSource object's last event ID string is not the empty string, then:
+        //  - Let lastEventIDValue be the EventSource object's last event ID string, encoded as UTF-8.
+        //  - Set (`Last-Event-ID`, lastEventIDValue) in request's header list.
         if !event_source.last_event_id.borrow().is_empty() {
-            //TODO(eijebong): Change this once typed header support custom values
+            // TODO(eijebong): Change this once typed header support custom values
             request.headers.insert(
                 HeaderName::from_static("last-event-id"),
                 HeaderValue::from_str(&String::from(event_source.last_event_id.borrow().clone()))
                     .unwrap(),
             );
         }
-        // Step 5.4
-        global
-            .core_resource_thread()
-            .send(CoreResourceMsg::Fetch(
-                request,
-                FetchChannels::ResponseMsg(self.action_sender, None),
-            ))
-            .unwrap();
+
+        // Step 5.4: Fetch request and process the response obtained in this fashion, if
+        // any, as described earlier in this section.
+        let task_source = global.task_manager().networking_task_source().into();
+        global.fetch(request, self.event_source_context, task_source);
     }
 }

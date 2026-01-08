@@ -2,41 +2,26 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-#[macro_use]
-extern crate log;
-#[macro_use]
-extern crate malloc_size_of_derive;
+use std::cell::Cell;
+use std::cmp::Ordering;
+use std::time::Duration;
 
-use gfx_traits::Epoch;
-use ipc_channel::ipc::IpcSender;
-use msg::constellation_msg::PipelineId;
-use profile_traits::time::TimerMetadata;
-use profile_traits::time::{send_profile_data, ProfilerCategory, ProfilerChan};
-use script_traits::{ConstellationControlMsg, LayoutMsg, ProgressiveWebMetricType};
+use base::cross_process_instant::CrossProcessInstant;
+use compositing_traits::largest_contentful_paint_candidate::LargestContentfulPaintType;
+use malloc_size_of_derive::MallocSizeOf;
+use profile_traits::time::{
+    ProfilerCategory, ProfilerChan, TimerMetadata, TimerMetadataFrameType, TimerMetadataReflowType,
+    send_profile_data,
+};
+use script_traits::ProgressiveWebMetricType;
 use servo_config::opts;
 use servo_url::ServoUrl;
-use std::cell::{Cell, RefCell};
-use std::cmp::Ordering;
-use std::collections::HashMap;
-use time::precise_time_ns;
-
-pub trait ProfilerMetadataFactory {
-    fn new_metadata(&self) -> Option<TimerMetadata>;
-}
-
-pub trait ProgressiveWebMetric {
-    fn get_navigation_start(&self) -> Option<u64>;
-    fn set_navigation_start(&mut self, time: u64);
-    fn get_time_profiler_chan(&self) -> &ProfilerChan;
-    fn send_queued_constellation_msg(&self, name: ProgressiveWebMetricType, time: u64);
-    fn get_url(&self) -> &ServoUrl;
-}
 
 /// TODO make this configurable
 /// maximum task time is 50ms (in ns)
-pub const MAX_TASK_NS: u64 = 50000000;
-/// 10 second window (in ns)
-const INTERACTIVE_WINDOW_SECONDS_IN_NS: u64 = 10000000000;
+pub const MAX_TASK_NS: u128 = 50000000;
+/// 10 second window
+const INTERACTIVE_WINDOW_SECONDS: Duration = Duration::from_secs(10);
 
 pub trait ToMs<T> {
     fn to_ms(&self) -> T;
@@ -48,67 +33,74 @@ impl ToMs<f64> for u64 {
     }
 }
 
-fn set_metric<U: ProgressiveWebMetric>(
-    pwm: &U,
+fn set_metric(
+    pwm: &ProgressiveWebMetrics,
     metadata: Option<TimerMetadata>,
     metric_type: ProgressiveWebMetricType,
     category: ProfilerCategory,
-    attr: &Cell<Option<u64>>,
-    metric_time: Option<u64>,
+    attr: &Cell<Option<CrossProcessInstant>>,
+    metric_time: CrossProcessInstant,
     url: &ServoUrl,
 ) {
-    let navigation_start = match pwm.get_navigation_start() {
-        Some(time) => time,
-        None => {
-            warn!("Trying to set metric before navigation start");
-            return;
-        },
-    };
-    let now = match metric_time {
-        Some(time) => time,
-        None => precise_time_ns(),
-    };
-    let time = now - navigation_start;
-    attr.set(Some(time));
-
-    // Queue performance observer notification.
-    pwm.send_queued_constellation_msg(metric_type, time);
+    attr.set(Some(metric_time));
 
     // Send the metric to the time profiler.
     send_profile_data(
         category,
         metadata,
-        &pwm.get_time_profiler_chan(),
-        time,
-        time,
+        pwm.time_profiler_chan(),
+        metric_time,
+        metric_time,
     );
 
     // Print the metric to console if the print-pwm option was given.
     if opts::get().print_pwm {
+        let navigation_start = pwm
+            .navigation_start()
+            .unwrap_or_else(CrossProcessInstant::epoch);
         println!(
-            "Navigation start: {}",
-            pwm.get_navigation_start().unwrap().to_ms()
+            "{:?} {:?} {:?}",
+            url,
+            metric_type,
+            (metric_time - navigation_start).as_seconds_f64()
         );
-        println!("{:?} {:?} {:?}", url, metric_type, time.to_ms());
     }
 }
 
-// spec: https://github.com/WICG/time-to-interactive
-// https://github.com/GoogleChrome/lighthouse/issues/27
-// we can look at three different metrics here:
-// navigation start -> visually ready (dom content loaded)
-// navigation start -> thread ready (main thread available)
-// visually ready -> thread ready
+/// A data structure to track web metrics dfined in various specifications:
+///
+///  - <https://w3c.github.io/paint-timing/>
+///  - <https://github.com/WICG/time-to-interactive> / <https://github.com/GoogleChrome/lighthouse/issues/27>
+///
+///  We can look at three different metrics here:
+///    - navigation start -> visually ready (dom content loaded)
+///    - navigation start -> thread ready (main thread available)
+///    - visually ready -> thread ready
 #[derive(MallocSizeOf)]
-pub struct InteractiveMetrics {
+pub struct ProgressiveWebMetrics {
+    /// Whether or not this metric is for an `<iframe>` or a top level frame.
+    frame_type: TimerMetadataFrameType,
     /// when we navigated to the page
-    navigation_start: Option<u64>,
+    navigation_start: Option<CrossProcessInstant>,
     /// indicates if the page is visually ready
-    dom_content_loaded: Cell<Option<u64>>,
+    dom_content_loaded: Cell<Option<CrossProcessInstant>>,
     /// main thread is available -- there's been a 10s window with no tasks longer than 50ms
-    main_thread_available: Cell<Option<u64>>,
+    main_thread_available: Cell<Option<CrossProcessInstant>>,
     // max(main_thread_available, dom_content_loaded)
-    time_to_interactive: Cell<Option<u64>>,
+    time_to_interactive: Cell<Option<CrossProcessInstant>>,
+    /// The first paint of a particular document.
+    /// TODO(mrobinson): It's unclear if this particular metric is reflected in the specification.
+    ///
+    /// See <https://w3c.github.io/paint-timing/#sec-reporting-paint-timing>.
+    first_paint: Cell<Option<CrossProcessInstant>>,
+    /// The first "contentful" paint of a particular document.
+    ///
+    /// See <https://w3c.github.io/paint-timing/#first-contentful-paint>
+    first_contentful_paint: Cell<Option<CrossProcessInstant>>,
+    /// The time at which the largest contentful paint was rendered.
+    ///
+    /// See <https://www.w3.org/TR/largest-contentful-paint/>
+    largest_contentful_paint: Cell<Option<CrossProcessInstant>>,
     #[ignore_malloc_size_of = "can't measure channels"]
     time_profiler_chan: ProfilerChan,
     url: ServoUrl,
@@ -116,30 +108,32 @@ pub struct InteractiveMetrics {
 
 #[derive(Clone, Copy, Debug, MallocSizeOf)]
 pub struct InteractiveWindow {
-    start: u64,
+    start: CrossProcessInstant,
+}
+
+impl Default for InteractiveWindow {
+    fn default() -> Self {
+        Self {
+            start: CrossProcessInstant::now(),
+        }
+    }
 }
 
 impl InteractiveWindow {
-    pub fn new() -> InteractiveWindow {
-        InteractiveWindow {
-            start: precise_time_ns(),
-        }
-    }
-
     // We need to either start or restart the 10s window
     //   start: we've added a new document
     //   restart: there was a task > 50ms
     //   not all documents are interactive
     pub fn start_window(&mut self) {
-        self.start = precise_time_ns();
+        self.start = CrossProcessInstant::now();
     }
 
     /// check if 10s has elapsed since start
     pub fn needs_check(&self) -> bool {
-        precise_time_ns() - self.start >= INTERACTIVE_WINDOW_SECONDS_IN_NS
+        CrossProcessInstant::now() - self.start > INTERACTIVE_WINDOW_SECONDS
     }
 
-    pub fn get_start(&self) -> u64 {
+    pub fn get_start(&self) -> CrossProcessInstant {
         self.start
     }
 }
@@ -147,47 +141,132 @@ impl InteractiveWindow {
 #[derive(Debug)]
 pub enum InteractiveFlag {
     DOMContentLoaded,
-    TimeToInteractive(u64),
+    TimeToInteractive(CrossProcessInstant),
 }
 
-impl InteractiveMetrics {
-    pub fn new(time_profiler_chan: ProfilerChan, url: ServoUrl) -> InteractiveMetrics {
-        InteractiveMetrics {
+impl ProgressiveWebMetrics {
+    pub fn new(
+        time_profiler_chan: ProfilerChan,
+        url: ServoUrl,
+        frame_type: TimerMetadataFrameType,
+    ) -> ProgressiveWebMetrics {
+        ProgressiveWebMetrics {
+            frame_type,
             navigation_start: None,
             dom_content_loaded: Cell::new(None),
             main_thread_available: Cell::new(None),
             time_to_interactive: Cell::new(None),
-            time_profiler_chan: time_profiler_chan,
+            first_paint: Cell::new(None),
+            first_contentful_paint: Cell::new(None),
+            largest_contentful_paint: Cell::new(None),
+            time_profiler_chan,
             url,
+        }
+    }
+
+    fn make_metadata(&self, first_reflow: bool) -> TimerMetadata {
+        TimerMetadata {
+            url: self.url.to_string(),
+            iframe: self.frame_type.clone(),
+            incremental: match first_reflow {
+                true => TimerMetadataReflowType::FirstReflow,
+                false => TimerMetadataReflowType::Incremental,
+            },
         }
     }
 
     pub fn set_dom_content_loaded(&self) {
         if self.dom_content_loaded.get().is_none() {
-            self.dom_content_loaded.set(Some(precise_time_ns()));
+            self.dom_content_loaded
+                .set(Some(CrossProcessInstant::now()));
         }
     }
 
-    pub fn set_main_thread_available(&self, time: u64) {
+    pub fn set_main_thread_available(&self, time: CrossProcessInstant) {
         if self.main_thread_available.get().is_none() {
             self.main_thread_available.set(Some(time));
         }
     }
 
-    pub fn get_dom_content_loaded(&self) -> Option<u64> {
+    pub fn dom_content_loaded(&self) -> Option<CrossProcessInstant> {
         self.dom_content_loaded.get()
     }
 
-    pub fn get_main_thread_available(&self) -> Option<u64> {
+    pub fn first_paint(&self) -> Option<CrossProcessInstant> {
+        self.first_paint.get()
+    }
+
+    pub fn first_contentful_paint(&self) -> Option<CrossProcessInstant> {
+        self.first_contentful_paint.get()
+    }
+
+    pub fn largest_contentful_paint(&self) -> Option<CrossProcessInstant> {
+        self.largest_contentful_paint.get()
+    }
+
+    pub fn main_thread_available(&self) -> Option<CrossProcessInstant> {
         self.main_thread_available.get()
+    }
+
+    pub fn set_performance_paint_metric(
+        &self,
+        paint_time: CrossProcessInstant,
+        first_reflow: bool,
+        metric_type: ProgressiveWebMetricType,
+    ) {
+        match metric_type {
+            ProgressiveWebMetricType::FirstPaint => self.set_first_paint(paint_time, first_reflow),
+            ProgressiveWebMetricType::FirstContentfulPaint => {
+                self.set_first_contentful_paint(paint_time, first_reflow)
+            },
+            _ => {},
+        }
+    }
+
+    fn set_first_paint(&self, paint_time: CrossProcessInstant, first_reflow: bool) {
+        set_metric(
+            self,
+            Some(self.make_metadata(first_reflow)),
+            ProgressiveWebMetricType::FirstPaint,
+            ProfilerCategory::TimeToFirstPaint,
+            &self.first_paint,
+            paint_time,
+            &self.url,
+        );
+    }
+
+    fn set_first_contentful_paint(&self, paint_time: CrossProcessInstant, first_reflow: bool) {
+        set_metric(
+            self,
+            Some(self.make_metadata(first_reflow)),
+            ProgressiveWebMetricType::FirstContentfulPaint,
+            ProfilerCategory::TimeToFirstContentfulPaint,
+            &self.first_contentful_paint,
+            paint_time,
+            &self.url,
+        );
+    }
+
+    pub fn set_largest_contentful_paint(
+        &self,
+        paint_time: CrossProcessInstant,
+        area: usize,
+        lcp_type: LargestContentfulPaintType,
+    ) {
+        set_metric(
+            self,
+            Some(self.make_metadata(false)),
+            ProgressiveWebMetricType::LargestContentfulPaint { area, lcp_type },
+            ProfilerCategory::TimeToLargestContentfulPaint,
+            &self.largest_contentful_paint,
+            paint_time,
+            &self.url,
+        );
     }
 
     // can set either dlc or tti first, but both must be set to actually calc metric
     // when the second is set, set_tti is called with appropriate time
-    pub fn maybe_set_tti<T>(&self, profiler_metadata_factory: &T, metric: InteractiveFlag)
-    where
-        T: ProfilerMetadataFactory,
-    {
+    pub fn maybe_set_tti(&self, metric: InteractiveFlag) {
         if self.get_tti().is_some() {
             return;
         }
@@ -209,192 +288,132 @@ impl InteractiveMetrics {
         };
         set_metric(
             self,
-            profiler_metadata_factory.new_metadata(),
+            Some(self.make_metadata(true)),
             ProgressiveWebMetricType::TimeToInteractive,
             ProfilerCategory::TimeToInteractive,
             &self.time_to_interactive,
-            Some(metric_time),
+            metric_time,
             &self.url,
         );
     }
 
-    pub fn get_tti(&self) -> Option<u64> {
+    pub fn get_tti(&self) -> Option<CrossProcessInstant> {
         self.time_to_interactive.get()
     }
 
     pub fn needs_tti(&self) -> bool {
         self.get_tti().is_none()
     }
-}
 
-impl ProgressiveWebMetric for InteractiveMetrics {
-    fn get_navigation_start(&self) -> Option<u64> {
+    pub fn navigation_start(&self) -> Option<CrossProcessInstant> {
         self.navigation_start
     }
 
-    fn set_navigation_start(&mut self, time: u64) {
+    pub fn set_navigation_start(&mut self, time: CrossProcessInstant) {
         self.navigation_start = Some(time);
     }
 
-    fn send_queued_constellation_msg(&self, _name: ProgressiveWebMetricType, _time: u64) {}
-
-    fn get_time_profiler_chan(&self) -> &ProfilerChan {
+    pub fn time_profiler_chan(&self) -> &ProfilerChan {
         &self.time_profiler_chan
     }
-
-    fn get_url(&self) -> &ServoUrl {
-        &self.url
-    }
 }
 
-// https://w3c.github.io/paint-timing/
-pub struct PaintTimeMetrics {
-    pending_metrics: RefCell<HashMap<Epoch, (Option<TimerMetadata>, bool)>>,
-    navigation_start: Option<u64>,
-    first_paint: Cell<Option<u64>>,
-    first_contentful_paint: Cell<Option<u64>>,
-    pipeline_id: PipelineId,
-    time_profiler_chan: ProfilerChan,
-    constellation_chan: IpcSender<LayoutMsg>,
-    script_chan: IpcSender<ConstellationControlMsg>,
-    url: ServoUrl,
-}
+#[cfg(test)]
+mod test {
+    use base::generic_channel;
 
-impl PaintTimeMetrics {
-    pub fn new(
-        pipeline_id: PipelineId,
-        time_profiler_chan: ProfilerChan,
-        constellation_chan: IpcSender<LayoutMsg>,
-        script_chan: IpcSender<ConstellationControlMsg>,
-        url: ServoUrl,
-    ) -> PaintTimeMetrics {
-        PaintTimeMetrics {
-            pending_metrics: RefCell::new(HashMap::new()),
-            navigation_start: None,
-            first_paint: Cell::new(None),
-            first_contentful_paint: Cell::new(None),
-            pipeline_id,
-            time_profiler_chan,
-            constellation_chan,
-            script_chan,
-            url,
-        }
-    }
+    use super::*;
 
-    pub fn maybe_set_first_paint<T>(&self, profiler_metadata_factory: &T)
-    where
-        T: ProfilerMetadataFactory,
-    {
-        if self.first_paint.get().is_some() {
-            return;
-        }
-
-        set_metric(
-            self,
-            profiler_metadata_factory.new_metadata(),
-            ProgressiveWebMetricType::FirstPaint,
-            ProfilerCategory::TimeToFirstPaint,
-            &self.first_paint,
-            None,
-            &self.url,
-        );
-    }
-
-    pub fn maybe_observe_paint_time<T>(
-        &self,
-        profiler_metadata_factory: &T,
-        epoch: Epoch,
-        display_list_is_contentful: bool,
-    ) where
-        T: ProfilerMetadataFactory,
-    {
-        if self.first_paint.get().is_some() && self.first_contentful_paint.get().is_some() {
-            // If we already set all paint metrics, we just bail out.
-            return;
-        }
-
-        self.pending_metrics.borrow_mut().insert(
-            epoch,
-            (
-                profiler_metadata_factory.new_metadata(),
-                display_list_is_contentful,
-            ),
+    fn test_metrics() -> ProgressiveWebMetrics {
+        let (sender, _) = generic_channel::channel().unwrap();
+        let profiler_chan = ProfilerChan(Some(sender));
+        let mut metrics = ProgressiveWebMetrics::new(
+            profiler_chan,
+            ServoUrl::parse("about:blank").unwrap(),
+            TimerMetadataFrameType::RootWindow,
         );
 
-        // Send the pending metric information to the compositor thread.
-        // The compositor will record the current time after painting the
-        // frame with the given ID and will send the metric back to us.
-        let msg = LayoutMsg::PendingPaintMetric(self.pipeline_id, epoch);
-        if let Err(e) = self.constellation_chan.send(msg) {
-            warn!("Failed to send PendingPaintMetric {:?}", e);
-        }
+        assert!((&metrics).navigation_start().is_none());
+        assert!(metrics.get_tti().is_none());
+        assert!(metrics.first_contentful_paint().is_none());
+        assert!(metrics.first_paint().is_none());
+
+        metrics.set_navigation_start(CrossProcessInstant::now());
+
+        metrics
     }
 
-    pub fn maybe_set_metric(&self, epoch: Epoch, paint_time: u64) {
-        if self.first_paint.get().is_some() && self.first_contentful_paint.get().is_some() ||
-            self.navigation_start.is_none()
-        {
-            // If we already set all paint metrics or we have not set navigation start yet,
-            // we just bail out.
-            return;
-        }
+    #[test]
+    fn test_set_dcl() {
+        let metrics = test_metrics();
+        metrics.maybe_set_tti(InteractiveFlag::DOMContentLoaded);
+        let dcl = metrics.dom_content_loaded();
+        assert!(dcl.is_some());
 
-        if let Some(pending_metric) = self.pending_metrics.borrow_mut().remove(&epoch) {
-            let profiler_metadata = pending_metric.0;
-            set_metric(
-                self,
-                profiler_metadata.clone(),
-                ProgressiveWebMetricType::FirstPaint,
-                ProfilerCategory::TimeToFirstPaint,
-                &self.first_paint,
-                Some(paint_time),
-                &self.url,
-            );
-
-            if pending_metric.1 {
-                set_metric(
-                    self,
-                    profiler_metadata,
-                    ProgressiveWebMetricType::FirstContentfulPaint,
-                    ProfilerCategory::TimeToFirstContentfulPaint,
-                    &self.first_contentful_paint,
-                    Some(paint_time),
-                    &self.url,
-                );
-            }
-        }
+        // try to overwrite
+        metrics.maybe_set_tti(InteractiveFlag::DOMContentLoaded);
+        assert_eq!(metrics.dom_content_loaded(), dcl);
+        assert_eq!(metrics.get_tti(), None);
     }
 
-    pub fn get_first_paint(&self) -> Option<u64> {
-        self.first_paint.get()
+    #[test]
+    fn test_set_mta() {
+        let metrics = test_metrics();
+        let now = CrossProcessInstant::now();
+        metrics.maybe_set_tti(InteractiveFlag::TimeToInteractive(now));
+        let main_thread_available_time = metrics.main_thread_available();
+        assert!(main_thread_available_time.is_some());
+        assert_eq!(main_thread_available_time, Some(now));
+
+        // try to overwrite
+        metrics.maybe_set_tti(InteractiveFlag::TimeToInteractive(
+            CrossProcessInstant::now(),
+        ));
+        assert_eq!(metrics.main_thread_available(), main_thread_available_time);
+        assert_eq!(metrics.get_tti(), None);
     }
 
-    pub fn get_first_contentful_paint(&self) -> Option<u64> {
-        self.first_contentful_paint.get()
-    }
-}
+    #[test]
+    fn test_set_tti_dcl() {
+        let metrics = test_metrics();
+        let now = CrossProcessInstant::now();
+        metrics.maybe_set_tti(InteractiveFlag::TimeToInteractive(now));
+        let main_thread_available_time = metrics.main_thread_available();
+        assert!(main_thread_available_time.is_some());
 
-impl ProgressiveWebMetric for PaintTimeMetrics {
-    fn get_navigation_start(&self) -> Option<u64> {
-        self.navigation_start
-    }
+        metrics.maybe_set_tti(InteractiveFlag::DOMContentLoaded);
+        let dom_content_loaded_time = metrics.dom_content_loaded();
+        assert!(dom_content_loaded_time.is_some());
 
-    fn set_navigation_start(&mut self, time: u64) {
-        self.navigation_start = Some(time);
-    }
-
-    fn send_queued_constellation_msg(&self, name: ProgressiveWebMetricType, time: u64) {
-        let msg = ConstellationControlMsg::PaintMetric(self.pipeline_id, name, time);
-        if let Err(e) = self.script_chan.send(msg) {
-            warn!("Sending metric to script thread failed ({}).", e);
-        }
+        assert_eq!(metrics.get_tti(), dom_content_loaded_time);
     }
 
-    fn get_time_profiler_chan(&self) -> &ProfilerChan {
-        &self.time_profiler_chan
+    #[test]
+    fn test_set_tti_mta() {
+        let metrics = test_metrics();
+        metrics.maybe_set_tti(InteractiveFlag::DOMContentLoaded);
+        let dcl = metrics.dom_content_loaded();
+        assert!(dcl.is_some());
+
+        let time = CrossProcessInstant::now();
+        metrics.maybe_set_tti(InteractiveFlag::TimeToInteractive(time));
+        let mta = metrics.main_thread_available();
+        assert!(mta.is_some());
+
+        assert_eq!(metrics.get_tti(), mta);
     }
 
-    fn get_url(&self) -> &ServoUrl {
-        &self.url
+    #[test]
+    fn test_first_paint_setter() {
+        let metrics = test_metrics();
+        metrics.set_first_paint(CrossProcessInstant::now(), false);
+        assert!(metrics.first_paint().is_some());
+    }
+
+    #[test]
+    fn test_first_contentful_paint_setter() {
+        let metrics = test_metrics();
+        metrics.set_first_contentful_paint(CrossProcessInstant::now(), false);
+        assert!(metrics.first_contentful_paint().is_some());
     }
 }

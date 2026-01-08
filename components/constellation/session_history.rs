@@ -2,19 +2,19 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use crate::browsingcontext::NewBrowsingContextInfo;
-use euclid::Size2D;
-use msg::constellation_msg::{
-    BrowsingContextId, HistoryStateId, PipelineId, TopLevelBrowsingContextId,
-};
-use script_traits::LoadData;
-use servo_url::ServoUrl;
 use std::cmp::PartialEq;
-use std::{fmt, mem};
-use style_traits::CSSPixel;
+use std::fmt;
+
+use base::id::{BrowsingContextId, HistoryStateId, PipelineId, WebViewId};
+use constellation_traits::LoadData;
+use embedder_traits::ViewportDetails;
+use log::debug;
+use servo_url::ServoUrl;
+
+use crate::browsingcontext::NewBrowsingContextInfo;
 
 /// Represents the joint session history
-/// https://html.spec.whatwg.org/multipage/#joint-session-history
+/// <https://html.spec.whatwg.org/multipage/#joint-session-history>
 #[derive(Debug)]
 pub struct JointSessionHistory {
     /// Diffs used to traverse to past entries. Oldest entries are at the back,
@@ -41,7 +41,7 @@ impl JointSessionHistory {
     pub fn push_diff(&mut self, diff: SessionHistoryDiff) -> Vec<SessionHistoryDiff> {
         debug!("pushing a past entry; removing future");
         self.past.push(diff);
-        mem::replace(&mut self.future, vec![])
+        std::mem::take(&mut self.future)
     }
 
     pub fn replace_reloader(&mut self, old_reloader: NeedsToReload, new_reloader: NeedsToReload) {
@@ -56,12 +56,12 @@ impl JointSessionHistory {
         history_state_id: HistoryStateId,
         url: ServoUrl,
     ) {
-        if let Some(SessionHistoryDiff::PipelineDiff {
-            ref mut new_history_state_id,
-            ref mut new_url,
+        if let Some(SessionHistoryDiff::Pipeline {
+            new_history_state_id,
+            new_url,
             ..
         }) = self.past.iter_mut().find(|diff| match diff {
-            SessionHistoryDiff::PipelineDiff {
+            SessionHistoryDiff::Pipeline {
                 pipeline_reloader: NeedsToReload::No(id),
                 ..
             } => pipeline_id == *id,
@@ -71,12 +71,12 @@ impl JointSessionHistory {
             *new_url = url.clone();
         }
 
-        if let Some(SessionHistoryDiff::PipelineDiff {
-            ref mut old_history_state_id,
-            ref mut old_url,
+        if let Some(SessionHistoryDiff::Pipeline {
+            old_history_state_id,
+            old_url,
             ..
         }) = self.future.iter_mut().find(|diff| match diff {
-            SessionHistoryDiff::PipelineDiff {
+            SessionHistoryDiff::Pipeline {
                 pipeline_reloader: NeedsToReload::No(id),
                 ..
             } => pipeline_id == *id,
@@ -88,16 +88,16 @@ impl JointSessionHistory {
     }
 
     pub fn remove_entries_for_browsing_context(&mut self, context_id: BrowsingContextId) {
-        debug!("removing entries for context {}", context_id);
+        debug!("{}: Removing entries for browsing context", context_id);
         self.past.retain(|diff| match diff {
-            SessionHistoryDiff::BrowsingContextDiff {
+            SessionHistoryDiff::BrowsingContext {
                 browsing_context_id,
                 ..
             } => *browsing_context_id != context_id,
             _ => true,
         });
         self.future.retain(|diff| match diff {
-            SessionHistoryDiff::BrowsingContextDiff {
+            SessionHistoryDiff::BrowsingContext {
                 browsing_context_id,
                 ..
             } => *browsing_context_id != context_id,
@@ -108,12 +108,13 @@ impl JointSessionHistory {
 
 /// Represents a pending change in a session history, that will be applied
 /// once the new pipeline has loaded and completed initial layout / paint.
+#[derive(Debug)]
 pub struct SessionHistoryChange {
     /// The browsing context to change.
     pub browsing_context_id: BrowsingContextId,
 
     /// The top-level browsing context ancestor.
-    pub top_level_browsing_context_id: TopLevelBrowsingContextId,
+    pub webview_id: WebViewId,
 
     /// The pipeline for the document being loaded.
     pub new_pipeline_id: PipelineId,
@@ -125,11 +126,13 @@ pub struct SessionHistoryChange {
     /// easily available when they need to be constructed.
     pub new_browsing_context_info: Option<NewBrowsingContextInfo>,
 
-    /// The size of the viewport for the browsing context.
-    pub window_size: Size2D<f32, CSSPixel>,
+    /// The size and hidpi scale factor of the viewport for the browsing context.
+    pub viewport_details: ViewportDetails,
 }
 
 /// Represents a pipeline or discarded pipeline in a history entry.
+// FIXME: https://github.com/servo/servo/issues/34591
+#[expect(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum NeedsToReload {
     /// Represents a pipeline that has not been discarded
@@ -174,10 +177,12 @@ impl PartialEq for NeedsToReload {
 }
 
 /// Represents a the difference between two adjacent session history entries.
+// FIXME: https://github.com/servo/servo/issues/34591
+#[expect(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum SessionHistoryDiff {
     /// Represents a diff where the active pipeline of an entry changed.
-    BrowsingContextDiff {
+    BrowsingContext {
         /// The browsing context whose pipeline changed
         browsing_context_id: BrowsingContextId,
         /// The previous pipeline (used when traversing into the past)
@@ -186,7 +191,7 @@ pub enum SessionHistoryDiff {
         new_reloader: NeedsToReload,
     },
     /// Represents a diff where the active state of a pipeline changed.
-    PipelineDiff {
+    Pipeline {
         /// The pipeline whose history state changed.
         pipeline_reloader: NeedsToReload,
         /// The old history state id.
@@ -198,7 +203,7 @@ pub enum SessionHistoryDiff {
         /// The new url
         new_url: ServoUrl,
     },
-    HashDiff {
+    Hash {
         pipeline_reloader: NeedsToReload,
         old_url: ServoUrl,
         new_url: ServoUrl,
@@ -209,7 +214,7 @@ impl SessionHistoryDiff {
     /// Returns the old pipeline id if that pipeline is still alive, otherwise returns `None`
     pub fn alive_old_pipeline(&self) -> Option<PipelineId> {
         match *self {
-            SessionHistoryDiff::BrowsingContextDiff {
+            SessionHistoryDiff::BrowsingContext {
                 ref old_reloader, ..
             } => match *old_reloader {
                 NeedsToReload::No(pipeline_id) => Some(pipeline_id),
@@ -222,7 +227,7 @@ impl SessionHistoryDiff {
     /// Returns the new pipeline id if that pipeline is still alive, otherwise returns `None`
     pub fn alive_new_pipeline(&self) -> Option<PipelineId> {
         match *self {
-            SessionHistoryDiff::BrowsingContextDiff {
+            SessionHistoryDiff::BrowsingContext {
                 ref new_reloader, ..
             } => match *new_reloader {
                 NeedsToReload::No(pipeline_id) => Some(pipeline_id),
@@ -239,7 +244,7 @@ impl SessionHistoryDiff {
         reloader: &NeedsToReload,
     ) {
         match *self {
-            SessionHistoryDiff::BrowsingContextDiff {
+            SessionHistoryDiff::BrowsingContext {
                 ref mut old_reloader,
                 ref mut new_reloader,
                 ..
@@ -251,7 +256,7 @@ impl SessionHistoryDiff {
                     *new_reloader = reloader.clone();
                 }
             },
-            SessionHistoryDiff::PipelineDiff {
+            SessionHistoryDiff::Pipeline {
                 ref mut pipeline_reloader,
                 ..
             } => {
@@ -259,7 +264,7 @@ impl SessionHistoryDiff {
                     *pipeline_reloader = reloader.clone();
                 }
             },
-            SessionHistoryDiff::HashDiff {
+            SessionHistoryDiff::Hash {
                 ref mut pipeline_reloader,
                 ..
             } => {

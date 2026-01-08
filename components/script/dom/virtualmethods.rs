@@ -2,64 +2,71 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use html5ever::LocalName;
+use script_bindings::script_runtime::CanGc;
+use style::attr::AttrValue;
+
 use crate::dom::attr::Attr;
-use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::inheritance::ElementTypeId;
-use crate::dom::bindings::inheritance::HTMLElementTypeId;
-use crate::dom::bindings::inheritance::HTMLMediaElementTypeId;
-use crate::dom::bindings::inheritance::NodeTypeId;
-use crate::dom::bindings::inheritance::SVGElementTypeId;
-use crate::dom::bindings::inheritance::SVGGraphicsElementTypeId;
+use crate::dom::bindings::inheritance::{
+    Castable, DocumentFragmentTypeId, ElementTypeId, HTMLElementTypeId, HTMLMediaElementTypeId,
+    NodeTypeId, SVGElementTypeId, SVGGraphicsElementTypeId,
+};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
+use crate::dom::documentfragment::DocumentFragment;
 use crate::dom::element::{AttributeMutation, Element};
 use crate::dom::event::Event;
-use crate::dom::htmlanchorelement::HTMLAnchorElement;
-use crate::dom::htmlareaelement::HTMLAreaElement;
-use crate::dom::htmlbaseelement::HTMLBaseElement;
-use crate::dom::htmlbodyelement::HTMLBodyElement;
-use crate::dom::htmlbuttonelement::HTMLButtonElement;
-use crate::dom::htmlcanvaselement::HTMLCanvasElement;
-use crate::dom::htmldetailselement::HTMLDetailsElement;
-use crate::dom::htmlelement::HTMLElement;
-use crate::dom::htmlfieldsetelement::HTMLFieldSetElement;
-use crate::dom::htmlfontelement::HTMLFontElement;
-use crate::dom::htmlformelement::HTMLFormElement;
-use crate::dom::htmlheadelement::HTMLHeadElement;
-use crate::dom::htmlhrelement::HTMLHRElement;
-use crate::dom::htmliframeelement::HTMLIFrameElement;
-use crate::dom::htmlimageelement::HTMLImageElement;
-use crate::dom::htmlinputelement::HTMLInputElement;
-use crate::dom::htmllabelelement::HTMLLabelElement;
-use crate::dom::htmllielement::HTMLLIElement;
-use crate::dom::htmllinkelement::HTMLLinkElement;
-use crate::dom::htmlmediaelement::HTMLMediaElement;
-use crate::dom::htmlmetaelement::HTMLMetaElement;
-use crate::dom::htmlobjectelement::HTMLObjectElement;
-use crate::dom::htmloptgroupelement::HTMLOptGroupElement;
-use crate::dom::htmloptionelement::HTMLOptionElement;
-use crate::dom::htmloutputelement::HTMLOutputElement;
-use crate::dom::htmlscriptelement::HTMLScriptElement;
-use crate::dom::htmlselectelement::HTMLSelectElement;
-use crate::dom::htmlsourceelement::HTMLSourceElement;
-use crate::dom::htmlstyleelement::HTMLStyleElement;
-use crate::dom::htmltablecellelement::HTMLTableCellElement;
-use crate::dom::htmltableelement::HTMLTableElement;
-use crate::dom::htmltablerowelement::HTMLTableRowElement;
-use crate::dom::htmltablesectionelement::HTMLTableSectionElement;
-use crate::dom::htmltemplateelement::HTMLTemplateElement;
-use crate::dom::htmltextareaelement::HTMLTextAreaElement;
-use crate::dom::htmltitleelement::HTMLTitleElement;
-use crate::dom::htmlvideoelement::HTMLVideoElement;
+use crate::dom::html::htmlanchorelement::HTMLAnchorElement;
+use crate::dom::html::htmlareaelement::HTMLAreaElement;
+use crate::dom::html::htmlbaseelement::HTMLBaseElement;
+use crate::dom::html::htmlbodyelement::HTMLBodyElement;
+use crate::dom::html::htmlbuttonelement::HTMLButtonElement;
+use crate::dom::html::htmlcanvaselement::HTMLCanvasElement;
+use crate::dom::html::htmldetailselement::HTMLDetailsElement;
+use crate::dom::html::htmlelement::HTMLElement;
+use crate::dom::html::htmlfieldsetelement::HTMLFieldSetElement;
+use crate::dom::html::htmlfontelement::HTMLFontElement;
+use crate::dom::html::htmlformelement::HTMLFormElement;
+use crate::dom::html::htmlheadelement::HTMLHeadElement;
+use crate::dom::html::htmlhrelement::HTMLHRElement;
+use crate::dom::html::htmliframeelement::HTMLIFrameElement;
+use crate::dom::html::htmlimageelement::HTMLImageElement;
+use crate::dom::html::htmlinputelement::HTMLInputElement;
+use crate::dom::html::htmllabelelement::HTMLLabelElement;
+use crate::dom::html::htmllielement::HTMLLIElement;
+use crate::dom::html::htmllinkelement::HTMLLinkElement;
+use crate::dom::html::htmlmediaelement::HTMLMediaElement;
+use crate::dom::html::htmlmetaelement::HTMLMetaElement;
+use crate::dom::html::htmlmeterelement::HTMLMeterElement;
+use crate::dom::html::htmlobjectelement::HTMLObjectElement;
+use crate::dom::html::htmloptgroupelement::HTMLOptGroupElement;
+use crate::dom::html::htmloptionelement::HTMLOptionElement;
+use crate::dom::html::htmloutputelement::HTMLOutputElement;
+use crate::dom::html::htmlpreelement::HTMLPreElement;
+use crate::dom::html::htmlprogresselement::HTMLProgressElement;
+use crate::dom::html::htmlscriptelement::HTMLScriptElement;
+use crate::dom::html::htmlselectelement::HTMLSelectElement;
+use crate::dom::html::htmlslotelement::HTMLSlotElement;
+use crate::dom::html::htmlsourceelement::HTMLSourceElement;
+use crate::dom::html::htmlstyleelement::HTMLStyleElement;
+use crate::dom::html::htmltablecellelement::HTMLTableCellElement;
+use crate::dom::html::htmltablecolelement::HTMLTableColElement;
+use crate::dom::html::htmltableelement::HTMLTableElement;
+use crate::dom::html::htmltablerowelement::HTMLTableRowElement;
+use crate::dom::html::htmltablesectionelement::HTMLTableSectionElement;
+use crate::dom::html::htmltemplateelement::HTMLTemplateElement;
+use crate::dom::html::htmltextareaelement::HTMLTextAreaElement;
+use crate::dom::html::htmltitleelement::HTMLTitleElement;
+use crate::dom::html::htmlvideoelement::HTMLVideoElement;
 use crate::dom::node::{BindContext, ChildrenMutation, CloneChildrenFlag, Node, UnbindContext};
-use crate::dom::svgelement::SVGElement;
-use crate::dom::svgsvgelement::SVGSVGElement;
-use html5ever::LocalName;
-use style::attr::AttrValue;
+use crate::dom::shadowroot::ShadowRoot;
+use crate::dom::svg::svgelement::SVGElement;
+use crate::dom::svg::svgimageelement::SVGImageElement;
+use crate::dom::svg::svgsvgelement::SVGSVGElement;
 
 /// Trait to allow DOM nodes to opt-in to overriding (or adding to) common
 /// behaviours. Replicates the effect of C++ virtual methods.
-pub trait VirtualMethods {
+pub(crate) trait VirtualMethods {
     /// Returns self as the superclass of the implementation for this trait,
     /// if any.
     fn super_type(&self) -> Option<&dyn VirtualMethods>;
@@ -67,9 +74,9 @@ pub trait VirtualMethods {
     /// Called when attributes of a node are mutated.
     /// <https://dom.spec.whatwg.org/#attribute-is-set>
     /// <https://dom.spec.whatwg.org/#attribute-is-removed>
-    fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation) {
+    fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation, can_gc: CanGc) {
         if let Some(s) = self.super_type() {
-            s.attribute_mutated(attr, mutation);
+            s.attribute_mutated(attr, mutation, can_gc);
         }
     }
 
@@ -86,47 +93,54 @@ pub trait VirtualMethods {
     /// on this element.
     fn parse_plain_attribute(&self, name: &LocalName, value: DOMString) -> AttrValue {
         match self.super_type() {
-            Some(ref s) => s.parse_plain_attribute(name, value),
+            Some(s) => s.parse_plain_attribute(name, value),
             _ => AttrValue::String(value.into()),
         }
     }
 
-    /// Called when a Node is appended to a tree, where 'tree_connected' indicates
-    /// whether the tree is part of a Document.
-    fn bind_to_tree(&self, context: &BindContext) {
-        if let Some(ref s) = self.super_type() {
-            s.bind_to_tree(context);
+    /// Invoked during a DOM tree mutation after a node becomes connected, once all
+    /// related DOM tree mutations have been applied.
+    /// <https://dom.spec.whatwg.org/#concept-node-post-connection-ext>
+    fn post_connection_steps(&self, can_gc: CanGc) {
+        if let Some(s) = self.super_type() {
+            s.post_connection_steps(can_gc);
         }
     }
 
-    /// Called when a Node is removed from a tree, where 'tree_connected'
-    /// indicates whether the tree is part of a Document.
+    /// Called when a Node is appended to a tree.
+    fn bind_to_tree(&self, context: &BindContext, can_gc: CanGc) {
+        if let Some(s) = self.super_type() {
+            s.bind_to_tree(context, can_gc);
+        }
+    }
+
+    /// Called when a Node is removed from a tree.
     /// Implements removing steps:
     /// <https://dom.spec.whatwg.org/#concept-node-remove-ext>
-    fn unbind_from_tree(&self, context: &UnbindContext) {
-        if let Some(ref s) = self.super_type() {
-            s.unbind_from_tree(context);
+    fn unbind_from_tree(&self, context: &UnbindContext, can_gc: CanGc) {
+        if let Some(s) = self.super_type() {
+            s.unbind_from_tree(context, can_gc);
         }
     }
 
     /// Called on the parent when its children are changed.
-    fn children_changed(&self, mutation: &ChildrenMutation) {
-        if let Some(ref s) = self.super_type() {
-            s.children_changed(mutation);
+    fn children_changed(&self, mutation: &ChildrenMutation, can_gc: CanGc) {
+        if let Some(s) = self.super_type() {
+            s.children_changed(mutation, can_gc);
         }
     }
 
     /// Called during event dispatch after the bubbling phase completes.
-    fn handle_event(&self, event: &Event) {
+    fn handle_event(&self, event: &Event, can_gc: CanGc) {
         if let Some(s) = self.super_type() {
-            s.handle_event(event);
+            s.handle_event(event, can_gc);
         }
     }
 
     /// <https://dom.spec.whatwg.org/#concept-node-adopt-ext>
-    fn adopting_steps(&self, old_doc: &Document) {
-        if let Some(ref s) = self.super_type() {
-            s.adopting_steps(old_doc);
+    fn adopting_steps(&self, old_doc: &Document, can_gc: CanGc) {
+        if let Some(s) = self.super_type() {
+            s.adopting_steps(old_doc, can_gc);
         }
     }
 
@@ -136,16 +150,17 @@ pub trait VirtualMethods {
         copy: &Node,
         maybe_doc: Option<&Document>,
         clone_children: CloneChildrenFlag,
+        can_gc: CanGc,
     ) {
-        if let Some(ref s) = self.super_type() {
-            s.cloning_steps(copy, maybe_doc, clone_children);
+        if let Some(s) = self.super_type() {
+            s.cloning_steps(copy, maybe_doc, clone_children, can_gc);
         }
     }
 
     /// Called on an element when it is popped off the stack of open elements
     /// of a parser.
     fn pop(&self) {
-        if let Some(ref s) = self.super_type() {
+        if let Some(s) = self.super_type() {
             s.pop();
         }
     }
@@ -155,7 +170,7 @@ pub trait VirtualMethods {
 /// method call on the trait object will invoke the corresponding method on the
 /// concrete type, propagating up the parent hierarchy unless otherwise
 /// interrupted.
-pub fn vtable_for(node: &Node) -> &dyn VirtualMethods {
+pub(crate) fn vtable_for(node: &Node) -> &dyn VirtualMethods {
     match node.type_id() {
         NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLAnchorElement)) => {
             node.downcast::<HTMLAnchorElement>().unwrap() as &dyn VirtualMethods
@@ -222,6 +237,9 @@ pub fn vtable_for(node: &Node) -> &dyn VirtualMethods {
         NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLMetaElement)) => {
             node.downcast::<HTMLMetaElement>().unwrap() as &dyn VirtualMethods
         },
+        NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLMeterElement)) => {
+            node.downcast::<HTMLMeterElement>().unwrap() as &dyn VirtualMethods
+        },
         NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLObjectElement)) => {
             node.downcast::<HTMLObjectElement>().unwrap() as &dyn VirtualMethods
         },
@@ -234,6 +252,12 @@ pub fn vtable_for(node: &Node) -> &dyn VirtualMethods {
         NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLOutputElement)) => {
             node.downcast::<HTMLOutputElement>().unwrap() as &dyn VirtualMethods
         },
+        NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLPreElement)) => {
+            node.downcast::<HTMLPreElement>().unwrap() as &dyn VirtualMethods
+        },
+        NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLProgressElement)) => {
+            node.downcast::<HTMLProgressElement>().unwrap() as &dyn VirtualMethods
+        },
         NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLScriptElement)) => {
             node.downcast::<HTMLScriptElement>().unwrap() as &dyn VirtualMethods
         },
@@ -242,6 +266,9 @@ pub fn vtable_for(node: &Node) -> &dyn VirtualMethods {
         },
         NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLSourceElement)) => {
             node.downcast::<HTMLSourceElement>().unwrap() as &dyn VirtualMethods
+        },
+        NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLSlotElement)) => {
+            node.downcast::<HTMLSlotElement>().unwrap() as &dyn VirtualMethods
         },
         NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLStyleElement)) => {
             node.downcast::<HTMLStyleElement>().unwrap() as &dyn VirtualMethods
@@ -252,6 +279,9 @@ pub fn vtable_for(node: &Node) -> &dyn VirtualMethods {
         NodeTypeId::Element(ElementTypeId::HTMLElement(
             HTMLElementTypeId::HTMLTableCellElement,
         )) => node.downcast::<HTMLTableCellElement>().unwrap() as &dyn VirtualMethods,
+        NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLTableColElement)) => {
+            node.downcast::<HTMLTableColElement>().unwrap() as &dyn VirtualMethods
+        },
         NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLTableRowElement)) => {
             node.downcast::<HTMLTableRowElement>().unwrap() as &dyn VirtualMethods
         },
@@ -268,6 +298,9 @@ pub fn vtable_for(node: &Node) -> &dyn VirtualMethods {
             node.downcast::<HTMLTitleElement>().unwrap() as &dyn VirtualMethods
         },
         NodeTypeId::Element(ElementTypeId::SVGElement(SVGElementTypeId::SVGGraphicsElement(
+            SVGGraphicsElementTypeId::SVGImageElement,
+        ))) => node.downcast::<SVGImageElement>().unwrap() as &dyn VirtualMethods,
+        NodeTypeId::Element(ElementTypeId::SVGElement(SVGElementTypeId::SVGGraphicsElement(
             SVGGraphicsElementTypeId::SVGSVGElement,
         ))) => node.downcast::<SVGSVGElement>().unwrap() as &dyn VirtualMethods,
         NodeTypeId::Element(ElementTypeId::SVGElement(SVGElementTypeId::SVGElement)) => {
@@ -277,6 +310,12 @@ pub fn vtable_for(node: &Node) -> &dyn VirtualMethods {
             node.downcast::<Element>().unwrap() as &dyn VirtualMethods
         },
         NodeTypeId::Element(_) => node.downcast::<HTMLElement>().unwrap() as &dyn VirtualMethods,
+        NodeTypeId::DocumentFragment(DocumentFragmentTypeId::ShadowRoot) => {
+            node.downcast::<ShadowRoot>().unwrap() as &dyn VirtualMethods
+        },
+        NodeTypeId::DocumentFragment(_) => {
+            node.downcast::<DocumentFragment>().unwrap() as &dyn VirtualMethods
+        },
         _ => node as &dyn VirtualMethods,
     }
 }

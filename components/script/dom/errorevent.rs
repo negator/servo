@@ -2,28 +2,30 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::Cell;
+
+use dom_struct::dom_struct;
+use js::jsapi::Heap;
+use js::jsval::JSVal;
+use js::rust::{HandleObject, HandleValue, MutableHandleValue};
+use stylo_atoms::Atom;
+
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::ErrorEventBinding;
 use crate::dom::bindings::codegen::Bindings::ErrorEventBinding::ErrorEventMethods;
 use crate::dom::bindings::codegen::Bindings::EventBinding::EventMethods;
 use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::reflect_dom_object;
+use crate::dom::bindings::reflector::reflect_dom_object_with_proto;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::JSContext;
-use dom_struct::dom_struct;
-use js::jsapi::Heap;
-use js::jsval::JSVal;
-use js::rust::HandleValue;
-use servo_atoms::Atom;
-use std::cell::Cell;
+use crate::script_runtime::{CanGc, JSContext};
 
 #[dom_struct]
-pub struct ErrorEvent {
+pub(crate) struct ErrorEvent {
     event: Event,
     message: DomRefCell<DOMString>,
     filename: DomRefCell<DOMString>,
@@ -45,11 +47,16 @@ impl ErrorEvent {
         }
     }
 
-    pub fn new_uninitialized(global: &GlobalScope) -> DomRoot<ErrorEvent> {
-        reflect_dom_object(Box::new(ErrorEvent::new_inherited()), global)
+    fn new_uninitialized(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+    ) -> DomRoot<ErrorEvent> {
+        reflect_dom_object_with_proto(Box::new(ErrorEvent::new_inherited()), global, proto, can_gc)
     }
 
-    pub fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
         global: &GlobalScope,
         type_: Atom,
         bubbles: EventBubbles,
@@ -59,8 +66,29 @@ impl ErrorEvent {
         lineno: u32,
         colno: u32,
         error: HandleValue,
+        can_gc: CanGc,
     ) -> DomRoot<ErrorEvent> {
-        let ev = ErrorEvent::new_uninitialized(global);
+        Self::new_with_proto(
+            global, None, type_, bubbles, cancelable, message, filename, lineno, colno, error,
+            can_gc,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_proto(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        type_: Atom,
+        bubbles: EventBubbles,
+        cancelable: EventCancelable,
+        message: DOMString,
+        filename: DOMString,
+        lineno: u32,
+        colno: u32,
+        error: HandleValue,
+        can_gc: CanGc,
+    ) -> DomRoot<ErrorEvent> {
+        let ev = ErrorEvent::new_uninitialized(global, proto, can_gc);
         {
             let event = ev.upcast::<Event>();
             event.init_event(type_, bool::from(bubbles), bool::from(cancelable));
@@ -72,10 +100,14 @@ impl ErrorEvent {
         ev.error.set(error.get());
         ev
     }
+}
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+impl ErrorEventMethods<crate::DomTypeHolder> for ErrorEvent {
+    /// <https://html.spec.whatwg.org/multipage/#errorevent>
+    fn Constructor(
         global: &GlobalScope,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
         type_: DOMString,
         init: RootedTraceableBox<ErrorEventBinding::ErrorEventInit>,
     ) -> Fallible<DomRoot<ErrorEvent>> {
@@ -97,8 +129,9 @@ impl ErrorEvent {
 
         let cancelable = EventCancelable::from(init.parent.cancelable);
 
-        let event = ErrorEvent::new(
+        let event = ErrorEvent::new_with_proto(
             global,
+            proto,
             Atom::from(type_),
             bubbles,
             cancelable,
@@ -107,38 +140,38 @@ impl ErrorEvent {
             line_num,
             col_num,
             init.error.handle(),
+            can_gc,
         );
+        event.upcast::<Event>().set_composed(init.parent.composed);
         Ok(event)
     }
-}
 
-impl ErrorEventMethods for ErrorEvent {
-    // https://html.spec.whatwg.org/multipage/#dom-errorevent-lineno
+    /// <https://html.spec.whatwg.org/multipage/#dom-errorevent-lineno>
     fn Lineno(&self) -> u32 {
         self.lineno.get()
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-errorevent-colno
+    /// <https://html.spec.whatwg.org/multipage/#dom-errorevent-colno>
     fn Colno(&self) -> u32 {
         self.colno.get()
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-errorevent-message
+    /// <https://html.spec.whatwg.org/multipage/#dom-errorevent-message>
     fn Message(&self) -> DOMString {
         self.message.borrow().clone()
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-errorevent-filename
+    /// <https://html.spec.whatwg.org/multipage/#dom-errorevent-filename>
     fn Filename(&self) -> DOMString {
         self.filename.borrow().clone()
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-errorevent-error
-    fn Error(&self, _cx: JSContext) -> JSVal {
-        self.error.get()
+    /// <https://html.spec.whatwg.org/multipage/#dom-errorevent-error>
+    fn Error(&self, _cx: JSContext, mut retval: MutableHandleValue) {
+        retval.set(self.error.get());
     }
 
-    // https://dom.spec.whatwg.org/#dom-event-istrusted
+    /// <https://dom.spec.whatwg.org/#dom-event-istrusted>
     fn IsTrusted(&self) -> bool {
         self.event.IsTrusted()
     }

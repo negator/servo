@@ -2,102 +2,160 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use embedder_traits::resources::{self, Resource};
-use headers::{Header, HeaderMapExt, HeaderName, HeaderValue};
-use http::HeaderMap;
-use net_traits::pub_domains::reg_suffix;
-use net_traits::IncludeSubdomains;
-use servo_config::pref;
-use servo_url::{Host, ServoUrl};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::num::NonZeroU64;
+use std::sync::LazyLock;
+use std::time::Duration;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+use embedder_traits::resources::{self, Resource};
+use fst::{Map, MapBuilder};
+use headers::{HeaderMapExt, StrictTransportSecurity};
+use http::HeaderMap;
+use log::{debug, error, info};
+use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
+use malloc_size_of_derive::MallocSizeOf;
+use net_traits::IncludeSubdomains;
+use net_traits::pub_domains::reg_suffix;
+use serde::{Deserialize, Serialize};
+use servo_config::pref;
+use servo_url::{Host, ServoUrl};
+use time::UtcDateTime;
+
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct HstsEntry {
     pub host: String,
     pub include_subdomains: bool,
-    pub max_age: Option<u64>,
-    pub timestamp: Option<u64>,
+    // Nonzero to allow for memory optimization
+    pub expires_at: Option<NonZeroU64>,
+}
+
+// Zero and negative times are all expired
+fn unix_timestamp_to_nonzerou64(timestamp: i64) -> NonZeroU64 {
+    if timestamp <= 0 {
+        NonZeroU64::new(1).unwrap()
+    } else {
+        NonZeroU64::new(timestamp.try_into().unwrap()).unwrap()
+    }
 }
 
 impl HstsEntry {
     pub fn new(
         host: String,
         subdomains: IncludeSubdomains,
-        max_age: Option<u64>,
+        max_age: Option<Duration>,
     ) -> Option<HstsEntry> {
+        let expires_at = max_age.map(|duration| {
+            unix_timestamp_to_nonzerou64((UtcDateTime::now() + duration).unix_timestamp())
+        });
         if host.parse::<Ipv4Addr>().is_ok() || host.parse::<Ipv6Addr>().is_ok() {
             None
         } else {
             Some(HstsEntry {
-                host: host,
+                host,
                 include_subdomains: (subdomains == IncludeSubdomains::Included),
-                max_age: max_age,
-                timestamp: Some(time::get_time().sec as u64),
+                expires_at,
             })
         }
     }
 
     pub fn is_expired(&self) -> bool {
-        match (self.max_age, self.timestamp) {
-            (Some(max_age), Some(timestamp)) => {
-                (time::get_time().sec as u64) - timestamp >= max_age
+        match self.expires_at {
+            Some(timestamp) => {
+                unix_timestamp_to_nonzerou64(UtcDateTime::now().unix_timestamp()) >= timestamp
             },
-
             _ => false,
         }
     }
 
     fn matches_domain(&self, host: &str) -> bool {
-        !self.is_expired() && self.host == host
+        self.host == host
     }
 
     fn matches_subdomain(&self, host: &str) -> bool {
-        !self.is_expired() && host.ends_with(&format!(".{}", self.host))
+        host.ends_with(&format!(".{}", self.host))
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, MallocSizeOf, Serialize)]
 pub struct HstsList {
+    // Map from base domains to a list of entries that are subdomains of base domain
     pub entries_map: HashMap<String, Vec<HstsEntry>>,
 }
 
-impl HstsList {
-    pub fn new() -> HstsList {
-        HstsList {
-            entries_map: HashMap::new(),
-        }
-    }
+/// Represents the portion of the HSTS list that comes from the preload list
+/// it is split out to allow sharing between the private and public http state
+/// as well as potentially swpaping out the underlying type to something immutable
+/// and more efficient like FSTs or DAFSA/DAWGs.
+/// To generate a new version of the FST map file run `./mach update-hsts-preload`
+#[derive(Clone, Debug)]
+pub struct HstsPreloadList(pub fst::Map<Vec<u8>>);
 
+impl MallocSizeOf for HstsPreloadList {
+    #[expect(unsafe_code)]
+    fn size_of(&self, ops: &mut malloc_size_of::MallocSizeOfOps) -> usize {
+        unsafe { ops.malloc_size_of(self.0.as_fst().as_inner().as_ptr()) }
+    }
+}
+
+static PRELOAD_LIST_ENTRIES: LazyLock<HstsPreloadList> =
+    LazyLock::new(HstsPreloadList::from_servo_preload);
+
+pub fn hsts_preload_size_of(ops: &mut MallocSizeOfOps) -> usize {
+    PRELOAD_LIST_ENTRIES.size_of(ops)
+}
+
+impl HstsPreloadList {
     /// Create an `HstsList` from the bytes of a JSON preload file.
-    pub fn from_preload(preload_content: &str) -> Option<HstsList> {
-        #[derive(Deserialize)]
-        struct HstsEntries {
-            entries: Vec<HstsEntry>,
-        }
-
-        let hsts_entries: Option<HstsEntries> = serde_json::from_str(preload_content).ok();
-
-        hsts_entries.map_or(None, |hsts_entries| {
-            let mut hsts_list: HstsList = HstsList::new();
-
-            for hsts_entry in hsts_entries.entries {
-                hsts_list.push(hsts_entry);
-            }
-
-            return Some(hsts_list);
-        })
+    pub fn from_preload(preload_content: Vec<u8>) -> Option<HstsPreloadList> {
+        Map::new(preload_content).map(HstsPreloadList).ok()
     }
 
-    pub fn from_servo_preload() -> HstsList {
-        let list = resources::read_string(Resource::HstsPreloadList);
-        HstsList::from_preload(&list).expect("Servo HSTS preload file is invalid")
+    pub fn from_servo_preload() -> HstsPreloadList {
+        debug!("Intializing HSTS Preload list");
+        let map_bytes = resources::read_bytes(Resource::HstsPreloadList);
+        HstsPreloadList::from_preload(map_bytes).unwrap_or_else(|| {
+            error!("HSTS preload file is invalid. Setting HSTS list to default values");
+            HstsPreloadList(MapBuilder::memory().into_map())
+        })
     }
 
     pub fn is_host_secure(&self, host: &str) -> bool {
         let base_domain = reg_suffix(host);
-        self.entries_map.get(base_domain).map_or(false, |entries| {
-            entries.iter().any(|e| {
+        let parts = host[..host.len() - base_domain.len()].rsplit_terminator('.');
+        let mut domain_to_test = base_domain.to_owned();
+
+        if self.0.get(&domain_to_test).is_some_and(|id| {
+            // The FST map ids were constructed such that the parity represents the includeSubdomain flag
+            id % 2 == 1 || domain_to_test == host
+        }) {
+            return true;
+        }
+
+        // Check all further subdomains up to the passed host
+        for part in parts {
+            domain_to_test = format!("{}.{}", part, domain_to_test);
+            if self.0.get(&domain_to_test).is_some_and(|id| {
+                // The FST map ids were constructed such that the parity represents the includeSubdomain flag
+                id % 2 == 1 || domain_to_test == host
+            }) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+impl HstsList {
+    pub fn is_host_secure(&self, host: &str) -> bool {
+        if PRELOAD_LIST_ENTRIES.is_host_secure(host) {
+            info!("{host} is in the preload list");
+            return true;
+        }
+
+        let base_domain = reg_suffix(host);
+        self.entries_map.get(base_domain).is_some_and(|entries| {
+            entries.iter().filter(|e| !e.is_expired()).any(|e| {
                 if e.include_subdomains {
                     e.matches_subdomain(host) || e.matches_domain(host)
                 } else {
@@ -108,14 +166,16 @@ impl HstsList {
     }
 
     fn has_domain(&self, host: &str, base_domain: &str) -> bool {
-        self.entries_map.get(base_domain).map_or(false, |entries| {
-            entries.iter().any(|e| e.matches_domain(&host))
-        })
+        self.entries_map
+            .get(base_domain)
+            .is_some_and(|entries| entries.iter().any(|e| e.matches_domain(host)))
     }
 
     fn has_subdomain(&self, host: &str, base_domain: &str) -> bool {
-        self.entries_map.get(base_domain).map_or(false, |entries| {
-            entries.iter().any(|e| e.matches_subdomain(host))
+        self.entries_map.get(base_domain).is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|e| e.include_subdomains && e.matches_subdomain(host))
         })
     }
 
@@ -125,30 +185,28 @@ impl HstsList {
         let have_domain = self.has_domain(&entry.host, base_domain);
         let have_subdomain = self.has_subdomain(&entry.host, base_domain);
 
-        let entries = self
-            .entries_map
-            .entry(base_domain.to_owned())
-            .or_insert(vec![]);
+        let entries = self.entries_map.entry(base_domain.to_owned()).or_default();
         if !have_domain && !have_subdomain {
             entries.push(entry);
         } else if !have_subdomain {
-            for e in entries {
+            for e in entries.iter_mut() {
                 if e.matches_domain(&entry.host) {
                     e.include_subdomains = entry.include_subdomains;
-                    e.max_age = entry.max_age;
+                    e.expires_at = entry.expires_at;
                 }
             }
         }
+        entries.retain(|e| !e.is_expired());
     }
 
-    /// Step 2.9 of https://fetch.spec.whatwg.org/#concept-main-fetch.
+    /// Step 2.9 of <https://fetch.spec.whatwg.org/#concept-main-fetch>.
     pub fn apply_hsts_rules(&self, url: &mut ServoUrl) {
         if url.scheme() != "http" && url.scheme() != "ws" {
             return;
         }
 
-        let upgrade_scheme = if pref!(network.enforce_tls.enabled) {
-            if (!pref!(network.enforce_tls.localhost) &&
+        let upgrade_scheme = if pref!(network_enforce_tls_enabled) {
+            if (!pref!(network_enforce_tls_localhost) &&
                 match url.host() {
                     Some(Host::Domain(domain)) => {
                         domain.ends_with(".localhost") || domain == "localhost"
@@ -157,18 +215,18 @@ impl HstsList {
                     Some(Host::Ipv6(ipv6)) => ipv6.is_loopback(),
                     _ => false,
                 }) ||
-                (!pref!(network.enforce_tls.onion) &&
+                (!pref!(network_enforce_tls_onion) &&
                     url.domain()
-                        .map_or(false, |domain| domain.ends_with(".onion")))
+                        .is_some_and(|domain| domain.ends_with(".onion")))
             {
                 url.domain()
-                    .map_or(false, |domain| self.is_host_secure(domain))
+                    .is_some_and(|domain| self.is_host_secure(domain))
             } else {
                 true
             }
         } else {
             url.domain()
-                .map_or(false, |domain| self.is_host_secure(domain))
+                .is_some_and(|domain| self.is_host_secure(domain))
         };
 
         if upgrade_scheme {
@@ -187,18 +245,18 @@ impl HstsList {
 
         if let Some(header) = headers.typed_get::<StrictTransportSecurity>() {
             if let Some(host) = url.domain() {
-                let include_subdomains = if header.include_subdomains {
+                let include_subdomains = if header.include_subdomains() {
                     IncludeSubdomains::Included
                 } else {
                     IncludeSubdomains::NotIncluded
                 };
 
                 if let Some(entry) =
-                    HstsEntry::new(host.to_owned(), include_subdomains, Some(header.max_age))
+                    HstsEntry::new(host.to_owned(), include_subdomains, Some(header.max_age()))
                 {
                     info!("adding host {} to the strict transport security list", host);
-                    info!("- max-age {}", header.max_age);
-                    if header.include_subdomains {
+                    info!("- max-age {}", header.max_age().as_secs());
+                    if header.include_subdomains() {
                         info!("- includeSubdomains");
                     }
 
@@ -208,89 +266,3 @@ impl HstsList {
         }
     }
 }
-
-// TODO: Remove this with the next update of the `headers` crate
-// https://github.com/hyperium/headers/issues/61
-#[derive(Clone, Debug, PartialEq)]
-struct StrictTransportSecurity {
-    include_subdomains: bool,
-    max_age: u64,
-}
-
-enum Directive {
-    MaxAge(u64),
-    IncludeSubdomains,
-    Unknown,
-}
-
-// taken from https://github.com/hyperium/headers
-impl Header for StrictTransportSecurity {
-    fn name() -> &'static HeaderName {
-        &http::header::STRICT_TRANSPORT_SECURITY
-    }
-
-    fn decode<'i, I: Iterator<Item = &'i HeaderValue>>(
-        values: &mut I,
-    ) -> Result<Self, headers::Error> {
-        values
-            .just_one()
-            .and_then(|v| v.to_str().ok())
-            .map(|s| {
-                s.split(';')
-                    .map(str::trim)
-                    .map(|sub| {
-                        if sub.eq_ignore_ascii_case("includeSubDomains") {
-                            Some(Directive::IncludeSubdomains)
-                        } else {
-                            let mut sub = sub.splitn(2, '=');
-                            match (sub.next(), sub.next()) {
-                                (Some(left), Some(right))
-                                    if left.trim().eq_ignore_ascii_case("max-age") =>
-                                {
-                                    right
-                                        .trim()
-                                        .trim_matches('"')
-                                        .parse()
-                                        .ok()
-                                        .map(Directive::MaxAge)
-                                },
-                                _ => Some(Directive::Unknown),
-                            }
-                        }
-                    })
-                    .fold(Some((None, None)), |res, dir| match (res, dir) {
-                        (Some((None, sub)), Some(Directive::MaxAge(age))) => Some((Some(age), sub)),
-                        (Some((age, None)), Some(Directive::IncludeSubdomains)) => {
-                            Some((age, Some(())))
-                        },
-                        (Some((Some(_), _)), Some(Directive::MaxAge(_))) |
-                        (Some((_, Some(_))), Some(Directive::IncludeSubdomains)) |
-                        (_, None) => None,
-                        (res, _) => res,
-                    })
-                    .and_then(|res| match res {
-                        (Some(age), sub) => Some(StrictTransportSecurity {
-                            max_age: age,
-                            include_subdomains: sub.is_some(),
-                        }),
-                        _ => None,
-                    })
-                    .ok_or_else(headers::Error::invalid)
-            })
-            .unwrap_or_else(|| Err(headers::Error::invalid()))
-    }
-
-    fn encode<E: Extend<HeaderValue>>(&self, _values: &mut E) {}
-}
-
-trait IterExt: Iterator {
-    fn just_one(&mut self) -> Option<Self::Item> {
-        let one = self.next()?;
-        match self.next() {
-            Some(_) => None,
-            None => Some(one),
-        }
-    }
-}
-
-impl<T: Iterator> IterExt for T {}

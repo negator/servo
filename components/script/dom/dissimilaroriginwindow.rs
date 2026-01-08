@@ -2,6 +2,14 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use base::id::PipelineId;
+use constellation_traits::{ScriptToConstellationMessage, StructuredSerializedData};
+use dom_struct::dom_struct;
+use js::jsapi::{Heap, JSObject};
+use js::jsval::UndefinedValue;
+use js::rust::{CustomAutoRooter, CustomAutoRooterGuard, HandleValue, MutableHandleValue};
+use servo_url::ServoUrl;
+
 use crate::dom::bindings::codegen::Bindings::DissimilarOriginWindowBinding;
 use crate::dom::bindings::codegen::Bindings::DissimilarOriginWindowBinding::DissimilarOriginWindowMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowPostMessageOptions;
@@ -13,14 +21,7 @@ use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::dissimilaroriginlocation::DissimilarOriginLocation;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::windowproxy::WindowProxy;
-use crate::script_runtime::JSContext;
-use dom_struct::dom_struct;
-use js::jsapi::{Heap, JSObject};
-use js::jsval::{JSVal, UndefinedValue};
-use js::rust::{CustomAutoRooter, CustomAutoRooterGuard, HandleValue};
-use msg::constellation_msg::PipelineId;
-use script_traits::{ScriptMsg, StructuredSerializedData};
-use servo_url::ServoUrl;
+use crate::script_runtime::{CanGc, JSContext};
 
 /// Represents a dissimilar-origin `Window` that exists in another script thread.
 ///
@@ -32,7 +33,7 @@ use servo_url::ServoUrl;
 /// that throws security exceptions for most accessors. This is not a replacement
 /// for XOWs, but provides belt-and-braces security.
 #[dom_struct]
-pub struct DissimilarOriginWindow {
+pub(crate) struct DissimilarOriginWindow {
     /// The global for this window.
     globalscope: GlobalScope,
 
@@ -44,9 +45,11 @@ pub struct DissimilarOriginWindow {
 }
 
 impl DissimilarOriginWindow {
-    #[allow(unsafe_code)]
-    pub fn new(global_to_clone_from: &GlobalScope, window_proxy: &WindowProxy) -> DomRoot<Self> {
-        let cx = global_to_clone_from.get_cx();
+    pub(crate) fn new(
+        global_to_clone_from: &GlobalScope,
+        window_proxy: &WindowProxy,
+    ) -> DomRoot<Self> {
+        let cx = GlobalScope::get_cx();
         let win = Box::new(Self {
             globalscope: GlobalScope::new_inherited(
                 PipelineId::new(),
@@ -54,46 +57,46 @@ impl DissimilarOriginWindow {
                 global_to_clone_from.mem_profiler_chan().clone(),
                 global_to_clone_from.time_profiler_chan().clone(),
                 global_to_clone_from.script_to_constellation_chan().clone(),
-                global_to_clone_from.scheduler_chan().clone(),
+                global_to_clone_from.script_to_embedder_chan().clone(),
                 global_to_clone_from.resource_threads().clone(),
+                global_to_clone_from.storage_threads().clone(),
                 global_to_clone_from.origin().clone(),
                 global_to_clone_from.creation_url().clone(),
-                // FIXME(nox): The microtask queue is probably not important
-                // here, but this whole DOM interface is a hack anyway.
-                global_to_clone_from.microtask_queue().clone(),
-                global_to_clone_from.is_headless(),
-                global_to_clone_from.get_user_agent(),
+                global_to_clone_from.top_level_creation_url().clone(),
+                #[cfg(feature = "webgpu")]
                 global_to_clone_from.wgpu_id_hub(),
                 Some(global_to_clone_from.is_secure_context()),
+                false,
+                global_to_clone_from.font_context().cloned(),
             ),
             window_proxy: Dom::from_ref(window_proxy),
             location: Default::default(),
         });
-        unsafe { DissimilarOriginWindowBinding::Wrap(cx, win) }
+        DissimilarOriginWindowBinding::Wrap::<crate::DomTypeHolder>(cx, win)
     }
 
-    pub fn window_proxy(&self) -> DomRoot<WindowProxy> {
+    pub(crate) fn window_proxy(&self) -> DomRoot<WindowProxy> {
         DomRoot::from_ref(&*self.window_proxy)
     }
 }
 
-impl DissimilarOriginWindowMethods for DissimilarOriginWindow {
-    // https://html.spec.whatwg.org/multipage/#dom-window
+impl DissimilarOriginWindowMethods<crate::DomTypeHolder> for DissimilarOriginWindow {
+    /// <https://html.spec.whatwg.org/multipage/#dom-window>
     fn Window(&self) -> DomRoot<WindowProxy> {
         self.window_proxy()
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-self
+    /// <https://html.spec.whatwg.org/multipage/#dom-self>
     fn Self_(&self) -> DomRoot<WindowProxy> {
         self.window_proxy()
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-frames
+    /// <https://html.spec.whatwg.org/multipage/#dom-frames>
     fn Frames(&self) -> DomRoot<WindowProxy> {
         self.window_proxy()
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-parent
+    /// <https://html.spec.whatwg.org/multipage/#dom-parent>
     fn GetParent(&self) -> Option<DomRoot<WindowProxy>> {
         // Steps 1-3.
         if self.window_proxy.is_browsing_context_discarded() {
@@ -107,7 +110,7 @@ impl DissimilarOriginWindowMethods for DissimilarOriginWindow {
         Some(DomRoot::from_ref(&*self.window_proxy))
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-top
+    /// <https://html.spec.whatwg.org/multipage/#dom-top>
     fn GetTop(&self) -> Option<DomRoot<WindowProxy>> {
         // Steps 1-3.
         if self.window_proxy.is_browsing_context_discarded() {
@@ -117,24 +120,24 @@ impl DissimilarOriginWindowMethods for DissimilarOriginWindow {
         Some(DomRoot::from_ref(self.window_proxy.top()))
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-length
+    /// <https://html.spec.whatwg.org/multipage/#dom-length>
     fn Length(&self) -> u32 {
         // TODO: Implement x-origin length
         0
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-window-close
+    /// <https://html.spec.whatwg.org/multipage/#dom-window-close>
     fn Close(&self) {
         // TODO: Implement x-origin close
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-window-closed
+    /// <https://html.spec.whatwg.org/multipage/#dom-window-closed>
     fn Closed(&self) -> bool {
         // TODO: Implement x-origin close
         false
     }
 
-    /// https://html.spec.whatwg.org/multipage/#dom-window-postmessage
+    /// <https://html.spec.whatwg.org/multipage/#dom-window-postmessage>
     fn PostMessage(
         &self,
         cx: JSContext,
@@ -145,7 +148,7 @@ impl DissimilarOriginWindowMethods for DissimilarOriginWindow {
         self.post_message_impl(&target_origin, cx, message, transfer)
     }
 
-    /// https://html.spec.whatwg.org/multipage/#dom-window-postmessage-options
+    /// <https://html.spec.whatwg.org/multipage/#dom-window-postmessage-options>
     fn PostMessage_(
         &self,
         cx: JSContext,
@@ -165,36 +168,37 @@ impl DissimilarOriginWindowMethods for DissimilarOriginWindow {
         self.post_message_impl(&options.targetOrigin, cx, message, transfer)
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-opener
-    fn Opener(&self, _: JSContext) -> JSVal {
+    /// <https://html.spec.whatwg.org/multipage/#dom-opener>
+    fn Opener(&self, _: JSContext, mut retval: MutableHandleValue) {
         // TODO: Implement x-origin opener
-        UndefinedValue()
+        retval.set(UndefinedValue());
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-opener
+    /// <https://html.spec.whatwg.org/multipage/#dom-opener>
     fn SetOpener(&self, _: JSContext, _: HandleValue) {
         // TODO: Implement x-origin opener
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-window-blur
+    /// <https://html.spec.whatwg.org/multipage/#dom-window-blur>
     fn Blur(&self) {
-        // TODO: Implement x-origin blur
+        // > User agents are encouraged to ignore calls to this `blur()` method
+        // > entirely.
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-focus
+    /// <https://html.spec.whatwg.org/multipage/#dom-window-focus>
     fn Focus(&self) {
-        // TODO: Implement x-origin focus
+        self.window_proxy().focus();
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-location
-    fn Location(&self) -> DomRoot<DissimilarOriginLocation> {
+    /// <https://html.spec.whatwg.org/multipage/#dom-location>
+    fn Location(&self, can_gc: CanGc) -> DomRoot<DissimilarOriginLocation> {
         self.location
-            .or_init(|| DissimilarOriginLocation::new(self))
+            .or_init(|| DissimilarOriginLocation::new(self, can_gc))
     }
 }
 
 impl DissimilarOriginWindow {
-    /// https://html.spec.whatwg.org/multipage/#window-post-message-steps
+    /// <https://html.spec.whatwg.org/multipage/#window-post-message-steps>
     fn post_message_impl(
         &self,
         target_origin: &USVString,
@@ -208,8 +212,8 @@ impl DissimilarOriginWindow {
         self.post_message(target_origin, data)
     }
 
-    /// https://html.spec.whatwg.org/multipage/#window-post-message-steps
-    pub fn post_message(
+    /// <https://html.spec.whatwg.org/multipage/#window-post-message-steps>
+    pub(crate) fn post_message(
         &self,
         target_origin: &USVString,
         data: StructuredSerializedData,
@@ -228,17 +232,17 @@ impl DissimilarOriginWindow {
         let target_origin = match target_origin.0[..].as_ref() {
             "*" => None,
             "/" => Some(source_origin.clone()),
-            url => match ServoUrl::parse(&url) {
+            url => match ServoUrl::parse(url) {
                 Ok(url) => Some(url.origin().clone()),
-                Err(_) => return Err(Error::Syntax),
+                Err(_) => return Err(Error::Syntax(None)),
             },
         };
-        let msg = ScriptMsg::PostMessage {
+        let msg = ScriptToConstellationMessage::PostMessage {
             target,
             source: incumbent.pipeline_id(),
             source_origin,
             target_origin,
-            data: data,
+            data,
         };
         // Step 8
         let _ = incumbent.script_to_constellation_chan().send(msg);

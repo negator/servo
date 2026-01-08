@@ -7,97 +7,125 @@
 # option. This file may not be copied, modified, or distributed
 # except according to those terms.
 
-from __future__ import print_function, unicode_literals
-
 import argparse
-import re
-import sys
+import json
+import logging
 import os
 import os.path as path
-import copy
-from collections import OrderedDict
-import time
-import json
-import six.moves.urllib as urllib
-import base64
+import re
 import shutil
 import subprocess
-from xml.etree.ElementTree import XML
-from six import iteritems
+import sys
+import textwrap
+from argparse import ArgumentParser
+from pathlib import Path
+from typing import Any, List, Optional
 
-from mach.registrar import Registrar
+import tidy
+import wpt
+import wpt.manifestupdate
+import wpt.run
+import wpt.update
 from mach.decorators import (
+    Command,
     CommandArgument,
     CommandProvider,
-    Command,
 )
 
-from servo.command_base import (
-    CommandBase,
-    call, check_call, check_output,
-)
-from servo.util import host_triple
-
-from wptrunner import wptcommandline
-from update import updatecommandline
-from servo_tidy import tidy
-from servo_tidy_tests import test_tidy
+import servo.devtools_tests
+import servo.try_parser
+from servo.command_base import BuildType, CommandBase, call, check_call
+from servo.post_build_commands import PostBuildCommands
+from servo.util import delete
 
 SCRIPT_PATH = os.path.split(__file__)[0]
 PROJECT_TOPLEVEL_PATH = os.path.abspath(os.path.join(SCRIPT_PATH, "..", ".."))
-WEB_PLATFORM_TESTS_PATH = os.path.join("tests", "wpt", "web-platform-tests")
+WEB_PLATFORM_TESTS_PATH = os.path.join("tests", "wpt", "tests")
 SERVO_TESTS_PATH = os.path.join("tests", "wpt", "mozilla", "tests")
 
-CLANGFMT_CPP_DIRS = ["support/hololens/"]
-CLANGFMT_VERSION = "14"
+# Servo depends on several `rustfmt` options that are unstable. These are still
+# supported by stable `rustfmt` if they are passed as these command-line arguments.
+UNSTABLE_RUSTFMT_ARGUMENTS = [
+    "--config",
+    "unstable_features=true",
+    "--config",
+    "binop_separator=Back",
+    "--config",
+    "imports_granularity=Module",
+    "--config",
+    "group_imports=StdExternalCrate",
+]
 
-TEST_SUITES = OrderedDict([
-    ("tidy", {"kwargs": {"all_files": False, "no_progress": False, "self_test": False,
-                         "stylo": False},
-              "include_arg": "include"}),
-    ("wpt", {"kwargs": {"release": False},
-             "paths": [path.abspath(WEB_PLATFORM_TESTS_PATH),
-                       path.abspath(SERVO_TESTS_PATH)],
-             "include_arg": "include"}),
-    ("unit", {"kwargs": {},
-              "paths": [path.abspath(path.join("tests", "unit"))],
-              "include_arg": "test_name"}),
-])
-
-TEST_SUITES_BY_PREFIX = {path: k for k, v in iteritems(TEST_SUITES) if "paths" in v for path in v["paths"]}
-
-
-def create_parser_wpt():
-    import mozlog.commandline
-    parser = wptcommandline.create_parser()
-    parser.add_argument('--release', default=False, action="store_true",
-                        help="Run with a release build of servo")
-    parser.add_argument('--rr-chaos', default=False, action="store_true",
-                        help="Run under chaos mode in rr until a failure is captured")
-    parser.add_argument('--pref', default=[], action="append", dest="prefs",
-                        help="Pass preferences to servo")
-    parser.add_argument('--layout-2020', default=False, action="store_true",
-                        help="Use expected results for the 2020 layout engine")
-    parser.add_argument('--log-servojson', action="append", type=mozlog.commandline.log_file,
-                        help="Servo's JSON logger of unexpected results")
-    parser.add_argument('--always-succeed', default=False, action="store_true",
-                        help="Always yield exit code of zero")
-    parser.add_argument('--no-default-test-types', default=False, action="store_true",
-                        help="Run all of the test types provided by wptrunner or specified explicitly by --test-types"),
-    return parser
+# Listing these globs manually is a work-around for very slow `taplo` invocation
+# on MacOS machines. If `taplo` runs fast without the globs on MacOS, this
+# can be removed.
+TOML_GLOBS = [
+    "*.toml",
+    ".cargo/*.toml",
+    "components/*/*.toml",
+    "components/shared/*/*.toml",
+    "ports/*/*.toml",
+    "support/*/*.toml",
+]
 
 
-def create_parser_manifest_update():
-    import manifestupdate
-    return manifestupdate.create_parser()
+def format_toml_files_with_taplo(check_only: bool = True) -> int:
+    taplo = shutil.which("taplo")
+    if taplo is None:
+        print("Could not find `taplo`. Run `./mach bootstrap` or `cargo install taplo-cli --locked`")
+        return 1
+
+    if check_only:
+        return call([taplo, "fmt", "--check", *TOML_GLOBS], env={"RUST_LOG": "error"})
+    else:
+        return call([taplo, "fmt", *TOML_GLOBS], env={"RUST_LOG": "error"})
 
 
-def run_update(topdir, check_clean=False, rebuild=False, **kwargs):
-    import manifestupdate
-    from wptrunner import wptlogging
-    logger = wptlogging.setup(kwargs, {"mach": sys.stdout})
-    wpt_dir = os.path.abspath(os.path.join(topdir, 'tests', 'wpt'))
-    return manifestupdate.update(logger, wpt_dir, check_clean, rebuild)
+def format_python_files_with_ruff(check_only: bool = True) -> int:
+    ruff = shutil.which("ruff")
+    if ruff is None:
+        print("Could not find `ruff`. Run `./mach bootstrap`")
+        return 1
+
+    if check_only:
+        return call([ruff, "format", "--check", "--quiet"])
+    else:
+        return call([ruff, "format", "--quiet"])
+
+
+def format_with_rustfmt(check_only: bool = True) -> int:
+    maybe_check_only = ["--check"] if check_only else []
+    result = call(["cargo", "fmt", "--", *UNSTABLE_RUSTFMT_ARGUMENTS, *maybe_check_only])
+    if result != 0:
+        return result
+
+    return call(
+        [
+            "cargo",
+            "fmt",
+            "--manifest-path",
+            "support/crown/Cargo.toml",
+            "--",
+            *UNSTABLE_RUSTFMT_ARGUMENTS,
+            *maybe_check_only,
+        ]
+    )
+
+
+def pretty_print_json_decode_error(error: json.decoder.JSONDecodeError) -> None:
+    print(f"json decode error: {error}")
+    # Print section around that character that raised the json decode error.
+    snippet_radius = 25
+    start, stop = max(0, error.pos - snippet_radius), error.pos + snippet_radius
+    snippet = error.doc[start:stop]
+    print("```")
+    prefix = "... " if start != 0 else ""
+    suffix = " ..." if stop < len(error.doc) else ""
+    print(prefix, snippet, suffix, sep="")
+    # If the snippet is multiline, this won't work as expected, but it's a best effort.
+    right_justification = snippet_radius + 1 + len(suffix)
+    print("^ Offending character".rjust(right_justification))
+    print("```")
 
 
 @CommandProvider
@@ -105,100 +133,16 @@ class MachCommands(CommandBase):
     DEFAULT_RENDER_MODE = "cpu"
     HELP_RENDER_MODE = "Value can be 'cpu', 'gpu' or 'both' (default " + DEFAULT_RENDER_MODE + ")"
 
-    def __init__(self, context):
+    def __init__(self, context: Any) -> None:
         CommandBase.__init__(self, context)
         if not hasattr(self.context, "built_tests"):
             self.context.built_tests = False
 
-    @Command('test',
-             description='Run specified Servo tests',
-             category='testing')
-    @CommandArgument('params', default=None, nargs="...",
-                     help="Optionally select test based on "
-                          "test file directory")
-    @CommandArgument('--render-mode', '-rm', default=DEFAULT_RENDER_MODE,
-                     help="The render mode to be used on all tests. "
-                          + HELP_RENDER_MODE)
-    @CommandArgument('--release', default=False, action="store_true",
-                     help="Run with a release build of servo")
-    @CommandArgument('--tidy-all', default=False, action="store_true",
-                     help="Check all files, and run the WPT lint in tidy, "
-                          "even if unchanged")
-    @CommandArgument('--no-progress', default=False, action="store_true",
-                     help="Don't show progress for tidy")
-    @CommandArgument('--self-test', default=False, action="store_true",
-                     help="Run unit tests for tidy")
-    @CommandArgument('--all', default=False, action="store_true", dest="all_suites",
-                     help="Run all test suites")
-    def test(self, params, render_mode=DEFAULT_RENDER_MODE, release=False, tidy_all=False,
-             no_progress=False, self_test=False, all_suites=False):
-        suites = copy.deepcopy(TEST_SUITES)
-        suites["tidy"]["kwargs"] = {"all_files": tidy_all, "no_progress": no_progress, "self_test": self_test,
-                                    "stylo": False}
-        suites["wpt"]["kwargs"] = {"release": release}
-        suites["unit"]["kwargs"] = {}
-
-        selected_suites = OrderedDict()
-
-        if params is None:
-            if all_suites:
-                params = suites.keys()
-            else:
-                print("Specify a test path or suite name, or pass --all to run all test suites.\n\nAvailable suites:")
-                for s in suites:
-                    print("    %s" % s)
-                return 1
-
-        for arg in params:
-            found = False
-            if arg in suites and arg not in selected_suites:
-                selected_suites[arg] = []
-                found = True
-            else:
-                suite = self.suite_for_path(arg)
-                if suite is not None:
-                    if suite not in selected_suites:
-                        selected_suites[suite] = []
-                    selected_suites[suite].append(arg)
-                    found = True
-                    break
-
-            if not found:
-                print("%s is not a valid test path or suite name" % arg)
-                return 1
-
-        test_start = time.time()
-        for suite, tests in iteritems(selected_suites):
-            props = suites[suite]
-            kwargs = props.get("kwargs", {})
-            if tests:
-                kwargs[props["include_arg"]] = tests
-
-            Registrar.dispatch("test-%s" % suite, context=self.context, **kwargs)
-
-        elapsed = time.time() - test_start
-
-        print("Tests completed in %0.2fs" % elapsed)
-
-    # Helper to determine which test suite owns the path
-    def suite_for_path(self, path_arg):
-        if os.path.exists(path.abspath(path_arg)):
-            abs_path = path.abspath(path_arg)
-            for prefix, suite in iteritems(TEST_SUITES_BY_PREFIX):
-                if abs_path.startswith(prefix):
-                    return suite
-        return None
-
-    @Command('test-perf',
-             description='Run the page load performance test',
-             category='testing')
-    @CommandArgument('--base', default=None,
-                     help="the base URL for testcases")
-    @CommandArgument('--date', default=None,
-                     help="the datestamp for the data")
-    @CommandArgument('--submit', '-a', default=False, action="store_true",
-                     help="submit the data to perfherder")
-    def test_perf(self, base=None, date=None, submit=False):
+    @Command("test-perf", description="Run the page load performance test", category="testing")
+    @CommandArgument("--base", default=None, help="the base URL for testcases")
+    @CommandArgument("--date", default=None, help="the datestamp for the data")
+    @CommandArgument("--submit", "-a", default=False, action="store_true", help="submit the data to perfherder")
+    def test_perf(self, base: str | None = None, date: str | None = None, submit: bool = False) -> int:
         env = self.build_env()
         cmd = ["bash", "test_perf.sh"]
         if base:
@@ -207,22 +151,33 @@ class MachCommands(CommandBase):
             cmd += ["--date", date]
         if submit:
             cmd += ["--submit"]
-        return call(cmd,
-                    env=env,
-                    cwd=path.join("etc", "ci", "performance"))
+        return call(cmd, env=env, cwd=path.join("etc", "ci", "performance"))
 
-    @Command('test-unit',
-             description='Run unit tests',
-             category='testing')
-    @CommandArgument('test_name', nargs=argparse.REMAINDER,
-                     help="Only run tests that match this pattern or file path")
-    @CommandArgument('--package', '-p', default=None, help="Specific package to test")
-    @CommandArgument('--bench', default=False, action="store_true",
-                     help="Run in bench mode")
-    @CommandArgument('--nocapture', default=False, action="store_true",
-                     help="Run tests with nocapture ( show test stdout )")
-    @CommandBase.build_like_command_arguments
-    def test_unit(self, test_name=None, package=None, bench=False, nocapture=False, with_layout_2020=False, **kwargs):
+    @Command("test-unit", description="Run unit tests", category="testing")
+    @CommandArgument("test_name", nargs=argparse.REMAINDER, help="Only run tests that match this pattern or file path")
+    @CommandArgument("--package", "-p", default=None, help="Specific package to test")
+    @CommandArgument("--bench", default=False, action="store_true", help="Run in bench mode")
+    @CommandArgument(
+        "--nocapture", default=False, action="store_true", help="Run tests with nocapture ( show test stdout )"
+    )
+    @CommandArgument("--code-coverage", default=False, action="store_true", help="Run in code coverage mode")
+    @CommandArgument("--llvm-cov-option", default=None, action="append", help="Additional options for llvm-cov")
+    @CommandArgument("--nextest-profile", default=None, help="Specify the Nextest profile to use")
+    @CommandArgument("params", nargs="...", help="Command-line arguments to be passed through to Cargo nextest")
+    @CommandBase.common_command_arguments(build_configuration=True, build_type=True)
+    def test_unit(
+        self,
+        build_type: BuildType,
+        test_name: list[str] | None = None,
+        params: list[str] | None = None,
+        package: str | None = None,
+        bench: bool = False,
+        code_coverage: bool = False,
+        llvm_cov_option: Optional[List[str]] = None,
+        nocapture: bool = False,
+        nextest_profile: str | None = None,
+        **kwargs: Any,
+    ) -> int:
         if test_name is None:
             test_name = []
 
@@ -254,20 +209,32 @@ class MachCommands(CommandBase):
 
         self_contained_tests = [
             "background_hang_monitor",
-            "gfx",
-            "msg",
+            "base",
+            "compositing",
+            "compositing_traits",
+            "constellation",
+            "devtools",
+            "fonts",
+            "hyper_serde",
+            "layout",
+            "layout_api",
+            "libservo",
+            "metrics",
             "net",
             "net_traits",
+            "pixels",
+            "script_traits",
+            "script_bindings",
             "selectors",
             "servo_config",
-            "servo_remutex",
+            "servoshell",
+            "servo_url",
+            "storage",
+            "storage_traits",
+            "xpath",
         ]
-        if with_layout_2020:
-            self_contained_tests.append("layout_2020")
-        else:
-            self_contained_tests.append("layout_2013")
         if not packages:
-            packages = set(os.listdir(path.join(self.context.topdir, "tests", "unit"))) - set(['.DS_Store'])
+            packages = set(os.listdir(path.join(self.context.topdir, "tests", "unit"))) - set([".DS_Store"])
             packages |= set(self_contained_tests)
 
         in_crate_packages = []
@@ -278,435 +245,307 @@ class MachCommands(CommandBase):
             except KeyError:
                 pass
 
-        packages.discard('stylo')
-
-        env = self.build_env(test_unit=True)
-        # FIXME: https://github.com/servo/servo/issues/26192
-        if "apple-darwin" not in host_triple():
-            env["RUST_BACKTRACE"] = "1"
-
-        if "msvc" in host_triple():
-            # on MSVC, we need some DLLs in the path. They were copied
-            # in to the servo.exe build dir, so just point PATH to that.
-            env["PATH"] = "%s%s%s" % (path.dirname(self.get_binary_path(False, False)), os.pathsep, env["PATH"])
-
-        if len(packages) > 0 or len(in_crate_packages) > 0:
-            args = []
-            for crate in packages:
-                args += ["-p", "%s_tests" % crate]
-            for crate in in_crate_packages:
-                args += ["-p", crate]
-            args += test_patterns
-
-            if nocapture:
-                args += ["--", "--nocapture"]
-
-            err = self.run_cargo_build_like_command("bench" if bench else "test",
-                                                    args,
-                                                    env=env,
-                                                    with_layout_2020=with_layout_2020,
-                                                    **kwargs)
-            if err:
-                return err
-
-    @Command('test-content',
-             description='Run the content tests',
-             category='testing')
-    def test_content(self):
-        print("Content tests have been replaced by web-platform-tests under "
-              "tests/wpt/mozilla/.")
-        return 0
-
-    def install_rustfmt(self):
-        self.ensure_bootstrapped()
-        with open(os.devnull, "w") as devnull:
-            if self.call_rustup_run(["cargo", "fmt", "--version", "-q"],
-                                    stderr=devnull) != 0:
-                # Rustfmt is not installed. Install:
-                self.call_rustup_run(["rustup", "component", "add", "rustfmt-preview"])
-
-    @Command('test-tidy',
-             description='Run the source code tidiness check',
-             category='testing')
-    @CommandArgument('--all', default=False, action="store_true", dest="all_files",
-                     help="Check all files, and run the WPT lint in tidy, "
-                          "even if unchanged")
-    @CommandArgument('--no-wpt', default=False, action="store_true", dest="no_wpt",
-                     help="Skip checking that web-platform-tests manifests are up to date")
-    @CommandArgument('--no-progress', default=False, action="store_true",
-                     help="Don't show progress for tidy")
-    @CommandArgument('--self-test', default=False, action="store_true",
-                     help="Run unit tests for tidy")
-    @CommandArgument('--stylo', default=False, action="store_true",
-                     help="Only handle files in the stylo tree")
-    @CommandArgument('--force-cpp', default=False, action="store_true", help="Force CPP check")
-    def test_tidy(self, all_files, no_progress, self_test, stylo, force_cpp=False, no_wpt=False):
-        if self_test:
-            return test_tidy.do_tests()
-        else:
-            if no_wpt:
-                manifest_dirty = False
-            else:
-                manifest_dirty = run_update(self.context.topdir, check_clean=True)
-            tidy_failed = tidy.scan(not all_files, not no_progress, stylo=stylo, no_wpt=no_wpt)
-            self.install_rustfmt()
-            rustfmt_failed = self.call_rustup_run(["cargo", "fmt", "--", "--check"])
-
-            env = self.build_env()
-            clangfmt_failed = False
-            available, cmd, files = setup_clangfmt(env)
-            if available:
-                for file in files:
-                    stdout = check_output([cmd, "-output-replacements-xml", file], env=env)
-                    if len(XML(stdout)) > 0:
-                        print("%s is not formatted correctly." % file)
-                        clangfmt_failed = True
-            elif force_cpp:
-                print("Error: can't find suitable clang-format version. Required with --force-cpp.")
-                return True
-
-            if rustfmt_failed or clangfmt_failed:
-                print("Run `./mach fmt` to fix the formatting")
-
-            return tidy_failed or manifest_dirty or rustfmt_failed or clangfmt_failed
-
-    @Command('test-webidl',
-             description='Run the WebIDL parser tests',
-             category='testing')
-    @CommandArgument('--quiet', '-q', default=False, action="store_true",
-                     help="Don't print passing tests.")
-    @CommandArgument('tests', default=None, nargs="...",
-                     help="Specific tests to run, relative to the tests directory")
-    def test_webidl(self, quiet, tests):
-        test_file_dir = path.abspath(path.join(PROJECT_TOPLEVEL_PATH, "components", "script",
-                                               "dom", "bindings", "codegen", "parser"))
-        # For the `import WebIDL` in runtests.py
-        sys.path.insert(0, test_file_dir)
-
-        run_file = path.abspath(path.join(test_file_dir, "runtests.py"))
-        run_globals = {"__file__": run_file}
-        exec(compile(open(run_file).read(), run_file, 'exec'), run_globals)
-
-        verbose = not quiet
-        return run_globals["run_tests"](tests, verbose)
-
-    @Command('test-wpt-failure',
-             description='Run the tests harness that verifies that the test failures are reported correctly',
-             category='testing',
-             parser=create_parser_wpt)
-    def test_wpt_failure(self, **kwargs):
-        kwargs["pause_after_test"] = False
-        kwargs["include"] = ["infrastructure/failing-test.html"]
-        return not self._test_wpt(**kwargs)
-
-    @Command('test-wpt',
-             description='Run the regular web platform test suite',
-             category='testing',
-             parser=create_parser_wpt)
-    def test_wpt(self, **kwargs):
-        ret = self.run_test_list_or_dispatch(kwargs["test_list"], "wpt", self._test_wpt, **kwargs)
-        if kwargs["always_succeed"]:
+        # Return if there is nothing to do.
+        if len(packages) == 0 and len(in_crate_packages) == 0:
             return 0
+
+        args: list[str] = params or []
+
+        if build_type.is_release():
+            args += ["--release"]
+        elif build_type.is_dev():
+            pass  # there is no argument for debug
         else:
-            return ret
+            args += ["--cargo-profile", build_type.profile]
 
-    @Command('test-wpt-android',
-             description='Run the web platform test suite in an Android emulator',
-             category='testing',
-             parser=create_parser_wpt)
-    def test_wpt_android(self, release=False, dev=False, binary_args=None, **kwargs):
-        kwargs.update(
-            release=release,
-            dev=dev,
-            product="servodriver",
-            processes=1,
-            binary_args=self.in_android_emulator(release, dev) + (binary_args or []),
-            binary=sys.executable,
-        )
-        return self._test_wpt(android=True, **kwargs)
+        if nextest_profile is not None:
+            args += ["--profile", nextest_profile]
 
-    def _test_wpt(self, android=False, **kwargs):
-        self.set_run_env(android)
-        hosts_file_path = path.join(self.context.topdir, 'tests', 'wpt', 'hosts')
-        os.environ["HOST_FILE"] = hosts_file_path
-        run_file = path.abspath(path.join(self.context.topdir, "tests", "wpt", "run.py"))
-        return self.wptrunner(run_file, **kwargs)
+        for crate in packages:
+            args += ["-p", "%s_tests" % crate]
+        for crate in in_crate_packages:
+            args += ["-p", crate]
+        args += test_patterns
 
-    # Helper to ensure all specified paths are handled, otherwise dispatch to appropriate test suite.
-    def run_test_list_or_dispatch(self, requested_paths, correct_suite, correct_function, **kwargs):
-        if not requested_paths:
-            return correct_function(**kwargs)
-        # Paths specified on command line. Ensure they can be handled, re-dispatch otherwise.
-        all_handled = True
-        for test_path in requested_paths:
-            suite = self.suite_for_path(test_path)
-            if suite is not None and correct_suite != suite:
-                all_handled = False
-                print("Warning: %s is not a %s test. Delegating to test-%s." % (test_path, correct_suite, suite))
-        if all_handled:
-            return correct_function(**kwargs)
-        # Dispatch each test to the correct suite via test()
-        Registrar.dispatch("test", context=self.context, params=requested_paths)
-
-    # Helper for test_css and test_wpt:
-    def wptrunner(self, run_file, **kwargs):
-        # By default, Rayon selects the number of worker threads
-        # based on the available CPU count. This doesn't work very
-        # well when running tests on CI, since we run so many
-        # Servo processes in parallel. The result is a lot of
-        # extra timeouts. Instead, force Rayon to assume we are
-        # running on a 2 CPU environment.
-        os.environ['RAYON_RS_NUM_CPUS'] = "2"
-
-        os.environ["RUST_BACKTRACE"] = "1"
-        kwargs["debug"] = not kwargs["release"]
-        if kwargs.pop("rr_chaos"):
-            kwargs["debugger"] = "rr"
-            kwargs["debugger_args"] = "record --chaos"
-            kwargs["repeat_until_unexpected"] = True
-            # TODO: Delete rr traces from green test runs?
-        prefs = kwargs.pop("prefs")
-        if prefs:
-            binary_args = []
-            for pref in prefs:
-                binary_args.append("--pref=" + pref)
-            kwargs["binary_args"] = binary_args
-
-        if not kwargs.get('no_default_test_types'):
-            test_types = {
-                "servo": ["testharness", "reftest", "wdspec"],
-                "servodriver": ["testharness", "reftest"],
-            }
-            product = kwargs.get("product") or "servo"
-            kwargs["test_types"] = test_types[product]
-
-        run_globals = {"__file__": run_file}
-        exec(compile(open(run_file).read(), run_file, 'exec'), run_globals)
-        return run_globals["run_tests"](**kwargs)
-
-    @Command('update-manifest',
-             description='Run test-wpt --manifest-update SKIP_TESTS to regenerate MANIFEST.json',
-             category='testing',
-             parser=create_parser_manifest_update)
-    def update_manifest(self, **kwargs):
-        return run_update(self.context.topdir, **kwargs)
-
-    @Command('fmt',
-             description='Format the Rust and CPP source files with rustfmt and clang-format',
-             category='testing')
-    def format_code(self):
+        if nocapture:
+            args += ["--nocapture"]
+        args += ["--no-fail-fast"]
 
         env = self.build_env()
-        available, cmd, files = setup_clangfmt(env)
-        if available and len(files) > 0:
-            check_call([cmd, "-i"] + files, env=env)
 
-        self.install_rustfmt()
-        return self.call_rustup_run(["cargo", "fmt"])
+        crown_cargo_command: List[str] = ["cargo"]
+        cargo_command: str
+        if bench:
+            cargo_command = "bench"
+            if code_coverage:
+                print(
+                    "Error: Invalid argument combination for `./mach test-unit`. "
+                    "`--bench` and `--code-coverage` are mutually exclusive."
+                )
+                exit(1)
+        elif code_coverage:
+            cargo_llvm_cov_options: List[str] = llvm_cov_option or []
+            crown_cargo_command.extend(["llvm-cov", "nextest"])
+            crown_cargo_command.extend(cargo_llvm_cov_options)
+            cargo_command = "llvm-cov"
+            args.insert(0, "nextest")
+            args.extend(cargo_llvm_cov_options)
+        else:
+            crown_cargo_command.extend(["nextest", "run"])
+            cargo_command = "nextest"
+            args.insert(0, "run")
+        result = call(crown_cargo_command, cwd="support/crown")
+        if result != 0:
+            return result
+        result = self.run_cargo_build_like_command(cargo_command, args, env=env, **kwargs)
+        assert isinstance(result, int)
+        return result
 
-    @Command('update-wpt',
-             description='Update the web platform tests',
-             category='testing',
-             parser=updatecommandline.create_parser())
-    def update_wpt(self, **kwargs):
-        run_file = path.abspath(path.join("tests", "wpt", "update.py"))
+    @Command("test-tidy", description="Run the source code tidiness check", category="testing")
+    @CommandArgument(
+        "--all",
+        default=False,
+        action="store_true",
+        dest="all_files",
+        help="Check all files, and run the WPT lint in tidy, even if unchanged",
+    )
+    @CommandArgument("--no-progress", default=False, action="store_true", help="Don't show progress for tidy")
+    @CommandArgument(
+        "--github-annotations",
+        default=False,
+        action="store_true",
+        help="Emit tidy warnings in the Github Actions annotations format",
+    )
+    def test_tidy(self, all_files: bool, no_progress: bool, github_annotations: bool) -> int:
+        tidy_failed = tidy.scan(not all_files, not no_progress, github_annotations)
+
+        print("\r ➤  Checking formatting of Rust files...")
+        rustfmt_failed = format_with_rustfmt(check_only=True)
+
+        print("\r ➤  Checking formatting of python files...")
+        ruff_format_failed = format_python_files_with_ruff()
+
+        print("\r ➤  Checking formatting of toml files...")
+        taplo_failed = format_toml_files_with_taplo()
+
+        format_failed = rustfmt_failed or ruff_format_failed or taplo_failed
+        tidy_failed = format_failed or tidy_failed
+        print()
+        if tidy_failed:
+            print("\r ❌ test-tidy reported errors.")
+        else:
+            print("\r ✅ test-tidy reported no errors.")
+
+        if format_failed:
+            print("Run `./mach fmt` to fix the formatting")
+
+        return tidy_failed
+
+    @Command("test-scripts", description="Run tests for all build and support scripts.", category="testing")
+    @CommandArgument("--verbose", "-v", default=False, action="store_true", help="Enable verbose output")
+    @CommandArgument("--very-verbose", "-vv", default=False, action="store_true", help="Enable very verbose output")
+    @CommandArgument(
+        "--all", "-a", default=False, action="store_true", help="Run all script tests, even the slow ones."
+    )
+    @CommandArgument(
+        "tests", default=None, nargs="...", help="Specific WebIDL tests to run, relative to the tests directory"
+    )
+    def test_scripts(self, verbose: bool, very_verbose: bool, all: bool, tests: list[str]) -> int:
+        if very_verbose:
+            logging.getLogger().level = logging.DEBUG
+        elif verbose:
+            logging.getLogger().level = logging.INFO
+        else:
+            logging.getLogger().level = logging.WARN
+
+        passed = True
+
+        print("Running tidy tests...")
+        passed = tidy.run_tests() and passed
+
+        import python.servo.try_parser as try_parser
+
+        print("Running try_parser tests...")
+        passed = try_parser.run_tests() and passed
+
+        print("Running WPT tests...")
+        passed = wpt.run_tests() and passed
+
+        print("Running devtools parser tests...")
+        if shutil.which("tshark"):
+            try:
+                result = subprocess.run(
+                    ["etc/devtools_parser.py", "--json", "--read-file", "etc/devtools_parser_test.pcap"],
+                    check=True,
+                    capture_output=True,
+                )
+                expected = open("etc/devtools_parser_test.json", "rb").read()
+                actual = result.stdout
+                assert actual == expected, f"Incorrect output!\nExpected: {repr(expected)}\nActual:   {repr(actual)}"
+                print("OK")
+            except subprocess.CalledProcessError as e:
+                print(f"Process failed with exit status {e.returncode}: {e.cmd}", file=sys.stderr)
+                print(f"stdout: {repr(e.stdout)}", file=sys.stderr)
+                print(f"stderr: {repr(e.stderr)}", file=sys.stderr)
+                raise e
+        else:
+            print("SKIP: Install tshark manually")
+
+        if all or tests:
+            print("Running WebIDL tests...")
+
+            test_file_dir = path.abspath(path.join(PROJECT_TOPLEVEL_PATH, "third_party", "WebIDL"))
+            # For the `import WebIDL` in runtests.py
+            sys.path.insert(0, test_file_dir)
+            run_file = path.abspath(path.join(test_file_dir, "runtests.py"))
+            run_globals: dict[str, Any] = {"__file__": run_file}
+            exec(compile(open(run_file).read(), run_file, "exec"), run_globals)
+            passed = run_globals["run_tests"](tests, verbose or very_verbose) and passed
+
+        return 0 if passed else 1
+
+    @Command("test-devtools", description="Run tests for devtools.", category="testing")
+    @CommandArgument("test_names", nargs=argparse.REMAINDER, help="Only run tests that match these patterns")
+    @CommandBase.common_command_arguments(binary_selection=True)
+    def test_devtools(self, servo_binary: str, test_names: list[str], **kwargs: Any) -> int:
+        print("Running devtools tests...")
+        passed = servo.devtools_tests.run_tests(SCRIPT_PATH, servo_binary, test_names)
+        return 0 if passed else 1
+
+    @Command(
+        "test-wpt-failure",
+        description="Run the tests harness that verifies that the test failures are reported correctly",
+        category="testing",
+        parser=wpt.create_parser,
+    )
+    @CommandBase.common_command_arguments(build_configuration=False, build_type=True)
+    def test_wpt_failure(self, build_type: BuildType, **kwargs: Any) -> bool:
+        kwargs["pause_after_test"] = False
+        kwargs["include"] = ["infrastructure/failing-test.html"]
+        return not self._test_wpt(build_type=build_type, **kwargs)
+
+    @Command(
+        "test-wpt", description="Run the regular web platform test suite", category="testing", parser=wpt.create_parser
+    )
+    @CommandBase.common_command_arguments(binary_selection=True)
+    def test_wpt(self, servo_binary: str, **kwargs: Any) -> int:
+        return self._test_wpt(servo_binary, **kwargs)
+
+    @CommandBase.allow_target_configuration
+    def _test_wpt(self, servo_binary: str, **kwargs: Any) -> int:
+        # TODO(mrobinson): Why do we pass the wrong binary path in when running WPT on Android?
+        return_value = wpt.run.run_tests(servo_binary, **kwargs)
+        return return_value if not kwargs["always_succeed"] else 0
+
+    @Command(
+        "update-manifest",
+        description="Run test-wpt --manifest-update SKIP_TESTS to regenerate MANIFEST.json",
+        category="testing",
+        parser=wpt.manifestupdate.create_parser,
+    )
+    def update_manifest(self, **kwargs: Any) -> int:
+        return wpt.manifestupdate.update(check_clean=False)
+
+    @Command("fmt", description="Format Rust, Python, and TOML files", category="testing")
+    def format_code(self) -> int:
+        result = format_python_files_with_ruff(check_only=False)
+        if result != 0:
+            return result
+
+        result = format_toml_files_with_taplo(check_only=False)
+        if result != 0:
+            return result
+
+        return format_with_rustfmt(check_only=False)
+
+    @Command(
+        "update-wpt", description="Update the web platform tests", category="testing", parser=wpt.update.create_parser
+    )
+    def update_wpt(self, **kwargs: Any) -> int:
         patch = kwargs.get("patch", False)
-
         if not patch and kwargs["sync"]:
             print("Are you sure you don't want a patch?")
             return 1
+        return wpt.update.update_tests(**kwargs)
 
-        run_globals = {"__file__": run_file}
-        exec(compile(open(run_file).read(), run_file, 'exec'), run_globals)
-        return run_globals["update_tests"](**kwargs)
+    @Command("test-ohos-wpt", description="Run a single WPT test on OHOS device using WebDriver", category="testing")
+    @CommandArgument("--test", required=True, help="Path to WPT test (relative to tests/wpt/tests/)")
+    @CommandArgument("--webdriver-port", type=int, default=7000, help="WebDriver server port on OHOS device")
+    @CommandArgument("--wpt-server-port", type=int, default=8000, help="WPT server port on desktop")
+    @CommandArgument("--verbose", action="store_true", help="Enable verbose logging")
+    def test_ohos_wpt(self, **kwargs: Any) -> int:
+        """Run a single WPT test on OHOS device."""
+        script_path = Path(__file__).parent.parent / "wpt" / "ohos_webdriver_test.py"
 
-    @Command('filter-intermittents',
-             description='Given a WPT error summary file, filter out intermittents and other cruft.',
-             category='testing')
-    @CommandArgument('summary',
-                     help="Error summary log to take in")
-    @CommandArgument('--log-filteredsummary', default=None,
-                     help='Print filtered log to file')
-    @CommandArgument('--log-intermittents', default=None,
-                     help='Print intermittents to file')
-    @CommandArgument('--auth', default=None,
-                     help='File containing basic authorization credentials for Github API (format `username:password`)')
-    @CommandArgument('--tracker-api', default=None, action='store',
-                     help='The API endpoint for tracking known intermittent failures.')
-    @CommandArgument('--reporter-api', default=None, action='store',
-                     help='The API endpoint for reporting tracked intermittent failures.')
-    def filter_intermittents(self,
-                             summary,
-                             log_filteredsummary,
-                             log_intermittents,
-                             auth,
-                             tracker_api,
-                             reporter_api):
-        encoded_auth = None
-        if auth:
-            with open(auth, "r") as file:
-                encoded_auth = base64.encodestring(file.read().strip()).replace('\n', '')
-        failures = []
-        with open(summary, "r") as file:
-            failures = [json.loads(line) for line in file]
-        actual_failures = []
-        intermittents = []
-        for failure in failures:
-            if tracker_api:
-                if tracker_api == 'default':
-                    tracker_api = "https://build.servo.org/intermittent-tracker"
-                elif tracker_api.endswith('/'):
-                    tracker_api = tracker_api[0:-1]
+        cmd = [
+            sys.executable,
+            str(script_path),
+            "--test",
+            kwargs["test"],
+            "--webdriver-port",
+            str(kwargs["webdriver_port"]),
+            "--wpt-server-port",
+            str(kwargs["wpt_server_port"]),
+        ]
 
-                if 'test' not in failure:
-                    continue
-                query = urllib.parse.quote(failure['test'], safe='')
-                request = urllib.request.Request("%s/query.py?name=%s" % (tracker_api, query))
-                search = urllib.request.urlopen(request)
-                data = json.load(search)
-                is_intermittent = len(data) > 0
-            else:
-                qstr = "repo:servo/servo+label:I-intermittent+type:issue+state:open+%s" % failure['test']
-                # we want `/` to get quoted, but not `+` (github's API doesn't like that), so we set `safe` to `+`
-                query = urllib.parse.quote(qstr, safe='+')
-                request = urllib.request.Request("https://api.github.com/search/issues?q=%s" % query)
-                if encoded_auth:
-                    request.add_header("Authorization", "Basic %s" % encoded_auth)
-                search = urllib.request.urlopen(request)
-                data = json.load(search)
-                is_intermittent = data['total_count'] > 0
+        if kwargs.get("verbose"):
+            cmd.append("--verbose")
 
-            if is_intermittent:
-                if 'output' in failure:
-                    intermittents.append(failure["output"])
-                else:
-                    intermittents.append("%s [expected %s] %s \n"
-                                         % (failure["status"], failure["expected"], failure['test']))
-            else:
-                if 'output' in failure:
-                    actual_failures.append(failure["output"])
-                else:
-                    actual_failures.append("%s [expected %s] %s \n"
-                                           % (failure["status"], failure["expected"], failure['test']))
+        print(f"Running OHOS WPT test: {kwargs['test']}")
+        print("Make sure:")
+        print("1. OHOS device is connected and running Servo with WebDriver enabled")
+        print("2. WPT server is running on desktop")
+        print("3. HDC is available in PATH")
 
-        def format(outputs, description, file=sys.stdout):
-            formatted = "%s %s:\n%s" % (len(outputs), description, "\n".join(outputs))
-            if file == sys.stdout:
-                file.write(formatted)
-            else:
-                file.write(formatted.encode("utf-8"))
+        return subprocess.call(cmd)
 
-        if log_intermittents:
-            with open(log_intermittents, "wb") as file:
-                format(intermittents, "known-intermittent unexpected results", file)
+    @Command("test-jquery", description="Run the jQuery test suite", category="testing")
+    @CommandBase.common_command_arguments(binary_selection=True)
+    def test_jquery(self, servo_binary: str) -> int:
+        return self.jquery_test_runner("test", servo_binary)
 
-        description = "unexpected results that are NOT known-intermittents"
-        if log_filteredsummary:
-            with open(log_filteredsummary, "wb") as file:
-                format(actual_failures, description, file)
+    @Command("test-dromaeo", description="Run the Dromaeo test suite", category="testing")
+    @CommandArgument("tests", default=["recommended"], nargs="...", help="Specific tests to run")
+    @CommandArgument("--bmf-output", default=None, help="Specify BMF JSON output file")
+    @CommandBase.common_command_arguments(build_type=True, binary_selection=True)
+    def test_dromaeo(
+        self, tests: list[str], build_type: BuildType, servo_binary: str, bmf_output: str | None = None, **kwargs: Any
+    ) -> None:
+        return self.dromaeo_test_runner(tests, servo_binary, bmf_output, build_type.profile)
 
-        if actual_failures:
-            format(actual_failures, description)
+    @Command("test-speedometer", description="Run servo's speedometer", category="testing")
+    @CommandArgument("--bmf-output", default=None, help="Specify BMF JSON output file")
+    @CommandBase.common_command_arguments(build_type=True, binary_selection=True)
+    def test_speedometer(
+        self, build_type: BuildType, servo_binary: str, bmf_output: str | None = None, **kwargs: Any
+    ) -> None:
+        return self.speedometer_runner(servo_binary, bmf_output, build_type.profile)
 
-        return bool(actual_failures)
+    @Command("update-jquery", description="Update the jQuery test suite expected results", category="testing")
+    @CommandBase.common_command_arguments(binary_selection=True)
+    def update_jquery(self, servo_binary: str) -> int:
+        return self.jquery_test_runner("update", servo_binary)
 
-    @Command('test-android-startup',
-             description='Extremely minimal testing of Servo for Android',
-             category='testing')
-    @CommandArgument('--release', '-r', action='store_true',
-                     help='Run the release build')
-    @CommandArgument('--dev', '-d', action='store_true',
-                     help='Run the dev build')
-    def test_android_startup(self, release, dev):
-        html = """
-            <script>
-                window.alert("JavaScript is running!")
-            </script>
-        """
-        url = "data:text/html;base64," + html.encode("base64").replace("\n", "")
-        args = self.in_android_emulator(release, dev)
-        args = [sys.executable] + args + [url]
-        process = subprocess.Popen(args, stdout=subprocess.PIPE)
-        try:
-            while 1:
-                line = process.stdout.readline()
-                if len(line) == 0:
-                    print("EOF without finding the expected line")
-                    return 1
-                print(line.rstrip())
-                if "JavaScript is running!" in line:
-                    break
-        finally:
-            process.terminate()
-
-    def in_android_emulator(self, release, dev):
-        if (release and dev) or not (release or dev):
-            print("Please specify one of --dev or --release.")
-            sys.exit(1)
-
-        avd = "servo-x86"
-        target = "i686-linux-android"
-        print("Assuming --target " + target)
-
-        env = self.build_env(target=target)
-        os.environ["PATH"] = env["PATH"]
-        assert self.handle_android_target(target)
-        apk = self.get_apk_path(release)
-
-        py = path.join(self.context.topdir, "etc", "run_in_headless_android_emulator.py")
-        return [py, avd, apk]
-
-    @Command('test-jquery',
-             description='Run the jQuery test suite',
-             category='testing')
-    @CommandArgument('--release', '-r', action='store_true',
-                     help='Run the release build')
-    @CommandArgument('--dev', '-d', action='store_true',
-                     help='Run the dev build')
-    def test_jquery(self, release, dev):
-        return self.jquery_test_runner("test", release, dev)
-
-    @Command('test-dromaeo',
-             description='Run the Dromaeo test suite',
-             category='testing')
-    @CommandArgument('tests', default=["recommended"], nargs="...",
-                     help="Specific tests to run")
-    @CommandArgument('--release', '-r', action='store_true',
-                     help='Run the release build')
-    @CommandArgument('--dev', '-d', action='store_true',
-                     help='Run the dev build')
-    def test_dromaeo(self, tests, release, dev):
-        return self.dromaeo_test_runner(tests, release, dev)
-
-    @Command('update-jquery',
-             description='Update the jQuery test suite expected results',
-             category='testing')
-    @CommandArgument('--release', '-r', action='store_true',
-                     help='Run the release build')
-    @CommandArgument('--dev', '-d', action='store_true',
-                     help='Run the dev build')
-    def update_jquery(self, release, dev):
-        return self.jquery_test_runner("update", release, dev)
-
-    @Command('compare_dromaeo',
-             description='Compare outputs of two runs of ./mach test-dromaeo command',
-             category='testing')
-    @CommandArgument('params', default=None, nargs="...",
-                     help=" filepaths of output files of two runs of dromaeo test ")
-    def compare_dromaeo(self, params):
+    @Command(
+        "compare_dromaeo", description="Compare outputs of two runs of ./mach test-dromaeo command", category="testing"
+    )
+    @CommandArgument(
+        "params", default=None, nargs="...", help=" filepaths of output files of two runs of dromaeo test "
+    )
+    def compare_dromaeo(self, params: list[str]) -> None:
         prev_op_filename = params[0]
         cur_op_filename = params[1]
-        result = {'Test': [], 'Prev_Time': [], 'Cur_Time': [], 'Difference(%)': []}
-        with open(prev_op_filename, 'r') as prev_op, open(cur_op_filename, 'r') as cur_op:
+        result = {"Test": [], "Prev_Time": [], "Cur_Time": [], "Difference(%)": []}
+        with open(prev_op_filename, "r") as prev_op, open(cur_op_filename, "r") as cur_op:
             l1 = prev_op.readline()
             l2 = cur_op.readline()
 
-            while ((l1.find('[dromaeo] Saving...') and l2.find('[dromaeo] Saving...'))):
+            while l1.find("[dromaeo] Saving...") and l2.find("[dromaeo] Saving..."):
                 l1 = prev_op.readline()
                 l2 = cur_op.readline()
 
             reach = 3
-            while (reach > 0):
+            while reach > 0:
                 l1 = prev_op.readline()
                 l2 = cur_op.readline()
                 reach -= 1
@@ -716,276 +555,189 @@ class MachCommands(CommandBase):
                 l2 = cur_op.readline()
                 if not l1:
                     break
-                result['Test'].append(str(l1).split('|')[0].strip())
-                result['Prev_Time'].append(float(str(l1).split('|')[1].strip()))
-                result['Cur_Time'].append(float(str(l2).split('|')[1].strip()))
-                a = float(str(l1).split('|')[1].strip())
-                b = float(str(l2).split('|')[1].strip())
-                result['Difference(%)'].append(((b - a) / a) * 100)
+                result["Test"].append(str(l1).split("|")[0].strip())
+                result["Prev_Time"].append(float(str(l1).split("|")[1].strip()))
+                result["Cur_Time"].append(float(str(l2).split("|")[1].strip()))
+                a = float(str(l1).split("|")[1].strip())
+                b = float(str(l2).split("|")[1].strip())
+                result["Difference(%)"].append(((b - a) / a) * 100)
 
-            width_col1 = max([len(x) for x in result['Test']])
-            width_col2 = max([len(str(x)) for x in result['Prev_Time']])
-            width_col3 = max([len(str(x)) for x in result['Cur_Time']])
-            width_col4 = max([len(str(x)) for x in result['Difference(%)']])
+            width_col1 = max([len(x) for x in result["Test"]])
+            width_col2 = max([len(str(x)) for x in result["Prev_Time"]])
+            width_col3 = max([len(str(x)) for x in result["Cur_Time"]])
+            width_col4 = max([len(str(x)) for x in result["Difference(%)"]])
 
-            for p, q, r, s in zip(['Test'], ['First Run'], ['Second Run'], ['Difference(%)']):
-                print("\033[1m" + "{}|{}|{}|{}".format(p.ljust(width_col1), q.ljust(width_col2), r.ljust(width_col3),
-                      s.ljust(width_col4)) + "\033[0m" + "\n" + "--------------------------------------------------"
-                      + "-------------------------------------------------------------------------")
+            for p, q, r, s in zip(["Test"], ["First Run"], ["Second Run"], ["Difference(%)"]):
+                print(
+                    "\033[1m"
+                    + "{}|{}|{}|{}".format(
+                        p.ljust(width_col1), q.ljust(width_col2), r.ljust(width_col3), s.ljust(width_col4)
+                    )
+                    + "\033[0m"
+                    + "\n"
+                    + "--------------------------------------------------"
+                    + "-------------------------------------------------------------------------"
+                )
 
-            for a1, b1, c1, d1 in zip(result['Test'], result['Prev_Time'], result['Cur_Time'], result['Difference(%)']):
+            for a1, b1, c1, d1 in zip(result["Test"], result["Prev_Time"], result["Cur_Time"], result["Difference(%)"]):
                 if d1 > 0:
-                    print("\033[91m" + "{}|{}|{}|{}".format(a1.ljust(width_col1),
-                          str(b1).ljust(width_col2), str(c1).ljust(width_col3), str(d1).ljust(width_col4)) + "\033[0m")
+                    print(
+                        "\033[91m"
+                        + "{}|{}|{}|{}".format(
+                            a1.ljust(width_col1),
+                            str(b1).ljust(width_col2),
+                            str(c1).ljust(width_col3),
+                            str(d1).ljust(width_col4),
+                        )
+                        + "\033[0m"
+                    )
                 elif d1 < 0:
-                    print("\033[92m" + "{}|{}|{}|{}".format(a1.ljust(width_col1),
-                          str(b1).ljust(width_col2), str(c1).ljust(width_col3), str(d1).ljust(width_col4)) + "\033[0m")
+                    print(
+                        "\033[92m"
+                        + "{}|{}|{}|{}".format(
+                            a1.ljust(width_col1),
+                            str(b1).ljust(width_col2),
+                            str(c1).ljust(width_col3),
+                            str(d1).ljust(width_col4),
+                        )
+                        + "\033[0m"
+                    )
                 else:
-                    print("{}|{}|{}|{}".format(a1.ljust(width_col1), str(b1).ljust(width_col2),
-                          str(c1).ljust(width_col3), str(d1).ljust(width_col4)))
+                    print(
+                        "{}|{}|{}|{}".format(
+                            a1.ljust(width_col1),
+                            str(b1).ljust(width_col2),
+                            str(c1).ljust(width_col3),
+                            str(d1).ljust(width_col4),
+                        )
+                    )
 
-    def jquery_test_runner(self, cmd, release, dev):
+    def jquery_test_runner(self, cmd: str, binary: str) -> int:
         base_dir = path.abspath(path.join("tests", "jquery"))
         jquery_dir = path.join(base_dir, "jquery")
         run_file = path.join(base_dir, "run_jquery.py")
 
         # Clone the jQuery repository if it doesn't exist
         if not os.path.isdir(jquery_dir):
-            check_call(
-                ["git", "clone", "-b", "servo", "--depth", "1", "https://github.com/servo/jquery", jquery_dir])
+            check_call(["git", "clone", "-b", "servo", "--depth", "1", "https://github.com/servo/jquery", jquery_dir])
 
         # Run pull in case the jQuery repo was updated since last test run
-        check_call(
-            ["git", "-C", jquery_dir, "pull"])
+        check_call(["git", "-C", jquery_dir, "pull"])
 
         # Check that a release servo build exists
-        bin_path = path.abspath(self.get_binary_path(release, dev))
+        bin_path = path.abspath(binary)
 
         return call([run_file, cmd, bin_path, base_dir])
 
-    def dromaeo_test_runner(self, tests, release, dev):
+    def dromaeo_test_runner(self, tests: list[str], binary: str, bmf_output: str | None, profile: str) -> None:
         base_dir = path.abspath(path.join("tests", "dromaeo"))
         dromaeo_dir = path.join(base_dir, "dromaeo")
         run_file = path.join(base_dir, "run_dromaeo.py")
+        if bmf_output:
+            bmf_output = path.abspath(bmf_output)
+        else:
+            bmf_output = ""
 
         # Clone the Dromaeo repository if it doesn't exist
         if not os.path.isdir(dromaeo_dir):
             check_call(
-                ["git", "clone", "-b", "servo", "--depth", "1", "https://github.com/notriddle/dromaeo", dromaeo_dir])
+                ["git", "clone", "-b", "servo", "--depth", "1", "https://github.com/notriddle/dromaeo", dromaeo_dir]
+            )
 
         # Run pull in case the Dromaeo repo was updated since last test run
-        check_call(
-            ["git", "-C", dromaeo_dir, "pull"])
+        check_call(["git", "-C", dromaeo_dir, "pull"])
 
         # Compile test suite
-        check_call(
-            ["make", "-C", dromaeo_dir, "web"])
+        check_call(["make", "-C", dromaeo_dir, "web"])
 
         # Check that a release servo build exists
-        bin_path = path.abspath(self.get_binary_path(release, dev))
+        bin_path = path.abspath(binary)
 
-        return check_call(
-            [run_file, "|".join(tests), bin_path, base_dir])
+        args = [run_file, "|".join(tests), bin_path, base_dir]
+        if bmf_output is not None:
+            args.append(bmf_output)
+            args.append(profile)
 
+        return check_call(args)
 
-def setup_clangfmt(env):
-    cmd = "clang-format.exe" if sys.platform == "win32" else "clang-format"
-    try:
-        version = check_output([cmd, "--version"], env=env, universal_newlines=True).rstrip()
-        print(version)
-        if version.find("clang-format version {}.".format(CLANGFMT_VERSION)) == -1:
-            print("clang-format: wrong version (v{} required). Skipping CPP formatting.".format(CLANGFMT_VERSION))
-            return False, None, None
-    except OSError:
-        print("clang-format not installed. Skipping CPP formatting.")
-        return False, None, None
-    gitcmd = ['git', 'ls-files']
-    gitfiles = check_output(gitcmd + CLANGFMT_CPP_DIRS, universal_newlines=True).splitlines()
-    filtered = [line for line in gitfiles if line.endswith(".h") or line.endswith(".cpp")]
-    return True, cmd, filtered
+    def speedometer_to_bmf(self, speedometer: dict[str, Any], bmf_output: str, profile: str | None = None) -> None:
+        output = dict()
+        profile = "" if profile is None else profile + "/"
 
+        def parse_speedometer_result(result: dict[str, Any]) -> None:
+            if result["unit"] == "ms":
+                output[profile + f"Speedometer/{result['name']}"] = {
+                    "latency": {  # speedometer has ms we need to convert to ns
+                        "value": float(result["mean"]) * 1000000.0,
+                        "lower_value": float(result["min"]) * 1000000.0,
+                        "upper_value": float(result["max"]) * 1000000.0,
+                    }
+                }
+            elif result["unit"] == "score":
+                output[profile + f"Speedometer/{result['name']}"] = {
+                    "score": {
+                        "value": float(result["mean"]),
+                        "lower_value": float(result["min"]),
+                        "upper_value": float(result["max"]),
+                    }
+                }
+            else:
+                raise Exception("Unknown unit!")
 
-def create_parser_create():
-    import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument("--no-editor", action="store_true",
-                   help="Don't try to open the test in an editor")
-    p.add_argument("-e", "--editor", action="store", help="Editor to use")
-    p.add_argument("--no-run", action="store_true",
-                   help="Don't try to update the wpt manifest or open the test in a browser")
-    p.add_argument('--release', action="store_true",
-                   help="Run with a release build of servo")
-    p.add_argument("--long-timeout", action="store_true",
-                   help="Test should be given a long timeout (typically 60s rather than 10s,"
-                   "but varies depending on environment)")
-    p.add_argument("--overwrite", action="store_true",
-                   help="Allow overwriting an existing test file")
-    p.add_argument("-r", "--reftest", action="store_true",
-                   help="Create a reftest rather than a testharness (js) test"),
-    p.add_argument("-ref", "--reference", dest="ref", help="Path to the reference file")
-    p.add_argument("--mismatch", action="store_true",
-                   help="Create a mismatch reftest")
-    p.add_argument("--wait", action="store_true",
-                   help="Create a reftest that waits until takeScreenshot() is called")
-    p.add_argument("path", action="store", help="Path to the test file")
-    return p
+            for child in result["children"]:
+                parse_speedometer_result(child)
 
+        for v in speedometer.values():
+            parse_speedometer_result(v)
+        with open(bmf_output, "w", encoding="utf-8") as f:
+            json.dump(output, f, indent=4)
 
-@CommandProvider
-class WebPlatformTestsCreator(CommandBase):
-    template_prefix = """<!doctype html>
-%(documentElement)s<meta charset="utf-8">
-"""
-    template_long_timeout = "<meta name=timeout content=long>\n"
+    def speedometer_runner(self, binary: str, bmf_output: str | None, profile: str) -> None:
+        output = subprocess.check_output(
+            [
+                binary,
+                "https://servospeedometer.netlify.app?headless=1",
+                "--pref",
+                "dom_allow_scripts_to_close_windows",
+                "--window-size=1100x900",
+                "--headless",
+            ],
+            encoding="utf-8",
+            timeout=120,
+        )
+        try:
+            speedometer = json.loads(output)
+        except json.decoder.JSONDecodeError as e:
+            pretty_print_json_decode_error(e)
+            print("Error: Failed to parse speedometer results")
+            print("This can happen if other log messages are printed while running servo...")
+            exit(1)
 
-    template_body_th = """<title></title>
-<script src="/resources/testharness.js"></script>
-<script src="/resources/testharnessreport.js"></script>
-<script>
+        print(f"Score: {speedometer['Score']['mean']} ± {speedometer['Score']['delta']}")
 
-</script>
-"""
+        if bmf_output:
+            self.speedometer_to_bmf(speedometer, bmf_output, profile)
 
-    template_body_reftest = """<title></title>
-<link rel="%(match)s" href="%(ref)s">
-"""
-
-    template_body_reftest_wait = """<script src="/common/reftest-wait.js"></script>
-"""
-
-    def make_test_file_url(self, absolute_file_path):
-        # Make the path relative to the project top-level directory so that
-        # we can more easily find the right test directory.
-        file_path = os.path.relpath(absolute_file_path, PROJECT_TOPLEVEL_PATH)
-
-        if file_path.startswith(WEB_PLATFORM_TESTS_PATH):
-            url = file_path[len(WEB_PLATFORM_TESTS_PATH):]
-        elif file_path.startswith(SERVO_TESTS_PATH):
-            url = "/mozilla" + file_path[len(SERVO_TESTS_PATH):]
-        else:  # This test file isn't in any known test directory.
-            return None
-
-        return url.replace(os.path.sep, "/")
-
-    def make_test_and_reference_urls(self, test_path, reference_path):
-        test_path = os.path.normpath(os.path.abspath(test_path))
-        test_url = self.make_test_file_url(test_path)
-        if test_url is None:
-            return (None, None)
-
-        if reference_path is None:
-            return (test_url, '')
-        reference_path = os.path.normpath(os.path.abspath(reference_path))
-
-        # If the reference is in the same directory, the URL can just be the
-        # name of the refernce file itself.
-        reference_path_parts = os.path.split(reference_path)
-        if reference_path_parts[0] == os.path.split(test_path)[0]:
-            return (test_url, reference_path_parts[1])
-        return (test_url, self.make_test_file_url(reference_path))
-
-    @Command("create-wpt",
-             category="testing",
-             parser=create_parser_create)
-    def run_create(self, **kwargs):
-        import subprocess
-
-        test_path = kwargs["path"]
-        reference_path = kwargs["ref"]
-
-        if reference_path:
-            kwargs["reftest"] = True
-
-        (test_url, reference_url) = self.make_test_and_reference_urls(
-            test_path, reference_path)
-
-        if test_url is None:
-            print("""Test path %s is not in wpt directories:
-tests/wpt/web-platform-tests for tests that may be shared
-tests/wpt/mozilla/tests for Servo-only tests""" % test_path)
-            return 1
-
-        if reference_url is None:
-            print("""Reference path %s is not in wpt directories:
-testing/web-platform/tests for tests that may be shared
-testing/web-platform/mozilla/tests for Servo-only tests""" % reference_path)
-            return 1
-
-        if os.path.exists(test_path) and not kwargs["overwrite"]:
-            print("Test path already exists, pass --overwrite to replace")
-            return 1
-
-        if kwargs["mismatch"] and not kwargs["reftest"]:
-            print("--mismatch only makes sense for a reftest")
-            return 1
-
-        if kwargs["wait"] and not kwargs["reftest"]:
-            print("--wait only makes sense for a reftest")
-            return 1
-
-        args = {"documentElement": "<html class=\"reftest-wait\">\n" if kwargs["wait"] else ""}
-        template = self.template_prefix % args
-        if kwargs["long_timeout"]:
-            template += self.template_long_timeout
-
-        if kwargs["reftest"]:
-            args = {"match": "match" if not kwargs["mismatch"] else "mismatch",
-                    "ref": reference_url}
-            template += self.template_body_reftest % args
-            if kwargs["wait"]:
-                template += self.template_body_reftest_wait
-        else:
-            template += self.template_body_th
-        with open(test_path, "w") as f:
-            f.write(template)
-
-        if kwargs["no_editor"]:
-            editor = None
-        elif kwargs["editor"]:
-            editor = kwargs["editor"]
-        elif "VISUAL" in os.environ:
-            editor = os.environ["VISUAL"]
-        elif "EDITOR" in os.environ:
-            editor = os.environ["EDITOR"]
-        else:
-            editor = None
-
-        if editor:
-            proc = subprocess.Popen("%s %s" % (editor, test_path), shell=True)
-
-        if not kwargs["no_run"]:
-            p = create_parser_wpt()
-            args = []
-            if kwargs["release"]:
-                args.append("--release")
-            args.append(test_path)
-            wpt_kwargs = vars(p.parse_args(args))
-            self.context.commands.dispatch("test-wpt", self.context, **wpt_kwargs)
-            self.context.commands.dispatch("update-manifest", self.context)
-
-        if editor:
-            proc.wait()
-
-    @Command('update-net-cookies',
-             description='Update the net unit tests with cookie tests from http-state',
-             category='testing')
-    def update_net_cookies(self):
+    @Command(
+        "update-net-cookies",
+        description="Update the net unit tests with cookie tests from http-state",
+        category="testing",
+    )
+    def update_net_cookies(self) -> int:
         cache_dir = path.join(self.config["tools"]["cache-dir"], "tests")
-        run_file = path.abspath(path.join(PROJECT_TOPLEVEL_PATH,
-                                          "components", "net", "tests",
-                                          "cookie_http_state_utils.py"))
-        run_globals = {"__file__": run_file}
-        exec(compile(open(run_file).read(), run_file, 'exec'), run_globals)
+        run_file = path.abspath(
+            path.join(PROJECT_TOPLEVEL_PATH, "components", "net", "tests", "cookie_http_state_utils.py")
+        )
+        run_globals: dict[str, Any] = {"__file__": run_file}
+        exec(compile(open(run_file).read(), run_file, "exec"), run_globals)
         return run_globals["update_test_file"](cache_dir)
 
-    @Command('update-webgl',
-             description='Update the WebGL conformance suite tests from Khronos repo',
-             category='testing')
-    @CommandArgument('--version', default='2.0.0',
-                     help='WebGL conformance suite version')
-    def update_webgl(self, version=None):
-        base_dir = path.abspath(path.join(PROJECT_TOPLEVEL_PATH,
-                                "tests", "wpt", "mozilla", "tests", "webgl"))
+    @Command(
+        "update-webgl", description="Update the WebGL conformance suite tests from Khronos repo", category="testing"
+    )
+    @CommandArgument("--version", default="2.0.0", help="WebGL conformance suite version")
+    def update_webgl(self, version: str | None = None) -> None:
+        base_dir = path.abspath(path.join(PROJECT_TOPLEVEL_PATH, "tests", "wpt", "mozilla", "tests", "webgl"))
         run_file = path.join(base_dir, "tools", "import-conformance-tests.py")
         dest_folder = path.join(base_dir, "conformance-%s" % version)
         patches_dir = path.join(base_dir, "tools")
@@ -993,16 +745,170 @@ testing/web-platform/mozilla/tests for Servo-only tests""" % reference_path)
         if os.path.exists(dest_folder):
             shutil.rmtree(dest_folder)
 
-        run_globals = {"__file__": run_file}
-        exec(compile(open(run_file).read(), run_file, 'exec'), run_globals)
+        run_globals: dict[str, Any] = {"__file__": run_file}
+        exec(compile(open(run_file).read(), run_file, "exec"), run_globals)
         return run_globals["update_conformance"](version, dest_folder, None, patches_dir)
 
-    @Command('smoketest',
-             description='Load a simple page in Servo and ensure that it closes properly',
-             category='testing')
-    @CommandArgument('params', nargs='...',
-                     help="Command-line arguments to be passed through to Servo")
-    def smoketest(self, params):
-        params = params + ['tests/html/close-on-load.html']
-        return self.context.commands.dispatch(
-            'run', self.context, params=params)
+    @Command("update-webgpu", description="Update the WebGPU conformance test suite", category="testing")
+    @CommandArgument("--repo", "-r", default="https://github.com/gpuweb/cts", help="Repo to vendor cts from")
+    @CommandArgument("--checkout", "-c", default="main", help="Branch or commit of repo")
+    def cts(self, repo: str = "https://github.com/gpuweb/cts", checkout: str = "main") -> int:
+        tdir = path.join(self.context.topdir, "tests/wpt/webgpu/tests")
+        clone_dir = path.join(tdir, "cts_clone")
+        # clone
+        res = call(["git", "clone", "-n", repo, "cts_clone"], cwd=tdir)
+        if res != 0:
+            return res
+        # checkout
+        res = call(["git", "checkout", checkout], cwd=clone_dir)
+        if res != 0:
+            return res
+        # build
+        res = call(["npm", "ci"], cwd=clone_dir)
+        if res != 0:
+            return res
+        res = call(["npm", "run", "wpt"], cwd=clone_dir)
+        if res != 0:
+            return res
+        # https://github.com/gpuweb/cts/pull/2770
+        delete(path.join(clone_dir, "out-wpt", "cts-chunked2sec.https.html"))
+        cts_html = path.join(clone_dir, "out-wpt", "cts.https.html")
+        # patch
+        with open(cts_html, "r") as file:
+            filedata = file.read()
+        # files are mounted differently
+        filedata = filedata.replace("src=/webgpu/common/runtime/wpt.js", "src=../webgpu/common/runtime/wpt.js")
+        # Mark all webgpu tests as long to increase their timeouts. This is needed due to wgpu's slowness.
+        # TODO: replace this with more fine grained solution: https://github.com/servo/servo/issues/30999
+        filedata = filedata.replace(
+            "<meta charset=utf-8>", '<meta charset=utf-8>\n<meta name="timeout" content="long">'
+        )
+        # Write the file out again
+        with open(cts_html, "w") as file:
+            file.write(filedata)
+        logger = path.join(clone_dir, "out-wpt", "common/internal/logging/test_case_recorder.js")
+        with open(logger, "r") as file:
+            filedata = file.read()
+        filedata.replace("info(ex) {", "info(ex) {return;")
+        with open(logger, "w") as file:
+            file.write(filedata)
+        # copy
+        delete(path.join(tdir, "webgpu"))
+        shutil.copytree(path.join(clone_dir, "out-wpt"), path.join(tdir, "webgpu"))
+        # update commit
+        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=clone_dir).decode()
+        with open(path.join(tdir, "checkout_commit.txt"), "w") as file:
+            file.write(commit)
+        # clean up
+        delete(clone_dir)
+        print("Updating manifest.")
+        return self.context.commands.dispatch("update-manifest", self.context)
+
+    @Command(
+        "smoketest", description="Load a simple page in Servo and ensure that it closes properly", category="testing"
+    )
+    @CommandArgument("params", nargs="...", help="Command-line arguments to be passed through to Servo")
+    @CommandBase.common_command_arguments(binary_selection=True)
+    def smoketest(self, servo_binary: str, params: list[str], **kwargs: Any) -> int | None:
+        # We pass `-f` here so that any thread panic will cause Servo to exit,
+        # preventing a panic from hanging execution. This means that these kind
+        # of panics won't cause timeouts on CI.
+        return PostBuildCommands(self.context)._run(servo_binary, params + ["-f", "tests/html/close-on-load.html"])
+
+    @Command("try", description="Runs try jobs by force pushing to try branch", category="testing")
+    @CommandArgument("--remote", "-r", default="origin", help="A git remote to run the try job on")
+    @CommandArgument(
+        "try_strings", default=["full"], nargs="...", help="A list of try strings specifying what kind of job to run."
+    )
+    def try_command(self, remote: str, try_strings: list[str]) -> int:
+        if subprocess.check_output(["git", "diff", "--cached", "--name-only"]).strip():
+            print("Cannot run `try` with staged and uncommited changes. ")
+            print("Please either commit or stash them before running `try`.")
+            return 1
+
+        remote_url = subprocess.check_output(["git", "config", "--get", f"remote.{remote}.url"]).decode().strip()
+        if "github.com" not in remote_url:
+            print(f"The remote provided ({remote_url}) isn't a GitHub remote.")
+            return 1
+
+        try_string = " ".join(try_strings)
+        try:
+            config = servo.try_parser.Config(try_string)
+        except ValueError as err:
+            print(f"Failed to parse `try` config because of {err}")
+            return 1
+        print(f"Trying on {remote} ({remote_url}) with following configuration:")
+        print()
+        print(textwrap.indent(config.to_json(indent=2), prefix="  "))
+        print()
+
+        # The commit message is composed of both the last commit message and the try string.
+        commit_message = subprocess.check_output(["git", "show", "-s", "--format=%s"]).decode().strip()
+        commit_message = f"{commit_message} ({try_string})"
+
+        result = call(
+            [
+                "git",
+                "commit",
+                "--no-verify",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                commit_message,
+                "-m",
+                f"{config.to_json()}",
+            ]
+        )
+        if result != 0:
+            return result
+
+        # From here on out, we need to always clean up the commit we added to the branch.
+        try:
+            result = call(["git", "push", "--quiet", remote, "--force", "HEAD:try"])
+            if result != 0:
+                return result
+
+            # TODO: This is a pretty naive approach to turning a GitHub remote URL (either SSH or HTTPS)
+            # into a URL to the Actions page. It might be better to create this action with the `gh`
+            # tool and get the real URL.
+            actions_url = remote_url.replace(".git", "/actions")
+            if not actions_url.startswith("https"):
+                actions_url = actions_url.replace(":", "/")
+                actions_url = actions_url.replace("git@", "")
+                actions_url = f"https://{actions_url}"
+            print(f"Actions available at: {actions_url}")
+
+        finally:
+            # Remove the last commit which only contains the try configuration.
+            result = call(["git", "reset", "--quiet", "--soft", "HEAD~1"])
+            if result != 0:
+                print("Could not clean up try commit. Sorry! Please try to reset to the previous commit.")
+            return result
+
+
+def create_parser_create() -> ArgumentParser:
+    import argparse
+
+    p = argparse.ArgumentParser()
+    p.add_argument("--no-editor", action="store_true", help="Don't try to open the test in an editor")
+    p.add_argument("-e", "--editor", action="store", help="Editor to use")
+    p.add_argument(
+        "--no-run", action="store_true", help="Don't try to update the wpt manifest or open the test in a browser"
+    )
+    p.add_argument("--release", action="store_true", help="Run with a release build of servo")
+    p.add_argument(
+        "--long-timeout",
+        action="store_true",
+        help="Test should be given a long timeout (typically 60s rather than 10s,but varies depending on environment)",
+    )
+    p.add_argument("--overwrite", action="store_true", help="Allow overwriting an existing test file")
+    (
+        p.add_argument(
+            "-r", "--reftest", action="store_true", help="Create a reftest rather than a testharness (js) test"
+        ),
+    )
+    p.add_argument("-ref", "--reference", dest="ref", help="Path to the reference file")
+    p.add_argument("--mismatch", action="store_true", help="Create a mismatch reftest")
+    p.add_argument("--wait", action="store_true", help="Create a reftest that waits until takeScreenshot() is called")
+    p.add_argument("path", action="store", help="Path to the test file")
+    return p

@@ -3,21 +3,43 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-# The beginning of this script is both valid shell and valid python,
-# such that the script starts with the shell and is reexecuted with
-# the right python.
-''':' && if [ ! -z "$MSYSTEM" ] ; then exec python "$0" "$@" ; else which python3 > /dev/null 2> /dev/null && exec python3 "$0" "$@" || exec python "$0" "$@" ; fi
-'''
+# The beginning of this script is both valid shell and valid python, such that
+# the script starts with the shell and is reexecuted with `uv run`. This
+# ensures that the Python provided by the virtual environment (in the .venv
+# directory) is used. If the virtual environment does not exist, `uv run` will
+# still use the correct version of Python given in `.python-version` and
+# python/mach_bootstrap.py will provision a new environment that will be used
+# for the subsequent runs.
+''':' && {
+    MACH_DIR=$(dirname "$0");
+    run_in_nix_if_needed() {
+        if { [ -f /etc/NIXOS ] || [ -n "${MACH_USE_NIX}" ]; } && [ -z "${IN_NIX_SHELL}" ]; then
+            EXTRA_NIX_ARGS=${SERVO_ANDROID_BUILD:+'--arg buildAndroid true'}
 
-from __future__ import print_function, unicode_literals
+            # `nix-shell` needs the whole command passed as a single argument, so the arguments need
+            # to be shell-quoted. Rotate through the arguments, replacing them with quoted versions.
+            for arg in "$@"; do
+                set -- "$@" "$(printf \%q "$1")"
+                shift
+            done
+
+            echo "NOTE: Entering nix-shell ${MACH_DIR}/shell.nix"
+            exec nix-shell "${MACH_DIR}/shell.nix" $EXTRA_NIX_ARGS --run "$*"
+        else
+            exec "$@"
+        fi
+    }
+
+    run_in_nix_if_needed uv run --no-project python ${MACH_DIR}/mach "$@"
+}
+'''
 
 import os
 import sys
 
-if sys.version_info < (3, 5):
-    print("mach does not support python < 3.5, please install python 3 >= 3.5")
-    sys.exit(1)
-
+# On NixOS, prepend nix-provided binary paths so they take precedence over .venv/bin
+if 'SERVO_NIX_BIN_DIR' in os.environ:
+    os.environ['PATH'] = os.environ['SERVO_NIX_BIN_DIR'] + os.pathsep + os.environ.get('PATH', '')
 
 def main(args):
     topdir = os.path.abspath(os.path.dirname(sys.argv[0]))
@@ -31,17 +53,4 @@ def main(args):
 
 
 if __name__ == '__main__':
-    sys.dont_write_bytecode = True
-
-    if os.path.exists('/etc/NIXOS') and not 'IN_NIX_SHELL' in os.environ: # we're on a nixOS system, need to run mach in nix-shell
-        import subprocess
-        from shlex import quote
-        mach_dir = os.path.abspath(os.path.dirname(__file__))
-        print('NOTE: Entering nix-shell etc/shell.nix')
-        try:
-            # sys argv already contains the ./mach part, so we just need to pass it as-is
-            subprocess.Popen(['nix-shell', mach_dir + '/etc/shell.nix', '--run', ' '.join(map(quote, sys.argv))]).wait()
-        except KeyboardInterrupt:
-            sys.exit(0)
-    else:
-        main(sys.argv)
+    main(sys.argv)

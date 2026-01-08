@@ -2,13 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use base::id::{BrowsingContextGroupId, BrowsingContextId, PipelineId, WebViewId};
+use embedder_traits::ViewportDetails;
+use log::warn;
+use rustc_hash::{FxHashMap, FxHashSet};
+
 use crate::pipeline::Pipeline;
-use euclid::Size2D;
-use msg::constellation_msg::{
-    BrowsingContextGroupId, BrowsingContextId, PipelineId, TopLevelBrowsingContextId,
-};
-use std::collections::{HashMap, HashSet};
-use style_traits::CSSPixel;
 
 /// Because a browsing context is only constructed once the document that's
 /// going to be in it becomes active (i.e. not when a pipeline is spawned), some
@@ -16,6 +15,7 @@ use style_traits::CSSPixel;
 /// constructing it. Thus, every time a pipeline is created for a browsing
 /// context which doesn't exist yet, these values needed for the new browsing
 /// context are stored here so that they may be available later.
+#[derive(Debug)]
 pub struct NewBrowsingContextInfo {
     /// The parent pipeline that contains this browsing context. `None` if this
     /// is a top level browsing context.
@@ -27,9 +27,9 @@ pub struct NewBrowsingContextInfo {
     /// Whether this browsing context inherits a secure context.
     pub inherited_secure_context: Option<bool>,
 
-    /// Whether this browsing context should be treated as visible for the
-    /// purposes of scheduling and resource management.
-    pub is_visible: bool,
+    /// Whether this browsing context should be throttled, using less resources
+    /// by stopping animations and running timers at a heavily limited rate.
+    pub throttled: bool,
 }
 
 /// The constellation's view of a browsing context.
@@ -46,10 +46,10 @@ pub struct BrowsingContext {
     pub id: BrowsingContextId,
 
     /// The top-level browsing context ancestor
-    pub top_level_id: TopLevelBrowsingContextId,
+    pub webview_id: WebViewId,
 
-    /// The size of the frame.
-    pub size: Size2D<f32, CSSPixel>,
+    /// The [`ViewportDetails`] of the frame that this [`BrowsingContext`] represents.
+    pub viewport_details: ViewportDetails,
 
     /// Whether this browsing context is in private browsing mode.
     pub is_private: bool,
@@ -57,9 +57,9 @@ pub struct BrowsingContext {
     /// Whether this browsing context inherits a secure context.
     pub inherited_secure_context: Option<bool>,
 
-    /// Whether this browsing context should be treated as visible for the
-    /// purposes of scheduling and resource management.
-    pub is_visible: bool,
+    /// Whether this browsing context should be throttled, using less resources
+    /// by stopping animations and running timers at a heavily limited rate.
+    pub throttled: bool,
 
     /// The pipeline for the current session history entry.
     pub pipeline_id: PipelineId,
@@ -70,33 +70,34 @@ pub struct BrowsingContext {
 
     /// All the pipelines that have been presented or will be presented in
     /// this browsing context.
-    pub pipelines: HashSet<PipelineId>,
+    pub pipelines: FxHashSet<PipelineId>,
 }
 
 impl BrowsingContext {
     /// Create a new browsing context.
     /// Note this just creates the browsing context, it doesn't add it to the constellation's set of browsing contexts.
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         bc_group_id: BrowsingContextGroupId,
         id: BrowsingContextId,
-        top_level_id: TopLevelBrowsingContextId,
+        webview_id: WebViewId,
         pipeline_id: PipelineId,
         parent_pipeline_id: Option<PipelineId>,
-        size: Size2D<f32, CSSPixel>,
+        viewport_details: ViewportDetails,
         is_private: bool,
         inherited_secure_context: Option<bool>,
-        is_visible: bool,
+        throttled: bool,
     ) -> BrowsingContext {
-        let mut pipelines = HashSet::new();
+        let mut pipelines = FxHashSet::default();
         pipelines.insert(pipeline_id);
         BrowsingContext {
             bc_group_id,
             id,
-            top_level_id,
-            size,
+            webview_id,
+            viewport_details,
             is_private,
             inherited_secure_context,
-            is_visible,
+            throttled,
             pipeline_id,
             parent_pipeline_id,
             pipelines,
@@ -109,7 +110,7 @@ impl BrowsingContext {
 
     /// Is this a top-level browsing context?
     pub fn is_top_level(&self) -> bool {
-        self.id == self.top_level_id
+        self.id == self.webview_id
     }
 }
 
@@ -121,12 +122,12 @@ pub struct FullyActiveBrowsingContextsIterator<'a> {
     pub stack: Vec<BrowsingContextId>,
 
     /// The set of all browsing contexts.
-    pub browsing_contexts: &'a HashMap<BrowsingContextId, BrowsingContext>,
+    pub browsing_contexts: &'a FxHashMap<BrowsingContextId, BrowsingContext>,
 
     /// The set of all pipelines.  We use this to find the active
     /// children of a frame, which are the iframes in the currently
     /// active document.
-    pub pipelines: &'a HashMap<PipelineId, Pipeline>,
+    pub pipelines: &'a FxHashMap<PipelineId, Pipeline>,
 }
 
 impl<'a> Iterator for FullyActiveBrowsingContextsIterator<'a> {
@@ -168,12 +169,12 @@ pub struct AllBrowsingContextsIterator<'a> {
     pub stack: Vec<BrowsingContextId>,
 
     /// The set of all browsing contexts.
-    pub browsing_contexts: &'a HashMap<BrowsingContextId, BrowsingContext>,
+    pub browsing_contexts: &'a FxHashMap<BrowsingContextId, BrowsingContext>,
 
     /// The set of all pipelines.  We use this to find the
     /// children of a browsing context, which are the iframes in all documents
     /// in the session history.
-    pub pipelines: &'a HashMap<PipelineId, Pipeline>,
+    pub pipelines: &'a FxHashMap<PipelineId, Pipeline>,
 }
 
 impl<'a> Iterator for AllBrowsingContextsIterator<'a> {
@@ -195,7 +196,7 @@ impl<'a> Iterator for AllBrowsingContextsIterator<'a> {
             let child_browsing_context_ids = browsing_context
                 .pipelines
                 .iter()
-                .filter_map(|pipeline_id| pipelines.get(&pipeline_id))
+                .filter_map(|pipeline_id| pipelines.get(pipeline_id))
                 .flat_map(|pipeline| pipeline.children.iter());
             self.stack.extend(child_browsing_context_ids);
             return Some(browsing_context);

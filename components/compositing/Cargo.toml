@@ -1,11 +1,11 @@
 [package]
 name = "compositing"
-version = "0.0.1"
-authors = ["The Servo Project Developers"]
-license = "MPL-2.0"
-edition = "2018"
-publish = false
-build = "build.rs"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
 
 [lib]
 name = "compositing"
@@ -13,35 +13,53 @@ path = "lib.rs"
 
 [features]
 default = []
-gl = ["gleam", "pixels"]
+tracing = ["dep:tracing"]
+webgpu = ["dep:webgpu"]
+webxr = ["dep:webxr", "dep:webxr-api"]
+
+[lints.clippy]
+unwrap_used = "deny"
+panic = "deny"
 
 [dependencies]
-canvas = { path = "../canvas" }
-crossbeam-channel = "0.4"
-embedder_traits = { path = "../embedder_traits" }
-euclid = "0.20"
-gfx_traits = { path = "../gfx_traits" }
-gleam = { version = "0.12", optional = true }
-image = "0.24"
-ipc-channel = "0.14"
-keyboard-types = "0.6"
-libc = "0.2"
-log = "0.4"
-msg = { path = "../msg" }
-net_traits = { path = "../net_traits" }
-num-traits = "0.2"
-pixels = { path = "../pixels", optional = true }
-profile_traits = { path = "../profile_traits" }
-script_traits = { path = "../script_traits" }
-servo-media = { git = "https://github.com/servo/media" }
+base = { workspace = true }
+bincode = { workspace = true }
+bitflags = { workspace = true }
+canvas_traits = { workspace = true }
+compositing_traits = { workspace = true }
+constellation_traits = { workspace = true }
+crossbeam-channel = { workspace = true }
+dpi = { workspace = true }
+embedder_traits = { workspace = true }
+euclid = { workspace = true }
+gleam = { workspace = true }
+image = { workspace = true }
+ipc-channel = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+media = { path = "../media" }
+malloc_size_of = { workspace = true }
+parking_lot = { workspace = true }
+pixels = { path = "../pixels" }
+profile_traits = { workspace = true }
+rayon = { workspace = true }
+rustc-hash = { workspace = true }
+servo-tracing = { workspace = true }
+servo_allocator = { path = "../allocator" }
+servo_config = { path = "../config" }
 servo_geometry = { path = "../geometry" }
-servo_url = { path = "../url" }
-style_traits = { path = "../style_traits" }
-time = "0.1.41"
-webrender = { git = "https://github.com/servo/webrender", features = ["capture"] }
-webrender_api = { git = "https://github.com/servo/webrender" }
-webrender_surfman = { path = "../webrender_surfman" }
-webxr = { git = "https://github.com/servo/webxr" }
+smallvec = { workspace = true }
+stylo_traits = { workspace = true }
+surfman = { workspace = true }
+timers = { path = "../timers" }
+tracing = { workspace = true, optional = true }
+webgl = { path = "../webgl" }
+webgpu = { path = "../webgpu", optional = true }
+webrender = { workspace = true }
+webrender_api = { workspace = true }
+webxr = { path = "../webxr", optional = true }
+webxr-api = { workspace = true, optional = true }
+wr_malloc_size_of = { workspace = true }
 
-[build-dependencies]
-toml = "0.5"
+[dev-dependencies]
+surfman = { workspace = true }

@@ -11,90 +11,109 @@
 //! over events from the network and events from the DOM, using async/await to avoid
 //! the need for a dedicated thread per websocket.
 
-use crate::connector::{create_tls_config, ALPN_H1};
-use crate::cookie::Cookie;
-use crate::fetch::methods::should_be_blocked_due_to_bad_port;
-use crate::hosts::replace_host;
-use crate::http_loader::HttpState;
-use async_tungstenite::tokio::{client_async_tls_with_connector_and_config, ConnectStream};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use async_tungstenite::WebSocketStream;
-use embedder_traits::resources::{self, Resource};
-use futures::future::TryFutureExt;
-use futures::sink::SinkExt;
+use async_tungstenite::tokio::{ConnectStream, client_async_tls_with_connector_and_config};
+use base64::Engine;
 use futures::stream::StreamExt;
-use http::header::{HeaderMap, HeaderName, HeaderValue};
+use http::HeaderMap;
+use http::header::{self, HeaderName, HeaderValue};
 use ipc_channel::ipc::{IpcReceiver, IpcSender};
 use ipc_channel::router::ROUTER;
+use log::{debug, trace, warn};
 use net_traits::request::{RequestBuilder, RequestMode};
-use net_traits::{CookieSource, MessageData};
-use net_traits::{WebSocketDomAction, WebSocketNetworkEvent};
-use openssl::ssl::ConnectConfiguration;
+use net_traits::{CookieSource, MessageData, WebSocketDomAction, WebSocketNetworkEvent};
 use servo_url::ServoUrl;
-use std::fs;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use tokio2::net::TcpStream;
-use tokio2::runtime::Runtime;
-use tokio2::select;
-use tokio2::sync::mpsc::{unbounded_channel, UnboundedReceiver};
-use tungstenite::error::Error;
-use tungstenite::error::Result as WebSocketResult;
-use tungstenite::handshake::client::{Request, Response};
-use tungstenite::http::header::{self as WSHeader, HeaderValue as WSHeaderValue};
+use tokio::net::TcpStream;
+use tokio::select;
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use tokio_rustls::TlsConnector;
+use tungstenite::error::{Error, ProtocolError, UrlError};
+use tungstenite::handshake::client::Response;
 use tungstenite::protocol::CloseFrame;
-use tungstenite::Message;
-use url::Url;
+use tungstenite::{ClientRequestBuilder, Message};
 
-// Websockets get their own tokio runtime that's independent of the one used for
-// HTTP connections, otherwise a large number of websockets could occupy all workers
-// and starve other network traffic.
-lazy_static! {
-    pub static ref HANDLE: Mutex<Option<Runtime>> = Mutex::new(Some(Runtime::new().unwrap()));
-}
+use crate::async_runtime::spawn_task;
+use crate::connector::TlsConfig;
+use crate::cookie::ServoCookie;
+use crate::hosts::replace_host;
+use crate::http_loader::HttpState;
 
-/// Create a tungstenite Request object for the initial HTTP request.
+/// Create a Request object for the initial HTTP request.
 /// This request contains `Origin`, `Sec-WebSocket-Protocol`, `Authorization`,
 /// and `Cookie` headers as appropriate.
 /// Returns an error if any header values are invalid or tungstenite cannot create
 /// the desired request.
-fn create_request(
-    resource_url: &ServoUrl,
-    origin: &str,
-    protocols: &[String],
-    http_state: &HttpState,
-) -> WebSocketResult<Request> {
-    let mut builder = Request::get(resource_url.as_str());
-    let headers = builder.headers_mut().unwrap();
-    headers.insert("Origin", WSHeaderValue::from_str(origin)?);
+pub fn create_handshake_request(
+    request: RequestBuilder,
+    http_state: Arc<HttpState>,
+) -> Result<net_traits::request::Request, Error> {
+    let origin = request.url.origin();
 
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "Origin",
+        HeaderValue::from_str(&request.url.origin().ascii_serialization())?,
+    );
+
+    let host = format!(
+        "{}",
+        origin
+            .host()
+            .ok_or_else(|| Error::Url(UrlError::NoHostName))?
+    );
+    headers.insert("Host", HeaderValue::from_str(&host)?);
+    // https://websockets.spec.whatwg.org/#concept-websocket-establish
+    // 3. Append (`Upgrade`, `websocket`) to request’s header list.
+    headers.insert("Upgrade", HeaderValue::from_static("websocket"));
+
+    // 4. Append (`Connection`, `Upgrade`) to request’s header list.
+    headers.insert("Connection", HeaderValue::from_static("upgrade"));
+
+    // 5. Let keyValue be a nonce consisting of a randomly selected 16-byte value that has been
+    // forgiving-base64-encoded and isomorphic encoded.
+    let key = HeaderValue::from_str(&tungstenite::handshake::client::generate_key()).unwrap();
+
+    // 6. Append (`Sec-WebSocket-Key`, keyValue) to request’s header list.
+    headers.insert("Sec-WebSocket-Key", key);
+
+    // 7. Append (`Sec-WebSocket-Version`, `13`) to request’s header list.
+    headers.insert("Sec-Websocket-Version", HeaderValue::from_static("13"));
+
+    // 8. For each protocol in protocols, combine (`Sec-WebSocket-Protocol`, protocol) in request’s
+    // header list.
+    let protocols = match request.mode {
+        RequestMode::WebSocket {
+            ref protocols,
+            original_url: _,
+        } => protocols,
+        _ => unreachable!("How did we get here?"),
+    };
     if !protocols.is_empty() {
         let protocols = protocols.join(",");
-        headers.insert(
-            "Sec-WebSocket-Protocol",
-            WSHeaderValue::from_str(&protocols)?,
-        );
+        headers.insert("Sec-WebSocket-Protocol", HeaderValue::from_str(&protocols)?);
     }
 
-    let mut cookie_jar = http_state.cookie_jar.write().unwrap();
-    cookie_jar.remove_expired_cookies_for_url(resource_url);
-    if let Some(cookie_list) = cookie_jar.cookies_for_url(resource_url, CookieSource::HTTP) {
-        headers.insert("Cookie", WSHeaderValue::from_str(&cookie_list)?);
+    let mut cookie_jar = http_state.cookie_jar.write();
+    cookie_jar.remove_expired_cookies_for_url(&request.url);
+    if let Some(cookie_list) = cookie_jar.cookies_for_url(&request.url, CookieSource::HTTP) {
+        headers.insert("Cookie", HeaderValue::from_str(&cookie_list)?);
     }
 
-    if resource_url.password().is_some() || resource_url.username() != "" {
-        let basic = base64::encode(&format!(
+    if request.url.password().is_some() || request.url.username() != "" {
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!(
             "{}:{}",
-            resource_url.username(),
-            resource_url.password().unwrap_or("")
+            request.url.username(),
+            request.url.password().unwrap_or("")
         ));
         headers.insert(
             "Authorization",
-            WSHeaderValue::from_str(&format!("Basic {}", basic))?,
+            HeaderValue::from_str(&format!("Basic {}", basic))?,
         );
     }
-
-    let request = builder.body(())?;
-    Ok(request)
+    Ok(request.headers(headers).build())
 }
 
 /// Process an HTTP response resulting from a WS handshake.
@@ -110,44 +129,35 @@ fn process_ws_response(
     trace!("processing websocket http response for {}", resource_url);
     let mut protocol_in_use = None;
     if let Some(protocol_name) = response.headers().get("Sec-WebSocket-Protocol") {
-        let protocol_name = protocol_name.to_str().unwrap();
+        let protocol_name = protocol_name.to_str().unwrap_or("");
         if !protocols.is_empty() && !protocols.iter().any(|p| protocol_name == (*p)) {
-            return Err(Error::Protocol(
-                "Protocol in use not in client-supplied protocol list".into(),
-            ));
+            return Err(Error::Protocol(ProtocolError::InvalidHeader(Box::new(
+                HeaderName::from_static("sec-websocket-protocol"),
+            ))));
         }
         protocol_in_use = Some(protocol_name.to_string());
     }
 
-    let mut jar = http_state.cookie_jar.write().unwrap();
+    let mut jar = http_state.cookie_jar.write();
     // TODO(eijebong): Replace thise once typed headers settled on a cookie impl
-    for cookie in response.headers().get_all(WSHeader::SET_COOKIE) {
-        if let Ok(s) = std::str::from_utf8(cookie.as_bytes()) {
+    for cookie in response.headers().get_all(header::SET_COOKIE) {
+        let cookie_bytes = cookie.as_bytes();
+        if !ServoCookie::is_valid_name_or_value(cookie_bytes) {
+            continue;
+        }
+        if let Ok(s) = std::str::from_utf8(cookie_bytes) {
             if let Some(cookie) =
-                Cookie::from_cookie_string(s.into(), resource_url, CookieSource::HTTP)
+                ServoCookie::from_cookie_string(s, resource_url, CookieSource::HTTP)
             {
                 jar.push(cookie, resource_url, CookieSource::HTTP);
             }
         }
     }
 
-    // We need to make a new header map here because tungstenite depends on
-    // a more recent version of http than the rest of the network stack, so the
-    // HeaderMap types are incompatible.
-    let mut headers = HeaderMap::new();
-    for (key, value) in response.headers().iter() {
-        if let (Ok(key), Ok(value)) = (
-            HeaderName::from_bytes(key.as_ref()),
-            HeaderValue::from_bytes(value.as_ref()),
-        ) {
-            headers.insert(key, value);
-        }
-    }
     http_state
         .hsts_list
         .write()
-        .unwrap()
-        .update_hsts_list_from_response(resource_url, &headers);
+        .update_hsts_list_from_response(resource_url, response.headers());
 
     Ok(protocol_in_use)
 }
@@ -166,19 +176,19 @@ fn setup_dom_listener(
 ) -> UnboundedReceiver<DomMsg> {
     let (sender, receiver) = unbounded_channel();
 
-    ROUTER.add_route(
-        dom_action_receiver.to_opaque(),
+    ROUTER.add_typed_route(
+        dom_action_receiver,
         Box::new(move |message| {
-            let dom_action = message.to().expect("Ws dom_action message to deserialize");
+            let dom_action = message.expect("Ws dom_action message to deserialize");
             trace!("handling WS DOM action: {:?}", dom_action);
             match dom_action {
                 WebSocketDomAction::SendMessage(MessageData::Text(data)) => {
-                    if let Err(e) = sender.send(DomMsg::Send(Message::Text(data))) {
+                    if let Err(e) = sender.send(DomMsg::Send(Message::Text(data.into()))) {
                         warn!("Error sending websocket message: {:?}", e);
                     }
                 },
                 WebSocketDomAction::SendMessage(MessageData::Binary(data)) => {
-                    if let Err(e) = sender.send(DomMsg::Send(Message::Binary(data))) {
+                    if let Err(e) = sender.send(DomMsg::Send(Message::Binary(data.into()))) {
                         warn!("Error sending websocket message: {:?}", e);
                     }
                 },
@@ -250,7 +260,7 @@ async fn run_ws_loop(
                 };
                 match msg {
                     Message::Text(s) => {
-                        let message = MessageData::Text(s);
+                        let message = MessageData::Text(s.as_str().to_owned());
                         if let Err(e) = resource_event_sender
                             .send(WebSocketNetworkEvent::MessageReceived(message))
                         {
@@ -260,7 +270,7 @@ async fn run_ws_loop(
                     }
 
                     Message::Binary(v) => {
-                        let message = MessageData::Binary(v);
+                        let message = MessageData::Binary(v.to_vec());
                         if let Err(e) = resource_event_sender
                             .send(WebSocketNetworkEvent::MessageReceived(message))
                         {
@@ -283,6 +293,10 @@ async fn run_ws_loop(
                         ));
                         break;
                     }
+
+                    Message::Frame(_) => {
+                        warn!("Unexpected websocket frame message");
+                    }
                 }
             }
         }
@@ -292,176 +306,70 @@ async fn run_ws_loop(
 /// Initiate a new async WS connection. Returns an error if the connection fails
 /// for any reason, or if the response isn't valid. Otherwise, the endless WS
 /// listening loop will be started.
-async fn start_websocket(
+pub(crate) async fn start_websocket(
     http_state: Arc<HttpState>,
-    url: ServoUrl,
     resource_event_sender: IpcSender<WebSocketNetworkEvent>,
-    protocols: Vec<String>,
-    client: Request,
-    tls_config: ConnectConfiguration,
+    protocols: &[String],
+    client: &net_traits::request::Request,
+    tls_config: TlsConfig,
     dom_action_receiver: IpcReceiver<WebSocketDomAction>,
-) -> Result<(), Error> {
-    trace!("starting WS connection to {}", url);
+) -> Result<Response, Error> {
+    trace!("starting WS connection to {}", client.url());
 
     let initiated_close = Arc::new(AtomicBool::new(false));
     let dom_receiver = setup_dom_listener(dom_action_receiver, initiated_close.clone());
 
-    let host_str = client
-        .uri()
-        .host()
-        .ok_or_else(|| Error::Url("No host string".into()))?;
-    let host = replace_host(host_str);
-    let mut net_url =
-        Url::parse(&client.uri().to_string()).map_err(|e| Error::Url(e.to_string().into()))?;
+    let url = client.url();
+    let host = replace_host(url.host_str().expect("URL has no host"));
+    let mut net_url = client.url().into_url();
     net_url
         .set_host(Some(&host))
-        .map_err(|e| Error::Url(e.to_string().into()))?;
+        .map_err(|e| Error::Url(UrlError::UnableToConnect(e.to_string())))?;
 
     let domain = net_url
         .host()
-        .ok_or_else(|| Error::Url("No host string".into()))?;
+        .ok_or_else(|| Error::Url(UrlError::NoHostName))?;
     let port = net_url
         .port_or_known_default()
-        .ok_or_else(|| Error::Url("Unknown port".into()))?;
+        .ok_or_else(|| Error::Url(UrlError::UnableToConnect("Unknown port".into())))?;
 
     let try_socket = TcpStream::connect((&*domain.to_string(), port)).await;
     let socket = try_socket.map_err(Error::Io)?;
-    let (stream, response) =
-        client_async_tls_with_connector_and_config(client, socket, Some(tls_config), None).await?;
+    let connector = TlsConnector::from(Arc::new(tls_config));
 
-    let protocol_in_use = process_ws_response(&http_state, &response, &url, &protocols)?;
+    // TODO(pylbrecht): move request conversion to a separate function
+    let mut original_url = client.original_url();
+    if original_url.scheme() == "ws" && url.scheme() == "https" {
+        original_url.as_mut_url().set_scheme("wss").unwrap();
+    }
+    let mut builder =
+        ClientRequestBuilder::new(original_url.as_str().parse().expect("unable to parse URI"));
+    for (key, value) in client.headers.iter() {
+        builder = builder.with_header(
+            key.as_str(),
+            value
+                .to_str()
+                .expect("unable to convert header value to string"),
+        );
+    }
+
+    let (stream, response) =
+        client_async_tls_with_connector_and_config(builder, socket, Some(connector), None).await?;
+
+    let protocol_in_use = process_ws_response(&http_state, &response, &url, protocols)?;
 
     if !initiated_close.load(Ordering::SeqCst) {
         if resource_event_sender
             .send(WebSocketNetworkEvent::ConnectionEstablished { protocol_in_use })
             .is_err()
         {
-            return Ok(());
+            return Ok(response);
         }
 
         trace!("about to start ws loop for {}", url);
-        run_ws_loop(dom_receiver, resource_event_sender, stream).await;
+        spawn_task(run_ws_loop(dom_receiver, resource_event_sender, stream));
     } else {
         trace!("client closed connection for {}, not running loop", url);
     }
-    Ok(())
-}
-
-/// Create a new websocket connection for the given request.
-fn connect(
-    mut req_builder: RequestBuilder,
-    resource_event_sender: IpcSender<WebSocketNetworkEvent>,
-    dom_action_receiver: IpcReceiver<WebSocketDomAction>,
-    http_state: Arc<HttpState>,
-    certificate_path: Option<String>,
-) -> Result<(), String> {
-    let protocols = match req_builder.mode {
-        RequestMode::WebSocket { protocols } => protocols,
-        _ => {
-            return Err(
-                "Received a RequestBuilder with a non-websocket mode in websocket_loader"
-                    .to_string(),
-            )
-        },
-    };
-
-    // https://fetch.spec.whatwg.org/#websocket-opening-handshake
-    // By standard, we should work with an http(s):// URL (req_url),
-    // but as ws-rs expects to be called with a ws(s):// URL (net_url)
-    // we upgrade ws to wss, so we don't have to convert http(s) back to ws(s).
-    http_state
-        .hsts_list
-        .read()
-        .unwrap()
-        .apply_hsts_rules(&mut req_builder.url);
-
-    let scheme = req_builder.url.scheme();
-    let mut req_url = req_builder.url.clone();
-    match scheme {
-        "ws" => {
-            req_url
-                .as_mut_url()
-                .set_scheme("http")
-                .map_err(|()| "couldn't replace scheme".to_string())?;
-        },
-        "wss" => {
-            req_url
-                .as_mut_url()
-                .set_scheme("https")
-                .map_err(|()| "couldn't replace scheme".to_string())?;
-        },
-        _ => {},
-    }
-
-    if should_be_blocked_due_to_bad_port(&req_url) {
-        return Err("Port blocked".to_string());
-    }
-
-    let certs = match certificate_path {
-        Some(ref path) => fs::read_to_string(path).map_err(|e| e.to_string())?,
-        None => resources::read_string(Resource::SSLCertificates),
-    };
-
-    let client = match create_request(
-        &req_builder.url,
-        &req_builder.origin.ascii_serialization(),
-        &protocols,
-        &*http_state,
-    ) {
-        Ok(c) => c,
-        Err(e) => return Err(e.to_string()),
-    };
-
-    let tls_config = create_tls_config(
-        &certs,
-        ALPN_H1,
-        http_state.extra_certs.clone(),
-        http_state.connection_certs.clone(),
-    );
-    let tls_config = match tls_config.build().configure() {
-        Ok(c) => c,
-        Err(e) => return Err(e.to_string()),
-    };
-
-    let resource_event_sender2 = resource_event_sender.clone();
-    match HANDLE.lock().unwrap().as_mut() {
-        Some(handle) => handle.spawn(
-            start_websocket(
-                http_state,
-                req_builder.url.clone(),
-                resource_event_sender,
-                protocols,
-                client,
-                tls_config,
-                dom_action_receiver,
-            )
-            .map_err(move |e| {
-                warn!("Failed to establish a WebSocket connection: {:?}", e);
-                let _ = resource_event_sender2.send(WebSocketNetworkEvent::Fail);
-            }),
-        ),
-        None => return Err("No runtime available".to_string()),
-    };
-    Ok(())
-}
-
-/// Create a new websocket connection for the given request.
-pub fn init(
-    req_builder: RequestBuilder,
-    resource_event_sender: IpcSender<WebSocketNetworkEvent>,
-    dom_action_receiver: IpcReceiver<WebSocketDomAction>,
-    http_state: Arc<HttpState>,
-    certificate_path: Option<String>,
-) {
-    let resource_event_sender2 = resource_event_sender.clone();
-    if let Err(e) = connect(
-        req_builder,
-        resource_event_sender,
-        dom_action_receiver,
-        http_state,
-        certificate_path,
-    ) {
-        warn!("Error starting websocket: {}", e);
-        let _ = resource_event_sender2.send(WebSocketNetworkEvent::Fail);
-    }
+    Ok(response)
 }

@@ -2,183 +2,317 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-//! Data needed by the layout thread.
-
-use crate::display_list::items::{OpaqueNode, WebRenderImageInfo};
-use crate::opaque_node::OpaqueNodeMethods;
-use fnv::FnvHasher;
-use gfx::font_cache_thread::FontCacheThread;
-use gfx::font_context::FontContext;
-use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
-use msg::constellation_msg::PipelineId;
-use net_traits::image_cache::{
-    ImageCache, ImageCacheResult, ImageOrMetadataAvailable, UsePlaceholder,
-};
-use parking_lot::RwLock;
-use script_layout_interface::{PendingImage, PendingImageState};
-use script_traits::Painter;
-use servo_atoms::Atom;
-use servo_url::{ImmutableOrigin, ServoUrl};
-use std::cell::{RefCell, RefMut};
 use std::collections::HashMap;
-use std::hash::BuildHasherDefault;
-use std::sync::{Arc, Mutex};
-use std::thread;
-use style::context::RegisteredSpeculativePainter;
+use std::sync::Arc;
+
+use base::id::PainterId;
+use embedder_traits::UntrustedNodeAddress;
+use euclid::Size2D;
+use fonts::FontContext;
+use layout_api::wrapper_traits::ThreadSafeLayoutNode;
+use layout_api::{
+    AnimatingImages, IFrameSizes, LayoutImageDestination, PendingImage, PendingImageState,
+    PendingRasterizationImage,
+};
+use net_traits::image_cache::{
+    Image as CachedImage, ImageCache, ImageCacheResult, ImageOrMetadataAvailable, PendingImageId,
+};
+use parking_lot::{Mutex, RwLock};
+use pixels::RasterImage;
+use script::layout_dom::ServoThreadSafeLayoutNode;
+use servo_url::{ImmutableOrigin, ServoUrl};
 use style::context::SharedStyleContext;
+use style::dom::OpaqueNode;
+use style::values::computed::image::{Gradient, Image};
+use webrender_api::units::{DeviceIntSize, DeviceSize};
 
-pub type LayoutFontContext = FontContext<FontCacheThread>;
+pub(crate) type CachedImageOrError = Result<CachedImage, ResolveImageError>;
 
-thread_local!(static FONT_CONTEXT_KEY: RefCell<Option<LayoutFontContext>> = RefCell::new(None));
-
-pub fn with_thread_local_font_context<F, R>(layout_context: &LayoutContext, f: F) -> R
-where
-    F: FnOnce(&mut LayoutFontContext) -> R,
-{
-    FONT_CONTEXT_KEY.with(|k| {
-        let mut font_context = k.borrow_mut();
-        if font_context.is_none() {
-            let font_cache_thread = layout_context.font_cache_thread.lock().unwrap().clone();
-            *font_context = Some(FontContext::new(font_cache_thread));
-        }
-        f(&mut RefMut::map(font_context, |x| x.as_mut().unwrap()))
-    })
-}
-
-pub fn malloc_size_of_persistent_local_context(ops: &mut MallocSizeOfOps) -> usize {
-    FONT_CONTEXT_KEY.with(|r| {
-        if let Some(ref context) = *r.borrow() {
-            context.size_of(ops)
-        } else {
-            0
-        }
-    })
-}
-
-/// Layout information shared among all workers. This must be thread-safe.
-pub struct LayoutContext<'a> {
-    /// The pipeline id of this LayoutContext.
-    pub id: PipelineId,
-
-    /// The origin of this layout context.
-    pub origin: ImmutableOrigin,
+pub(crate) struct LayoutContext<'a> {
+    pub use_rayon: bool,
 
     /// Bits shared by the layout and style system.
     pub style_context: SharedStyleContext<'a>,
 
+    /// A FontContext to be used during layout.
+    pub font_context: Arc<FontContext>,
+
+    /// A collection of `<iframe>` sizes to send back to script.
+    pub iframe_sizes: Mutex<IFrameSizes>,
+
+    /// An [`ImageResolver`] used for resolving images during box and fragment
+    /// tree construction. Later passed to display list construction.
+    pub image_resolver: Arc<ImageResolver>,
+
+    /// The [`PainterId`] that identifies which `RenderingContext` that this layout targets.
+    pub painter_id: PainterId,
+}
+
+pub enum ResolvedImage<'a> {
+    Gradient(&'a Gradient),
+    // The size is tracked explicitly as image-set images can specify their
+    // natural resolution which affects the final size for raster images.
+    Image {
+        image: CachedImage,
+        size: DeviceSize,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ResolveImageError {
+    LoadError,
+    ImagePending,
+    OnlyMetadata,
+    InvalidUrl,
+    MissingNode,
+    ImageMissingFromImageSet,
+    NotImplementedYet,
+    None,
+}
+
+pub(crate) enum LayoutImageCacheResult {
+    Pending,
+    DataAvailable(ImageOrMetadataAvailable),
+    LoadError,
+}
+
+pub(crate) struct ImageResolver {
+    /// The origin of the `Document` that this [`ImageResolver`] resolves images for.
+    pub origin: ImmutableOrigin,
+
     /// Reference to the script thread image cache.
     pub image_cache: Arc<dyn ImageCache>,
 
-    /// Interface to the font cache thread.
-    pub font_cache_thread: Mutex<FontCacheThread>,
-
-    /// A cache of WebRender image info.
-    pub webrender_image_cache: Arc<
-        RwLock<
-            HashMap<(ServoUrl, UsePlaceholder), WebRenderImageInfo, BuildHasherDefault<FnvHasher>>,
-        >,
-    >,
-
-    /// Paint worklets
-    pub registered_painters: &'a dyn RegisteredPainters,
-
     /// A list of in-progress image loads to be shared with the script thread.
     pub pending_images: Mutex<Vec<PendingImage>>,
+
+    /// A list of fully loaded vector images that need to be rasterized to a specific
+    /// size determined by layout. This will be shared with the script thread.
+    pub pending_rasterization_images: Mutex<Vec<PendingRasterizationImage>>,
+
+    /// A list of `SVGSVGElement`s encountered during layout that are not
+    /// serialized yet. This is needed to support inline SVGs as they are treated
+    /// as replaced elements and the layout is responsible for triggering the
+    /// network load for the corresponding serialized data: urls (similar to
+    /// background images).
+    pub pending_svg_elements_for_serialization: Mutex<Vec<UntrustedNodeAddress>>,
+
+    /// A shared reference to script's map of DOM nodes with animated images. This is used
+    /// to manage image animations in script and inform the script about newly animating
+    /// nodes.
+    pub animating_images: Arc<RwLock<AnimatingImages>>,
+
+    // A cache that maps image resources used in CSS (e.g as the `url()` value
+    // for `background-image` or `content` property) to the final resolved image data.
+    pub resolved_images_cache: Arc<RwLock<HashMap<ServoUrl, CachedImageOrError>>>,
+
+    /// The current animation timeline value used to properly initialize animating images.
+    pub animation_timeline_value: f64,
 }
 
-impl<'a> Drop for LayoutContext<'a> {
+impl Drop for ImageResolver {
     fn drop(&mut self) {
-        if !thread::panicking() {
-            assert!(self.pending_images.lock().unwrap().is_empty());
+        if !std::thread::panicking() {
+            assert!(self.pending_images.lock().is_empty());
+            assert!(self.pending_rasterization_images.lock().is_empty());
+            assert!(
+                self.pending_svg_elements_for_serialization
+                    .lock()
+                    .is_empty()
+            );
         }
     }
 }
 
-impl<'a> LayoutContext<'a> {
-    #[inline(always)]
-    pub fn shared_context(&self) -> &SharedStyleContext {
-        &self.style_context
-    }
-
-    pub fn get_or_request_image_or_meta(
+impl ImageResolver {
+    pub(crate) fn get_or_request_image_or_meta(
         &self,
         node: OpaqueNode,
         url: ServoUrl,
-        use_placeholder: UsePlaceholder,
-    ) -> Option<ImageOrMetadataAvailable> {
+        destination: LayoutImageDestination,
+    ) -> LayoutImageCacheResult {
         // Check for available image or start tracking.
-        let cache_result = self.image_cache.get_cached_image_status(
-            url.clone(),
-            self.origin.clone(),
-            None,
-            use_placeholder,
-        );
+        let cache_result =
+            self.image_cache
+                .get_cached_image_status(url.clone(), self.origin.clone(), None);
 
         match cache_result {
-            ImageCacheResult::Available(img_or_meta) => Some(img_or_meta),
+            ImageCacheResult::Available(img_or_meta) => {
+                LayoutImageCacheResult::DataAvailable(img_or_meta)
+            },
             // Image has been requested, is still pending. Return no image for this paint loop.
             // When the image loads it will trigger a reflow and/or repaint.
             ImageCacheResult::Pending(id) => {
                 let image = PendingImage {
                     state: PendingImageState::PendingResponse,
-                    node: node.to_untrusted_node_address(),
+                    node: node.into(),
                     id,
                     origin: self.origin.clone(),
+                    destination,
                 };
-                self.pending_images.lock().unwrap().push(image);
-                None
+                self.pending_images.lock().push(image);
+                LayoutImageCacheResult::Pending
             },
             // Not yet requested - request image or metadata from the cache
             ImageCacheResult::ReadyForRequest(id) => {
                 let image = PendingImage {
                     state: PendingImageState::Unrequested(url),
-                    node: node.to_untrusted_node_address(),
+                    node: node.into(),
                     id,
                     origin: self.origin.clone(),
+                    destination,
                 };
-                self.pending_images.lock().unwrap().push(image);
-                None
+                self.pending_images.lock().push(image);
+                LayoutImageCacheResult::Pending
             },
-            // Image failed to load, so just return nothing
-            ImageCacheResult::LoadError => None,
+            // Image failed to load, so just return the same error.
+            ImageCacheResult::FailedToLoadOrDecode => LayoutImageCacheResult::LoadError,
         }
     }
 
-    pub fn get_webrender_image_for_url(
+    pub(crate) fn handle_animated_image(&self, node: OpaqueNode, image: Arc<RasterImage>) {
+        let mut animating_images = self.animating_images.write();
+        if !image.should_animate() {
+            animating_images.remove(node);
+        } else {
+            animating_images.maybe_insert_or_update(node, image, self.animation_timeline_value);
+        }
+    }
+
+    pub(crate) fn get_cached_image_for_url(
         &self,
         node: OpaqueNode,
         url: ServoUrl,
-        use_placeholder: UsePlaceholder,
-    ) -> Option<WebRenderImageInfo> {
-        if let Some(existing_webrender_image) = self
-            .webrender_image_cache
-            .read()
-            .get(&(url.clone(), use_placeholder))
-        {
-            return Some((*existing_webrender_image).clone());
+        destination: LayoutImageDestination,
+    ) -> Result<CachedImage, ResolveImageError> {
+        if let Some(cached_image) = self.resolved_images_cache.read().get(&url) {
+            return cached_image.clone();
         }
 
-        match self.get_or_request_image_or_meta(node, url.clone(), use_placeholder) {
-            Some(ImageOrMetadataAvailable::ImageAvailable { image, .. }) => {
-                let image_info = WebRenderImageInfo::from_image(&*image);
-                if image_info.key.is_none() {
-                    Some(image_info)
-                } else {
-                    let mut webrender_image_cache = self.webrender_image_cache.write();
-                    webrender_image_cache.insert((url, use_placeholder), image_info);
-                    Some(image_info)
-                }
+        let result = self.get_or_request_image_or_meta(node, url.clone(), destination);
+        match result {
+            LayoutImageCacheResult::DataAvailable(img_or_meta) => match img_or_meta {
+                ImageOrMetadataAvailable::ImageAvailable { image, .. } => {
+                    if let Some(image) = image.as_raster_image() {
+                        self.handle_animated_image(node, image.clone());
+                    }
+
+                    let mut resolved_images_cache = self.resolved_images_cache.write();
+                    resolved_images_cache.insert(url, Ok(image.clone()));
+                    Ok(image)
+                },
+                ImageOrMetadataAvailable::MetadataAvailable(..) => {
+                    Result::Err(ResolveImageError::OnlyMetadata)
+                },
             },
-            None | Some(ImageOrMetadataAvailable::MetadataAvailable(_)) => None,
+            LayoutImageCacheResult::Pending => Result::Err(ResolveImageError::ImagePending),
+            LayoutImageCacheResult::LoadError => {
+                let error = Err(ResolveImageError::LoadError);
+                self.resolved_images_cache
+                    .write()
+                    .insert(url, error.clone());
+                error
+            },
         }
     }
-}
 
-/// A registered painter
-pub trait RegisteredPainter: RegisteredSpeculativePainter + Painter {}
+    pub(crate) fn rasterize_vector_image(
+        &self,
+        image_id: PendingImageId,
+        size: DeviceIntSize,
+        node: OpaqueNode,
+    ) -> Option<RasterImage> {
+        let result = self.image_cache.rasterize_vector_image(image_id, size);
+        if result.is_none() {
+            self.pending_rasterization_images
+                .lock()
+                .push(PendingRasterizationImage {
+                    id: image_id,
+                    node: node.into(),
+                    size,
+                });
+        }
+        result
+    }
 
-/// A set of registered painters
-pub trait RegisteredPainters: Sync {
-    /// Look up a painter
-    fn get(&self, name: &Atom) -> Option<&dyn RegisteredPainter>;
+    pub(crate) fn queue_svg_element_for_serialization(
+        &self,
+        element: ServoThreadSafeLayoutNode<'_>,
+    ) {
+        self.pending_svg_elements_for_serialization
+            .lock()
+            .push(element.opaque().into())
+    }
+
+    pub(crate) fn resolve_image<'a>(
+        &self,
+        node: Option<OpaqueNode>,
+        image: &'a Image,
+    ) -> Result<ResolvedImage<'a>, ResolveImageError> {
+        match image {
+            // TODO: Add support for PaintWorklet and CrossFade rendering.
+            Image::None => Result::Err(ResolveImageError::None),
+            Image::CrossFade(_) => Result::Err(ResolveImageError::NotImplementedYet),
+            Image::PaintWorklet(_) => Result::Err(ResolveImageError::NotImplementedYet),
+            Image::Gradient(gradient) => Ok(ResolvedImage::Gradient(gradient)),
+            Image::Url(image_url) => {
+                // FIXME: images won’t always have in intrinsic width or
+                // height when support for SVG is added, or a WebRender
+                // `ImageKey`, for that matter.
+                //
+                // FIXME: It feels like this should take into account the pseudo
+                // element and not just the node.
+                let image_url = image_url.url().ok_or(ResolveImageError::InvalidUrl)?;
+                let node = node.ok_or(ResolveImageError::MissingNode)?;
+                let image = self.get_cached_image_for_url(
+                    node,
+                    image_url.clone().into(),
+                    LayoutImageDestination::DisplayListBuilding,
+                )?;
+                let metadata = image.metadata();
+                let size = Size2D::new(metadata.width, metadata.height).to_f32();
+                Ok(ResolvedImage::Image { image, size })
+            },
+            Image::ImageSet(image_set) => {
+                image_set
+                    .items
+                    .get(image_set.selected_index)
+                    .ok_or(ResolveImageError::ImageMissingFromImageSet)
+                    .and_then(|image| {
+                        self.resolve_image(node, &image.image)
+                            .map(|info| match info {
+                                ResolvedImage::Image {
+                                    image: cached_image,
+                                    ..
+                                } => {
+                                    // From <https://drafts.csswg.org/css-images-4/#image-set-notation>:
+                                    // > A <resolution> (optional). This is used to help the UA decide
+                                    // > which <image-set-option> to choose. If the image reference is
+                                    // > for a raster image, it also specifies the image’s natural
+                                    // > resolution, overriding any other source of data that might
+                                    // > supply a natural resolution.
+                                    let image_metadata = cached_image.metadata();
+                                    let size = if cached_image.as_raster_image().is_some() {
+                                        let scale_factor = image.resolution.dppx();
+                                        Size2D::new(
+                                            image_metadata.width as f32 / scale_factor,
+                                            image_metadata.height as f32 / scale_factor,
+                                        )
+                                    } else {
+                                        Size2D::new(image_metadata.width, image_metadata.height)
+                                            .to_f32()
+                                    };
+
+                                    ResolvedImage::Image {
+                                        image: cached_image,
+                                        size,
+                                    }
+                                },
+                                _ => info,
+                            })
+                    })
+            },
+            Image::LightDark(..) => unreachable!("light-dark() should be disabled"),
+        }
+    }
 }

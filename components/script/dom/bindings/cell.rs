@@ -4,53 +4,93 @@
 
 //! A shareable mutable container for the DOM.
 
-use crate::dom::bindings::root::{assert_in_layout, assert_in_script};
-#[cfg(feature = "refcell_backtrace")]
-pub use accountable_refcell::{ref_filter_map, Ref, RefCell, RefMut};
-#[cfg(not(feature = "refcell_backtrace"))]
-pub use ref_filter_map::ref_filter_map;
 use std::cell::{BorrowError, BorrowMutError};
 #[cfg(not(feature = "refcell_backtrace"))]
-pub use std::cell::{Ref, RefCell, RefMut};
+pub(crate) use std::cell::{Ref, RefCell, RefMut};
+
+#[cfg(feature = "refcell_backtrace")]
+pub(crate) use accountable_refcell::{Ref, RefCell, RefMut};
+use malloc_size_of::{MallocConditionalSizeOf, MallocSizeOfOps};
+
+use crate::dom::bindings::root::{assert_in_layout, assert_in_script};
 
 /// A mutable field in the DOM.
 ///
 /// This extends the API of `std::cell::RefCell` to allow unsafe access in
 /// certain situations, with dynamic checking in debug builds.
 #[derive(Clone, Debug, Default, MallocSizeOf, PartialEq)]
-pub struct DomRefCell<T> {
+pub(crate) struct DomRefCell<T> {
     value: RefCell<T>,
+}
+
+impl<T: MallocConditionalSizeOf> MallocConditionalSizeOf for DomRefCell<T> {
+    fn conditional_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.value.borrow().conditional_size_of(ops)
+    }
 }
 
 // Functionality specific to Servo's `DomRefCell` type
 // ===================================================
 
 impl<T> DomRefCell<T> {
-    /// Return a reference to the contents.
+    /// Return a reference to the contents.  For use in layout only.
     ///
-    /// For use in the layout thread only.
-    #[allow(unsafe_code)]
-    pub unsafe fn borrow_for_layout(&self) -> &T {
+    /// # Safety
+    ///
+    /// Unlike RefCell::borrow, this method is unsafe because it does not return a Ref, thus leaving
+    /// the borrow flag untouched. Mutably borrowing the RefCell while the reference returned by
+    /// this method is alive is undefined behaviour.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this is called from anywhere other than the layout thread
+    ///
+    /// Panics if the value is currently mutably borrowed.
+    #[expect(unsafe_code)]
+    pub(crate) unsafe fn borrow_for_layout(&self) -> &T {
         assert_in_layout();
-        self.value
-            .try_borrow_unguarded()
-            .expect("cell is mutably borrowed")
+        unsafe {
+            self.value
+                .try_borrow_unguarded()
+                .expect("cell is mutably borrowed")
+        }
     }
 
     /// Borrow the contents for the purpose of script deallocation.
     ///
-    #[allow(unsafe_code)]
-    pub unsafe fn borrow_for_script_deallocation(&self) -> &mut T {
+    /// # Safety
+    ///
+    /// Unlike RefCell::borrow, this method is unsafe because it does not return a Ref, thus leaving
+    /// the borrow flag untouched. Mutably borrowing the RefCell while the reference returned by
+    /// this method is alive is undefined behaviour.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this is called from anywhere other than the script thread.
+    #[expect(unsafe_code)]
+    #[allow(clippy::mut_from_ref)]
+    pub(crate) unsafe fn borrow_for_script_deallocation(&self) -> &mut T {
         assert_in_script();
-        &mut *self.value.as_ptr()
+        unsafe { &mut *self.value.as_ptr() }
     }
 
     /// Mutably borrow a cell for layout. Ideally this would use
     /// `RefCell::try_borrow_mut_unguarded` but that doesn't exist yet.
-    #[allow(unsafe_code)]
-    pub unsafe fn borrow_mut_for_layout(&self) -> &mut T {
+    ///
+    /// # Safety
+    ///
+    /// Unlike RefCell::borrow, this method is unsafe because it does not return a Ref, thus leaving
+    /// the borrow flag untouched. Mutably borrowing the RefCell while the reference returned by
+    /// this method is alive is undefined behaviour.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this is called from anywhere other than the layout thread.
+    #[expect(unsafe_code)]
+    #[allow(clippy::mut_from_ref)]
+    pub(crate) unsafe fn borrow_mut_for_layout(&self) -> &mut T {
         assert_in_layout();
-        &mut *self.value.as_ptr()
+        unsafe { &mut *self.value.as_ptr() }
     }
 }
 
@@ -58,7 +98,7 @@ impl<T> DomRefCell<T> {
 // ===================================================
 impl<T> DomRefCell<T> {
     /// Create a new `DomRefCell` containing `value`.
-    pub fn new(value: T) -> DomRefCell<T> {
+    pub(crate) fn new(value: T) -> DomRefCell<T> {
         DomRefCell {
             value: RefCell::new(value),
         }
@@ -71,10 +111,9 @@ impl<T> DomRefCell<T> {
     ///
     /// # Panics
     ///
-    /// Panics if this is called off the script thread.
-    ///
     /// Panics if the value is currently mutably borrowed.
-    pub fn borrow(&self) -> Ref<T> {
+    #[track_caller]
+    pub(crate) fn borrow(&self) -> Ref<'_, T> {
         self.value.borrow()
     }
 
@@ -85,10 +124,9 @@ impl<T> DomRefCell<T> {
     ///
     /// # Panics
     ///
-    /// Panics if this is called off the script thread.
-    ///
     /// Panics if the value is currently borrowed.
-    pub fn borrow_mut(&self) -> RefMut<T> {
+    #[track_caller]
+    pub(crate) fn borrow_mut(&self) -> RefMut<'_, T> {
         self.value.borrow_mut()
     }
 
@@ -102,7 +140,7 @@ impl<T> DomRefCell<T> {
     /// # Panics
     ///
     /// Panics if this is called off the script thread.
-    pub fn try_borrow(&self) -> Result<Ref<T>, BorrowError> {
+    pub(crate) fn try_borrow(&self) -> Result<Ref<'_, T>, BorrowError> {
         assert_in_script();
         self.value.try_borrow()
     }
@@ -117,8 +155,19 @@ impl<T> DomRefCell<T> {
     /// # Panics
     ///
     /// Panics if this is called off the script thread.
-    pub fn try_borrow_mut(&self) -> Result<RefMut<T>, BorrowMutError> {
+    pub(crate) fn try_borrow_mut(&self) -> Result<RefMut<'_, T>, BorrowMutError> {
         assert_in_script();
         self.value.try_borrow_mut()
+    }
+}
+
+impl<T: Default> DomRefCell<T> {
+    /// Takes the wrapped value, leaving `Default::default()` in its place.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the value is currently borrowed.
+    pub(crate) fn take(&self) -> T {
+        self.value.take()
     }
 }

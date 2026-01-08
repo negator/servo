@@ -2,32 +2,35 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::Cell;
+
+use dom_struct::dom_struct;
+use js::rust::HandleObject;
+use keyboard_types::{Key, Modifiers, NamedKey};
+
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::KeyboardEventBinding;
 use crate::dom::bindings::codegen::Bindings::KeyboardEventBinding::KeyboardEventMethods;
 use crate::dom::bindings::codegen::Bindings::UIEventBinding::UIEventMethods;
 use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::reflect_dom_object;
+use crate::dom::bindings::reflector::reflect_dom_object_with_proto;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::event::Event;
 use crate::dom::uievent::UIEvent;
 use crate::dom::window::Window;
-use dom_struct::dom_struct;
-use keyboard_types::{Key, Modifiers};
-use std::cell::Cell;
-
-unsafe_no_jsmanaged_fields!(Key);
-unsafe_no_jsmanaged_fields!(Modifiers);
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct KeyboardEvent {
+pub(crate) struct KeyboardEvent {
     uievent: UIEvent,
     key: DomRefCell<DOMString>,
+    #[no_trace]
     typed_key: DomRefCell<Key>,
     code: DomRefCell<DOMString>,
     location: Cell<u32>,
+    #[no_trace]
     modifiers: Cell<Modifiers>,
     repeat: Cell<bool>,
     is_composing: Cell<bool>,
@@ -40,7 +43,7 @@ impl KeyboardEvent {
         KeyboardEvent {
             uievent: UIEvent::new_inherited(),
             key: DomRefCell::new(DOMString::new()),
-            typed_key: DomRefCell::new(Key::Unidentified),
+            typed_key: DomRefCell::new(Key::Named(NamedKey::Unidentified)),
             code: DomRefCell::new(DOMString::new()),
             location: Cell::new(0),
             modifiers: Cell::new(Modifiers::empty()),
@@ -51,12 +54,65 @@ impl KeyboardEvent {
         }
     }
 
-    pub fn new_uninitialized(window: &Window) -> DomRoot<KeyboardEvent> {
-        reflect_dom_object(Box::new(KeyboardEvent::new_inherited()), window)
+    pub(crate) fn new_uninitialized(window: &Window, can_gc: CanGc) -> DomRoot<KeyboardEvent> {
+        Self::new_uninitialized_with_proto(window, None, can_gc)
     }
 
-    pub fn new(
+    fn new_uninitialized_with_proto(
         window: &Window,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+    ) -> DomRoot<KeyboardEvent> {
+        reflect_dom_object_with_proto(
+            Box::new(KeyboardEvent::new_inherited()),
+            window,
+            proto,
+            can_gc,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        window: &Window,
+        type_: DOMString,
+        can_bubble: bool,
+        cancelable: bool,
+        view: Option<&Window>,
+        detail: i32,
+        key: Key,
+        code: DOMString,
+        location: u32,
+        repeat: bool,
+        is_composing: bool,
+        modifiers: Modifiers,
+        char_code: u32,
+        key_code: u32,
+        can_gc: CanGc,
+    ) -> DomRoot<KeyboardEvent> {
+        Self::new_with_proto(
+            window,
+            None,
+            type_,
+            can_bubble,
+            cancelable,
+            view,
+            detail,
+            key,
+            code,
+            location,
+            repeat,
+            is_composing,
+            modifiers,
+            char_code,
+            key_code,
+            can_gc,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn new_with_proto(
+        window: &Window,
+        proto: Option<HandleObject>,
         type_: DOMString,
         can_bubble: bool,
         cancelable: bool,
@@ -70,8 +126,9 @@ impl KeyboardEvent {
         modifiers: Modifiers,
         char_code: u32,
         key_code: u32,
+        can_gc: CanGc,
     ) -> DomRoot<KeyboardEvent> {
-        let ev = KeyboardEvent::new_uninitialized(window);
+        let ev = KeyboardEvent::new_uninitialized_with_proto(window, proto, can_gc);
         ev.InitKeyboardEvent(
             type_,
             can_bubble,
@@ -89,12 +146,25 @@ impl KeyboardEvent {
         ev.is_composing.set(is_composing);
         ev.char_code.set(char_code);
         ev.key_code.set(key_code);
+        ev.uievent.set_which(key_code);
         ev
     }
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+    pub(crate) fn key(&self) -> Key {
+        self.typed_key.borrow().clone()
+    }
+
+    pub(crate) fn modifiers(&self) -> Modifiers {
+        self.modifiers.get()
+    }
+}
+
+impl KeyboardEventMethods<crate::DomTypeHolder> for KeyboardEvent {
+    /// <https://w3c.github.io/uievents/#dom-keyboardevent-keyboardevent>
+    fn Constructor(
         window: &Window,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
         type_: DOMString,
         init: &KeyboardEventBinding::KeyboardEventInit,
     ) -> Fallible<DomRoot<KeyboardEvent>> {
@@ -103,39 +173,29 @@ impl KeyboardEvent {
         modifiers.set(Modifiers::ALT, init.parent.altKey);
         modifiers.set(Modifiers::SHIFT, init.parent.shiftKey);
         modifiers.set(Modifiers::META, init.parent.metaKey);
-        let event = KeyboardEvent::new(
+        let event = KeyboardEvent::new_with_proto(
             window,
+            proto,
             type_,
             init.parent.parent.parent.bubbles,
             init.parent.parent.parent.cancelable,
             init.parent.parent.view.as_deref(),
             init.parent.parent.detail,
-            Key::Unidentified,
+            Key::Named(NamedKey::Unidentified),
             init.code.clone(),
             init.location,
             init.repeat,
             init.isComposing,
             modifiers,
-            0,
-            0,
+            init.charCode,
+            init.keyCode,
+            can_gc,
         );
         *event.key.borrow_mut() = init.key.clone();
         Ok(event)
     }
-}
 
-impl KeyboardEvent {
-    pub fn key(&self) -> Key {
-        self.typed_key.borrow().clone()
-    }
-
-    pub fn modifiers(&self) -> Modifiers {
-        self.modifiers.get()
-    }
-}
-
-impl KeyboardEventMethods for KeyboardEvent {
-    // https://w3c.github.io/uievents/#widl-KeyboardEvent-initKeyboardEvent
+    /// <https://w3c.github.io/uievents/#widl-KeyboardEvent-initKeyboardEvent>
     fn InitKeyboardEvent(
         &self,
         type_arg: DOMString,
@@ -159,54 +219,54 @@ impl KeyboardEventMethods for KeyboardEvent {
         self.repeat.set(repeat);
     }
 
-    // https://w3c.github.io/uievents/#widl-KeyboardEvent-key
+    /// <https://w3c.github.io/uievents/#dom-keyboardevent-initkeyboardevent>
     fn Key(&self) -> DOMString {
         self.key.borrow().clone()
     }
 
-    // https://w3c.github.io/uievents/#widl-KeyboardEvent-code
+    /// <https://w3c.github.io/uievents/#dom-keyboardevent-code>
     fn Code(&self) -> DOMString {
         self.code.borrow().clone()
     }
 
-    // https://w3c.github.io/uievents/#widl-KeyboardEvent-location
+    /// <https://w3c.github.io/uievents/#dom-keyboardevent-location>
     fn Location(&self) -> u32 {
         self.location.get()
     }
 
-    // https://w3c.github.io/uievents/#widl-KeyboardEvent-ctrlKey
+    /// <https://w3c.github.io/uievents/#dom-keyboardevent-ctrlkey>
     fn CtrlKey(&self) -> bool {
         self.modifiers.get().contains(Modifiers::CONTROL)
     }
 
-    // https://w3c.github.io/uievents/#widl-KeyboardEvent-shiftKey
+    /// <https://w3c.github.io/uievents/#dom-keyboardevent-shiftkey>
     fn ShiftKey(&self) -> bool {
         self.modifiers.get().contains(Modifiers::SHIFT)
     }
 
-    // https://w3c.github.io/uievents/#widl-KeyboardEvent-altKey
+    /// <https://w3c.github.io/uievents/#dom-keyboardevent-altkey>
     fn AltKey(&self) -> bool {
         self.modifiers.get().contains(Modifiers::ALT)
     }
 
-    // https://w3c.github.io/uievents/#widl-KeyboardEvent-metaKey
+    /// <https://w3c.github.io/uievents/#dom-keyboardevent-metakey>
     fn MetaKey(&self) -> bool {
         self.modifiers.get().contains(Modifiers::META)
     }
 
-    // https://w3c.github.io/uievents/#widl-KeyboardEvent-repeat
+    /// <https://w3c.github.io/uievents/#dom-keyboardevent-repeat>
     fn Repeat(&self) -> bool {
         self.repeat.get()
     }
 
-    // https://w3c.github.io/uievents/#widl-KeyboardEvent-isComposing
+    /// <https://w3c.github.io/uievents/#dom-keyboardevent-iscomposing>
     fn IsComposing(&self) -> bool {
         self.is_composing.get()
     }
 
-    // https://w3c.github.io/uievents/#dom-keyboardevent-getmodifierstate
+    /// <https://w3c.github.io/uievents/#dom-keyboardevent-getmodifierstate>
     fn GetModifierState(&self, key_arg: DOMString) -> bool {
-        self.modifiers.get().contains(match &*key_arg {
+        self.modifiers.get().contains(match &*key_arg.str() {
             "Alt" => Modifiers::ALT,
             "AltGraph" => Modifiers::ALT_GRAPH,
             "CapsLock" => Modifiers::CAPS_LOCK,
@@ -223,26 +283,17 @@ impl KeyboardEventMethods for KeyboardEvent {
         })
     }
 
-    // https://w3c.github.io/uievents/#widl-KeyboardEvent-charCode
+    /// <https://w3c.github.io/uievents/#dom-keyboardevent-charcode>
     fn CharCode(&self) -> u32 {
         self.char_code.get()
     }
 
-    // https://w3c.github.io/uievents/#widl-KeyboardEvent-keyCode
+    /// <https://w3c.github.io/uievents/#dom-keyboardevent-keycode>
     fn KeyCode(&self) -> u32 {
         self.key_code.get()
     }
 
-    // https://w3c.github.io/uievents/#widl-KeyboardEvent-which
-    fn Which(&self) -> u32 {
-        if self.char_code.get() != 0 {
-            self.char_code.get()
-        } else {
-            self.key_code.get()
-        }
-    }
-
-    // https://dom.spec.whatwg.org/#dom-event-istrusted
+    /// <https://dom.spec.whatwg.org/#dom-event-istrusted>
     fn IsTrusted(&self) -> bool {
         self.uievent.IsTrusted()
     }

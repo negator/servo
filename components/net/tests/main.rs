@@ -3,77 +3,58 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 #![cfg(test)]
-#![allow(dead_code)]
-
-#[macro_use]
-extern crate lazy_static;
+#![expect(dead_code)]
 
 mod cookie;
 mod cookie_http_state;
 mod data_loader;
 mod fetch;
+
+fn fetch(request: Request, dc: Option<Sender<DevtoolsControlMsg>>) -> Response {
+    fetch_with_context(request, &mut new_fetch_context(dc, None))
+}
 mod file_loader;
 mod filemanager_thread;
 mod hsts;
 mod http_cache;
 mod http_loader;
-mod mime_classifier;
+mod image_cache;
 mod resource_thread;
 mod subresource_integrity;
+use std::sync::Arc;
 
-use core::convert::Infallible;
-use core::pin::Pin;
-use crossbeam_channel::{unbounded, Sender};
+use content_security_policy as csp;
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use devtools_traits::DevtoolsControlMsg;
-use embedder_traits::resources::{self, Resource};
-use embedder_traits::{EmbedderProxy, EventLoopWaker};
-use futures::future::ready;
-use futures::StreamExt;
-use hyper::server::conn::Http;
-use hyper::server::Server as HyperServer;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Request as HyperRequest, Response as HyperResponse};
-use net::connector::{create_tls_config, ConnectionCerts, ExtraCerts, ALPN_H2_H1};
+use embedder_traits::{AuthenticationResponse, EmbedderMsg, EmbedderProxy};
+use net::async_runtime::spawn_blocking_task;
+use net::connector::{CACertificates, create_http_client, create_tls_config};
 use net::fetch::cors_cache::CorsCache;
-use net::fetch::methods::{self, CancellationListener, FetchContext};
+use net::fetch::methods::{self, FetchContext};
 use net::filemanager_thread::FileManager;
-use net::resource_thread::CoreResourceThreadPool;
+use net::protocols::ProtocolRegistry;
+use net::request_interceptor::RequestInterceptor;
 use net::test::HttpState;
+use net::test_util::{
+    create_embedder_proxy, make_body, make_server, make_ssl_server, replace_host_table,
+};
 use net_traits::filemanager_thread::FileTokenCheck;
 use net_traits::request::Request;
 use net_traits::response::Response;
 use net_traits::{FetchTaskTarget, ResourceFetchTiming, ResourceTimingType};
-use openssl::ssl::{Ssl, SslAcceptor, SslFiletype, SslMethod};
+use parking_lot::{Mutex, RwLock};
+use rustc_hash::FxHashMap;
 use servo_arc::Arc as ServoArc;
-use servo_url::ServoUrl;
-use std::net::TcpListener as StdTcpListener;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex, Weak};
-use tokio::net::TcpListener;
-use tokio::net::TcpStream;
-use tokio::runtime::{Builder, Runtime};
-use tokio_openssl::SslStream;
-use tokio_stream::wrappers::TcpListenerStream;
-use tokio_test::block_on;
-
-lazy_static! {
-    pub static ref HANDLE: Mutex<Runtime> = Mutex::new(
-        Builder::new_multi_thread()
-            .enable_io()
-            .worker_threads(10)
-            .build()
-            .unwrap()
-    );
-}
+use servo_url::{ImmutableOrigin, ServoUrl};
 
 const DEFAULT_USER_AGENT: &'static str = "Such Browser. Very Layout. Wow.";
 
 struct FetchResponseCollector {
-    sender: Sender<Response>,
+    sender: Option<tokio::sync::oneshot::Sender<Response>>,
 }
 
-fn create_embedder_proxy() -> EmbedderProxy {
-    let (sender, _) = unbounded();
+fn create_embedder_proxy_and_receiver() -> (EmbedderProxy, Receiver<EmbedderMsg>) {
+    let (sender, receiver) = unbounded();
     let event_loop_waker = || {
         struct DummyEventLoopWaker {}
         impl DummyEventLoopWaker {
@@ -81,9 +62,9 @@ fn create_embedder_proxy() -> EmbedderProxy {
                 DummyEventLoopWaker {}
             }
         }
-        impl EventLoopWaker for DummyEventLoopWaker {
+        impl embedder_traits::EventLoopWaker for DummyEventLoopWaker {
             fn wake(&self) {}
-            fn clone_box(&self) -> Box<dyn EventLoopWaker> {
+            fn clone_box(&self) -> Box<dyn embedder_traits::EventLoopWaker> {
                 Box::new(DummyEventLoopWaker {})
             }
         }
@@ -91,191 +72,113 @@ fn create_embedder_proxy() -> EmbedderProxy {
         Box::new(DummyEventLoopWaker::new())
     };
 
-    EmbedderProxy {
-        sender: sender,
+    let embedder_proxy = embedder_traits::EmbedderProxy {
+        sender: sender.clone(),
         event_loop_waker: event_loop_waker(),
+    };
+
+    (embedder_proxy, receiver)
+}
+
+fn receive_credential_prompt_msgs(
+    embedder_receiver: Receiver<EmbedderMsg>,
+    response: Option<AuthenticationResponse>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        loop {
+            let embedder_msg = embedder_receiver.recv().unwrap();
+            match embedder_msg {
+                embedder_traits::EmbedderMsg::RequestAuthentication(_, _, _, response_sender) => {
+                    let _ = response_sender.send(response);
+                    break;
+                },
+                embedder_traits::EmbedderMsg::WebResourceRequested(..) => {},
+                _ => unreachable!(),
+            }
+        }
+    })
+}
+
+fn create_http_state(fc: Option<EmbedderProxy>) -> HttpState {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let override_manager = net::connector::CertificateErrorOverrideManager::new();
+    HttpState {
+        hsts_list: RwLock::new(net::hsts::HstsList::default()),
+        cookie_jar: RwLock::new(net::cookie_storage::CookieStorage::new(150)),
+        auth_cache: RwLock::new(net::resource_thread::AuthCache::default()),
+        history_states: RwLock::new(FxHashMap::default()),
+        http_cache: net::http_cache::HttpCache::default(),
+        client: create_http_client(create_tls_config(
+            net::connector::CACertificates::Default,
+            false, /* ignore_certificate_errors */
+            override_manager.clone(),
+        )),
+        override_manager,
+        embedder_proxy: Mutex::new(fc.unwrap_or_else(|| create_embedder_proxy())),
     }
 }
 
 fn new_fetch_context(
     dc: Option<Sender<DevtoolsControlMsg>>,
     fc: Option<EmbedderProxy>,
-    pool_handle: Option<Weak<CoreResourceThreadPool>>,
 ) -> FetchContext {
-    let certs = resources::read_string(Resource::SSLCertificates);
-    let tls_config = create_tls_config(
-        &certs,
-        ALPN_H2_H1,
-        ExtraCerts::new(),
-        ConnectionCerts::new(),
-    );
     let sender = fc.unwrap_or_else(|| create_embedder_proxy());
 
     FetchContext {
-        state: Arc::new(HttpState::new(tls_config)),
+        state: Arc::new(create_http_state(Some(sender.clone()))),
         user_agent: DEFAULT_USER_AGENT.into(),
         devtools_chan: dc.map(|dc| Arc::new(Mutex::new(dc))),
-        filemanager: Arc::new(Mutex::new(FileManager::new(
-            sender,
-            pool_handle.unwrap_or_else(|| Weak::new()),
-        ))),
+        filemanager: Arc::new(Mutex::new(FileManager::new(sender.clone()))),
         file_token: FileTokenCheck::NotRequired,
-        cancellation_listener: Arc::new(Mutex::new(CancellationListener::new(None))),
+        request_interceptor: Arc::new(Mutex::new(RequestInterceptor::new(sender))),
+        cancellation_listener: Arc::new(Default::default()),
         timing: ServoArc::new(Mutex::new(ResourceFetchTiming::new(
             ResourceTimingType::Navigation,
         ))),
+        protocols: Arc::new(ProtocolRegistry::with_internal_protocols()),
+        websocket_chan: None,
+        ca_certificates: CACertificates::Default,
+        ignore_certificate_errors: false,
+        preloaded_resources: Default::default(),
+        in_flight_keep_alive_records: Default::default(),
     }
 }
 impl FetchTaskTarget for FetchResponseCollector {
     fn process_request_body(&mut self, _: &Request) {}
     fn process_request_eof(&mut self, _: &Request) {}
-    fn process_response(&mut self, _: &Response) {}
-    fn process_response_chunk(&mut self, _: Vec<u8>) {}
+    fn process_response(&mut self, _: &Request, _: &Response) {}
+    fn process_response_chunk(&mut self, _: &Request, _: Vec<u8>) {}
     /// Fired when the response is fully fetched
-    fn process_response_eof(&mut self, response: &Response) {
-        let _ = self.sender.send(response.clone());
+    fn process_response_eof(&mut self, _: &Request, response: &Response) {
+        let _ = self.sender.take().unwrap().send(response.clone());
     }
+    fn process_csp_violations(&mut self, _: &Request, _: Vec<csp::Violation>) {}
 }
 
-fn fetch(request: &mut Request, dc: Option<Sender<DevtoolsControlMsg>>) -> Response {
-    fetch_with_context(request, &mut new_fetch_context(dc, None, None))
-}
-
-fn fetch_with_context(request: &mut Request, mut context: &mut FetchContext) -> Response {
-    let (sender, receiver) = unbounded();
-    let mut target = FetchResponseCollector { sender: sender };
-    block_on(async move {
+fn fetch_with_context(request: Request, mut context: &mut FetchContext) -> Response {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let mut target = FetchResponseCollector {
+        sender: Some(sender),
+    };
+    spawn_blocking_task::<_, Response>(async move {
         methods::fetch(request, &mut target, &mut context).await;
-        receiver.recv().unwrap()
+        receiver.await.unwrap()
     })
 }
 
-fn fetch_with_cors_cache(request: &mut Request, cache: &mut CorsCache) -> Response {
-    let (sender, receiver) = unbounded();
-    let mut target = FetchResponseCollector { sender: sender };
-    block_on(async move {
-        methods::fetch_with_cors_cache(
-            request,
-            cache,
-            &mut target,
-            &mut new_fetch_context(None, None, None),
-        )
-        .await;
-        receiver.recv().unwrap()
+fn fetch_with_cors_cache(request: Request, cache: &mut CorsCache) -> Response {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let mut target = FetchResponseCollector {
+        sender: Some(sender),
+    };
+    let mut fetch_context = new_fetch_context(None, None);
+    spawn_blocking_task::<_, Response>(async move {
+        methods::fetch_with_cors_cache(request, cache, &mut target, &mut fetch_context).await;
+        receiver.await.unwrap()
     })
 }
 
-pub(crate) struct Server {
-    pub close_channel: tokio::sync::oneshot::Sender<()>,
-}
-
-impl Server {
-    fn close(self) {
-        self.close_channel.send(()).expect("err closing server:");
-    }
-}
-
-fn make_server<H>(handler: H) -> (Server, ServoUrl)
-where
-    H: Fn(HyperRequest<Body>, &mut HyperResponse<Body>) + Send + Sync + 'static,
-{
-    let handler = Arc::new(handler);
-    let listener = StdTcpListener::bind("0.0.0.0:0").unwrap();
-    let url_string = format!("http://localhost:{}", listener.local_addr().unwrap().port());
-    let url = ServoUrl::parse(&url_string).unwrap();
-    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    let server = async move {
-        HyperServer::from_tcp(listener)
-            .unwrap()
-            .serve(make_service_fn(move |_| {
-                let handler = handler.clone();
-                ready(Ok::<_, Infallible>(service_fn(
-                    move |req: HyperRequest<Body>| {
-                        let mut response = HyperResponse::new(Vec::<u8>::new().into());
-                        handler(req, &mut response);
-                        ready(Ok::<_, Infallible>(response))
-                    },
-                )))
-            }))
-            .with_graceful_shutdown(async move {
-                rx.await.ok();
-            })
-            .await
-            .expect("Could not start server");
-    };
-
-    HANDLE.lock().unwrap().spawn(server);
-    let server = Server { close_channel: tx };
-    (server, url)
-}
-
-fn make_ssl_server<H>(handler: H, cert_path: PathBuf, key_path: PathBuf) -> (Server, ServoUrl)
-where
-    H: Fn(HyperRequest<Body>, &mut HyperResponse<Body>) + Send + Sync + 'static,
-{
-    let handler = Arc::new(handler);
-    let listener = StdTcpListener::bind("[::0]:0").unwrap();
-    let listener = HANDLE
-        .lock()
-        .unwrap()
-        .block_on(async move { TcpListener::from_std(listener).unwrap() });
-
-    let url_string = format!("http://localhost:{}", listener.local_addr().unwrap().port());
-    let mut listener = TcpListenerStream::new(listener);
-
-    let url = ServoUrl::parse(&url_string).unwrap();
-    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
-
-    let server = async move {
-        loop {
-            let stream = tokio::select! {
-                stream = listener.next() => stream,
-                _ = &mut rx => break
-            };
-
-            let stream = match stream {
-                Some(stream) => stream.expect("Could not accept stream: "),
-                _ => break,
-            };
-
-            let stream = stream.into_std().unwrap();
-            stream
-                .set_read_timeout(Some(std::time::Duration::new(5, 0)))
-                .unwrap();
-            let stream = TcpStream::from_std(stream).unwrap();
-
-            let mut tls_server_config =
-                SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
-            tls_server_config
-                .set_certificate_file(&cert_path, SslFiletype::PEM)
-                .unwrap();
-            tls_server_config
-                .set_private_key_file(&key_path, SslFiletype::PEM)
-                .unwrap();
-
-            let tls_server_config = tls_server_config.build();
-            let ssl = Ssl::new(tls_server_config.context()).unwrap();
-            let mut stream = SslStream::new(ssl, stream).unwrap();
-
-            let _ = Pin::new(&mut stream).accept().await;
-
-            let handler = handler.clone();
-
-            let _ = Http::new()
-                .serve_connection(
-                    stream,
-                    service_fn(move |req: HyperRequest<Body>| {
-                        let mut response = HyperResponse::new(Body::empty());
-                        handler(req, &mut response);
-                        ready(Ok::<_, Infallible>(response))
-                    }),
-                )
-                .await;
-        }
-    };
-
-    HANDLE.lock().unwrap().spawn(server);
-
-    let server = Server { close_channel: tx };
-    (server, url)
+pub(crate) fn mock_origin() -> ImmutableOrigin {
+    ServoUrl::parse("http://servo.org").unwrap().origin()
 }

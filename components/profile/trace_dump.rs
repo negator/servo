@@ -4,10 +4,12 @@
 
 //! A module for writing time profiler traces out to a self contained HTML file.
 
-use profile_traits::time::{ProfilerCategory, TimerMetadata};
-use std::fs;
 use std::io::{self, Write};
-use std::path;
+use std::{fs, path};
+
+use base::cross_process_instant::CrossProcessInstant;
+use profile_traits::time::{ProfilerCategory, TimerMetadata};
+use serde::Serialize;
 
 /// An RAII class for writing the HTML trace dump.
 #[derive(Debug)]
@@ -36,20 +38,21 @@ impl TraceDump {
     {
         let mut file = fs::File::create(trace_file_path)?;
         write_prologue(&mut file)?;
-        Ok(TraceDump { file: file })
+        Ok(TraceDump { file })
     }
 
     /// Write one trace to the trace dump file.
     pub fn write_one(
         &mut self,
         category: &(ProfilerCategory, Option<TimerMetadata>),
-        time: (u64, u64),
+        start_time: CrossProcessInstant,
+        end_time: CrossProcessInstant,
     ) {
         let entry = TraceEntry {
             category: category.0,
             metadata: category.1.clone(),
-            start_time: time.0,
-            end_time: time.1,
+            start_time: (start_time - CrossProcessInstant::epoch()).whole_nanoseconds() as u64,
+            end_time: (end_time - CrossProcessInstant::epoch()).whole_nanoseconds() as u64,
         };
         serde_json::to_writer(&mut self.file, &entry).unwrap();
         writeln!(&mut self.file, ",").unwrap();

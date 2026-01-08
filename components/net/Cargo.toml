@@ -1,12 +1,12 @@
 [package]
 name = "net"
-version = "0.0.1"
-authors = ["The Servo Project Developers"]
-license = "MPL-2.0"
-edition = "2018"
-publish = false
-autotests = false  # Inhibit lookup for tests/*.rs without [[test]] sections
-build = "build.rs"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+autotests = false # Inhibit lookup for tests/*.rs without [[test]] sections
 
 [lib]
 name = "net"
@@ -14,65 +14,83 @@ path = "lib.rs"
 test = false
 doctest = false
 
+[features]
+test-util = ["hyper-util/server-graceful"]
+
 [dependencies]
-async-recursion = "0.3.2"
-async-tungstenite = { version = "0.9", features = ["tokio-openssl"] }
-base64 = "0.10.1"
-brotli = "3"
+async-compression = { version = "0.4.12", default-features = false, features = ["brotli", "gzip", "tokio", "zlib", "zstd"] }
+async-recursion = "1.1"
+async-tungstenite = { workspace = true }
+base = { workspace = true }
+base64 = { workspace = true }
 bytes = "1"
-content-security-policy = { version = "0.4.0", features = ["serde"] }
-cookie_rs = { package = "cookie", version = "0.12" }
-crossbeam-channel = "0.4"
-data-url = "0.1.0"
-devtools_traits = { path = "../devtools_traits" }
-embedder_traits = { path = "../embedder_traits" }
-flate2 = "1"
+chrono = { workspace = true }
+compositing_traits = { workspace = true }
+content-security-policy = { workspace = true }
+cookie = { workspace = true }
+crossbeam-channel = { workspace = true }
+data-url = { workspace = true }
+devtools_traits = { workspace = true }
+embedder_traits = { workspace = true }
+fst = "0.4"
 futures = { version = "0.3", package = "futures" }
-futures-util = { version  = "0.3" }
-headers = "0.3"
-http = "0.2"
-hyper = { version = "0.14", features = ["client", "http1", "http2", "tcp", "stream"] }
-hyper-openssl = "0.9.1"
-hyper_serde = "0.13"
-immeta = "0.4"
-ipc-channel = "0.14"
-lazy_static = "1"
-libflate = "0.1"
-log = "0.4"
-malloc_size_of = { path = "../malloc_size_of" }
-malloc_size_of_derive = "0.1"
-mime = "0.3"
-mime_guess = "2.0.3"
-msg = { path = "../msg" }
-net_traits = { path = "../net_traits" }
-openssl = "0.10"
-openssl-sys = "0.9"
-percent-encoding = "2.0"
+futures-core = { version = "0.3.30", default-features = false }
+futures-util = { version = "0.3.30", default-features = false }
+generic-array = "0.14"
+headers = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true, features = ["client", "http1", "http2"] }
+hyper-rustls = { workspace = true }
+hyper-util = { workspace = true }
+hyper_serde = { workspace = true }
+imsz = { workspace = true }
+ipc-channel = { workspace = true }
+itertools = { workspace = true }
+log = { workspace = true }
+malloc_size_of = { workspace = true }
+malloc_size_of_derive = { workspace = true }
+mime = { workspace = true }
+mime_guess = { workspace = true }
+net_traits = { workspace = true }
+nom = { workspace = true }
+parking_lot = { workspace = true }
 pixels = { path = "../pixels" }
-profile_traits = { path = "../profile_traits" }
-rayon = "1"
-serde = "1.0"
-serde_json = "1.0"
-servo_allocator = { path = "../allocator" }
-servo_arc = { path = "../servo_arc" }
+profile_traits = { workspace = true }
+quick_cache = { version = "0.6.18", default-features = false, features = ["ahash"] }
+rayon = { workspace = true }
+resvg = { workspace = true }
+rustc-hash = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+rustls-platform-verifier = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+servo_arc = { workspace = true }
 servo_config = { path = "../config" }
 servo_url = { path = "../url" }
-time = "0.1.41"
-tokio = { version = "1", package = "tokio", features = ["sync", "macros", "rt-multi-thread"] }
-tokio2 = { version = "0.2", package = "tokio", features = ["sync", "macros", "rt-threaded", "tcp"] }
-tokio-stream = "0.1"
-tungstenite = "0.11"
-url = "2.0"
-uuid = { version = "0.8", features = ["v4"] }
-webrender_api = { git = "https://github.com/servo/webrender" }
+sha2 = "0.10"
+time = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+tokio-rustls = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true, features = ["codec", "io"] }
+tower = { workspace = true }
+tungstenite = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+webpki-roots = { workspace = true }
+webrender_api = { workspace = true }
 
 [dev-dependencies]
-futures = {version = "0.3", features = ["compat"]}
-std_test_override = { path = "../std_test_override" }
-tokio-openssl = "0.6"
-tokio-test = "0.4"
-tokio-stream = { version = "0.1", features = ["net"] }
-hyper = { version = "0.14", features = ["full"] }
+embedder_traits = { workspace = true, features = ["baked-default-resources"] }
+flate2 = { workspace = true }
+fst = "0.4"
+futures = { version = "0.3", features = ["compat"] }
+hyper = { workspace = true, features = ["full"] }
+hyper-util = { workspace = true, features = ["server-graceful"] }
+net = { path = "../net", features = ["test-util"] }
+rustls = { workspace = true, features = ["aws-lc-rs"] }
 
 [[test]]
 name = "main"

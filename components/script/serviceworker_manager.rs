@@ -7,44 +7,46 @@
 //! If an active service worker timeouts, then it removes the descriptor entry from its
 //! active_workers map
 
-use crate::dom::abstractworker::WorkerScriptMsg;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, JoinHandle};
+
+use base::generic_channel::{self, GenericSender, ReceiveError, RoutedReceiver};
+use base::id::{PipelineNamespace, ServiceWorkerId, ServiceWorkerRegistrationId};
+use constellation_traits::{
+    DOMMessage, Job, JobError, JobResult, JobResultValue, JobType, SWManagerMsg, SWManagerSenders,
+    ScopeThings, ServiceWorkerManagerFactory, ServiceWorkerMsg,
+};
+use crossbeam_channel::{Receiver, Sender, select, unbounded};
+use fonts::FontContext;
+use ipc_channel::ipc;
+use ipc_channel::router::ROUTER;
+use net_traits::{CoreResourceMsg, CustomResponseMediator};
+use servo_config::pref;
+use servo_url::{ImmutableOrigin, ServoUrl};
+
+use crate::dom::abstractworker::{MessageData, WorkerScriptMsg};
 use crate::dom::serviceworkerglobalscope::{
     ServiceWorkerControlMsg, ServiceWorkerGlobalScope, ServiceWorkerScriptMsg,
 };
 use crate::dom::serviceworkerregistration::longest_prefix_match;
-use crate::script_runtime::ContextForRequestInterrupt;
-use crossbeam_channel::{unbounded, Receiver, RecvError, Sender};
-use ipc_channel::ipc::{self, IpcSender};
-use ipc_channel::router::ROUTER;
-use msg::constellation_msg::PipelineNamespace;
-use msg::constellation_msg::{ServiceWorkerId, ServiceWorkerRegistrationId};
-use net_traits::{CoreResourceMsg, CustomResponseMediator};
-use script_traits::{
-    DOMMessage, Job, JobError, JobResult, JobResultValue, JobType, SWManagerMsg, SWManagerSenders,
-    ScopeThings, ServiceWorkerManagerFactory, ServiceWorkerMsg,
-};
-use servo_config::pref;
-use servo_url::ImmutableOrigin;
-use servo_url::ServoUrl;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use crate::script_runtime::ThreadSafeJSContext;
 
 enum Message {
     FromResource(CustomResponseMediator),
-    FromConstellation(ServiceWorkerMsg),
+    FromConstellation(Box<ServiceWorkerMsg>),
 }
 
 /// <https://w3c.github.io/ServiceWorker/#dfn-service-worker>
 #[derive(Clone)]
-struct ServiceWorker {
+pub(crate) struct ServiceWorker {
     /// A unique identifer.
-    pub id: ServiceWorkerId,
+    pub(crate) id: ServiceWorkerId,
     /// <https://w3c.github.io/ServiceWorker/#dfn-script-url>
-    pub script_url: ServoUrl,
+    pub(crate) script_url: ServoUrl,
     /// A sender to the running service worker scope.
-    pub sender: Sender<ServiceWorkerScriptMsg>,
+    pub(crate) sender: Sender<ServiceWorkerScriptMsg>,
 }
 
 impl ServiceWorker {
@@ -64,7 +66,10 @@ impl ServiceWorker {
     fn forward_dom_message(&self, msg: DOMMessage) {
         let DOMMessage { origin, data } = msg;
         let _ = self.sender.send(ServiceWorkerScriptMsg::CommonWorker(
-            WorkerScriptMsg::DOMMessage { origin, data },
+            WorkerScriptMsg::DOMMessage(MessageData {
+                origin,
+                data: Box::new(data),
+            }),
         ));
     }
 
@@ -75,7 +80,7 @@ impl ServiceWorker {
 }
 
 /// When updating a registration, which worker are we targetting?
-#[allow(dead_code)]
+#[expect(dead_code)]
 enum RegistrationUpdateTarget {
     Installing,
     Waiting,
@@ -103,7 +108,7 @@ impl Drop for ServiceWorkerRegistration {
         self.context
             .take()
             .expect("No context to request interrupt.")
-            .request_interrupt();
+            .request_interrupt_callback();
 
         // TODO: Step 1, 2 and 3.
         if self
@@ -118,15 +123,15 @@ impl Drop for ServiceWorkerRegistration {
     }
 }
 
-/// https://w3c.github.io/ServiceWorker/#service-worker-registration-concept
+/// <https://w3c.github.io/ServiceWorker/#service-worker-registration-concept>
 struct ServiceWorkerRegistration {
     /// A unique identifer.
     id: ServiceWorkerRegistrationId,
-    /// https://w3c.github.io/ServiceWorker/#dfn-active-worker
+    /// <https://w3c.github.io/ServiceWorker/#dfn-active-worker>
     active_worker: Option<ServiceWorker>,
-    /// https://w3c.github.io/ServiceWorker/#dfn-waiting-worker
+    /// <https://w3c.github.io/ServiceWorker/#dfn-waiting-worker>
     waiting_worker: Option<ServiceWorker>,
-    /// https://w3c.github.io/ServiceWorker/#dfn-installing-worker
+    /// <https://w3c.github.io/ServiceWorker/#dfn-installing-worker>
     installing_worker: Option<ServiceWorker>,
     /// A channel to send control message to the worker,
     /// currently only used to signal shutdown.
@@ -134,13 +139,13 @@ struct ServiceWorkerRegistration {
     /// A handle to join on the worker thread.
     join_handle: Option<JoinHandle<()>>,
     /// A context to request an interrupt.
-    context: Option<ContextForRequestInterrupt>,
+    context: Option<ThreadSafeJSContext>,
     /// The closing flag for the worker.
     closing: Option<Arc<AtomicBool>>,
 }
 
 impl ServiceWorkerRegistration {
-    pub fn new() -> ServiceWorkerRegistration {
+    pub(crate) fn new() -> ServiceWorkerRegistration {
         ServiceWorkerRegistration {
             id: ServiceWorkerRegistrationId::new(),
             active_worker: None,
@@ -157,7 +162,7 @@ impl ServiceWorkerRegistration {
         &mut self,
         join_handle: JoinHandle<()>,
         control_sender: Sender<ServiceWorkerControlMsg>,
-        context: ContextForRequestInterrupt,
+        context: ThreadSafeJSContext,
         closing: Arc<AtomicBool>,
     ) {
         assert!(self.join_handle.is_none());
@@ -209,41 +214,45 @@ impl ServiceWorkerRegistration {
 
 /// A structure managing all registrations and workers for a given origin.
 pub struct ServiceWorkerManager {
-    /// https://w3c.github.io/ServiceWorker/#dfn-scope-to-registration-map
+    /// <https://w3c.github.io/ServiceWorker/#dfn-scope-to-registration-map>
     registrations: HashMap<ServoUrl, ServiceWorkerRegistration>,
     // Will be useful to implement posting a message to a client.
     // See https://github.com/servo/servo/issues/24660
-    _constellation_sender: IpcSender<SWManagerMsg>,
+    _constellation_sender: GenericSender<SWManagerMsg>,
     // own sender to send messages here
-    own_sender: IpcSender<ServiceWorkerMsg>,
+    own_sender: GenericSender<ServiceWorkerMsg>,
     // receiver to receive messages from constellation
-    own_port: Receiver<ServiceWorkerMsg>,
+    own_port: RoutedReceiver<ServiceWorkerMsg>,
     // to receive resource messages
     resource_receiver: Receiver<CustomResponseMediator>,
+    /// A shared [`FontContext`] to use for all service workers spawned by this [`ServiceWorkerManager`].
+    font_context: Arc<FontContext>,
 }
 
 impl ServiceWorkerManager {
     fn new(
-        own_sender: IpcSender<ServiceWorkerMsg>,
-        from_constellation_receiver: Receiver<ServiceWorkerMsg>,
+        own_sender: GenericSender<ServiceWorkerMsg>,
+        from_constellation_receiver: RoutedReceiver<ServiceWorkerMsg>,
         resource_port: Receiver<CustomResponseMediator>,
-        constellation_sender: IpcSender<SWManagerMsg>,
+        constellation_sender: GenericSender<SWManagerMsg>,
+        font_context: Arc<FontContext>,
     ) -> ServiceWorkerManager {
         // Install a pipeline-namespace in the current thread.
         PipelineNamespace::auto_install();
 
         ServiceWorkerManager {
             registrations: HashMap::new(),
-            own_sender: own_sender,
+            own_sender,
             own_port: from_constellation_receiver,
             resource_receiver: resource_port,
             _constellation_sender: constellation_sender,
+            font_context,
         }
     }
 
-    pub fn get_matching_scope(&self, load_url: &ServoUrl) -> Option<ServoUrl> {
+    pub(crate) fn get_matching_scope(&self, load_url: &ServoUrl) -> Option<ServoUrl> {
         for scope in self.registrations.keys() {
-            if longest_prefix_match(&scope, load_url) {
+            if longest_prefix_match(scope, load_url) {
                 return Some(scope.clone());
             }
         }
@@ -253,7 +262,7 @@ impl ServiceWorkerManager {
     fn handle_message(&mut self) {
         while let Ok(message) = self.receive_message() {
             let should_continue = match message {
-                Message::FromConstellation(msg) => self.handle_message_from_constellation(msg),
+                Message::FromConstellation(msg) => self.handle_message_from_constellation(*msg),
                 Message::FromResource(msg) => self.handle_message_from_resource(msg),
             };
             if !should_continue {
@@ -281,10 +290,10 @@ impl ServiceWorkerManager {
         true
     }
 
-    fn receive_message(&mut self) -> Result<Message, RecvError> {
+    fn receive_message(&mut self) -> generic_channel::ReceiveResult<Message> {
         select! {
-            recv(self.own_port) -> msg => msg.map(Message::FromConstellation),
-            recv(self.resource_receiver) -> msg => msg.map(Message::FromResource),
+            recv(self.own_port) -> result_msg => generic_channel::to_receive_result::<ServiceWorkerMsg>(result_msg).map(|msg| Message::FromConstellation(Box::new(msg))),
+            recv(self.resource_receiver) -> msg => msg.map(Message::FromResource).map_err(|_e| ReceiveError::Disconnected),
         }
     }
 
@@ -318,7 +327,7 @@ impl ServiceWorkerManager {
 
     /// <https://w3c.github.io/ServiceWorker/#register-algorithm>
     fn handle_register_job(&mut self, mut job: Job) {
-        if !job.script_url.is_origin_trustworthy() {
+        if !job.script_url.origin().is_potentially_trustworthy() {
             // Step 1.1
             let _ = job
                 .client
@@ -364,7 +373,6 @@ impl ServiceWorkerManager {
                         active_worker: registration.active_worker.as_ref().map(|worker| worker.id),
                     },
                 ));
-                return;
             }
         } else {
             // Step 6: we do not have a registration.
@@ -404,8 +412,12 @@ impl ServiceWorkerManager {
 
             // Very roughly steps 5 to 18.
             // TODO: implement all steps precisely.
-            let (new_worker, join_handle, control_sender, context, closing) =
-                update_serviceworker(self.own_sender.clone(), job.scope_url.clone(), scope_things);
+            let (new_worker, join_handle, control_sender, context, closing) = update_serviceworker(
+                self.own_sender.clone(),
+                job.scope_url.clone(),
+                scope_things,
+                self.font_context.clone(),
+            );
 
             // Since we've just started the worker thread, ensure we can shut it down later.
             registration.note_worker_thread(join_handle, control_sender, context, closing);
@@ -441,18 +453,19 @@ impl ServiceWorkerManager {
 
 /// <https://w3c.github.io/ServiceWorker/#update-algorithm>
 fn update_serviceworker(
-    own_sender: IpcSender<ServiceWorkerMsg>,
+    own_sender: GenericSender<ServiceWorkerMsg>,
     scope_url: ServoUrl,
     scope_things: ScopeThings,
+    font_context: Arc<FontContext>,
 ) -> (
     ServiceWorker,
     JoinHandle<()>,
     Sender<ServiceWorkerControlMsg>,
-    ContextForRequestInterrupt,
+    ThreadSafeJSContext,
     Arc<AtomicBool>,
 ) {
     let (sender, receiver) = unbounded();
-    let (_devtools_sender, devtools_receiver) = ipc::channel().unwrap();
+    let (_devtools_sender, devtools_receiver) = generic_channel::channel().unwrap();
     let worker_id = ServiceWorkerId::new();
 
     let (control_sender, control_receiver) = unbounded();
@@ -469,6 +482,7 @@ fn update_serviceworker(
         control_receiver,
         context_sender,
         closing.clone(),
+        font_context,
     );
 
     let context = context_receiver
@@ -489,26 +503,39 @@ impl ServiceWorkerManagerFactory for ServiceWorkerManager {
         let (resource_chan, resource_port) = ipc::channel().unwrap();
 
         let SWManagerSenders {
-            resource_sender,
+            resource_threads,
             own_sender,
             receiver,
             swmanager_sender: constellation_sender,
+            system_font_service_sender,
+            paint_api,
         } = sw_senders;
 
-        let from_constellation = ROUTER.route_ipc_receiver_to_new_crossbeam_receiver(receiver);
+        let from_constellation = receiver.route_preserving_errors();
         let resource_port = ROUTER.route_ipc_receiver_to_new_crossbeam_receiver(resource_port);
-        let _ = resource_sender.send(CoreResourceMsg::NetworkMediator(resource_chan, origin));
+        let _ = resource_threads
+            .core_thread
+            .send(CoreResourceMsg::NetworkMediator(resource_chan, origin));
+
+        let font_context = Arc::new(FontContext::new(
+            Arc::new(system_font_service_sender.to_proxy()),
+            paint_api,
+            resource_threads,
+        ));
+
+        let swmanager_thread = move || {
+            ServiceWorkerManager::new(
+                own_sender,
+                from_constellation,
+                resource_port,
+                constellation_sender,
+                font_context,
+            )
+            .handle_message()
+        };
         if thread::Builder::new()
             .name("SvcWorkerManager".to_owned())
-            .spawn(move || {
-                ServiceWorkerManager::new(
-                    own_sender,
-                    from_constellation,
-                    resource_port,
-                    constellation_sender,
-                )
-                .handle_message();
-            })
+            .spawn(swmanager_thread)
             .is_err()
         {
             warn!("ServiceWorkerManager thread spawning failed");
@@ -516,6 +543,6 @@ impl ServiceWorkerManagerFactory for ServiceWorkerManager {
     }
 }
 
-pub fn serviceworker_enabled() -> bool {
-    pref!(dom.serviceworker.enabled)
+pub(crate) fn serviceworker_enabled() -> bool {
+    pref!(dom_serviceworker_enabled)
 }
