@@ -55,16 +55,16 @@ impl FetchResponseListener for LayoutImageContext {
 
     fn process_response_eof(
         self,
+        cx: &mut js::context::JSContext,
         request_id: RequestId,
-        response: Result<ResourceFetchTiming, NetworkError>,
+        response: Result<(), NetworkError>,
+        timing: ResourceFetchTiming,
     ) {
         self.cache.notify_pending_response(
             self.id,
-            FetchResponseMsg::ProcessResponseEOF(request_id, response.clone()),
+            FetchResponseMsg::ProcessResponseEOF(request_id, response.clone(), timing.clone()),
         );
-        if let Ok(response) = response {
-            network_listener::submit_timing(&self, &response, CanGc::note());
-        }
+        network_listener::submit_timing(&self, &response, &timing, CanGc::from_cx(cx));
     }
 
     fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<Violation>) {

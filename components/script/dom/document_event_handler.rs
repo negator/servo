@@ -4,31 +4,33 @@
 
 use std::array::from_ref;
 use std::cell::{Cell, RefCell};
+use std::cmp::Ordering;
 use std::f64::consts::PI;
 use std::mem;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use base::generic_channel::GenericCallback;
 use constellation_traits::{KeyboardScroll, ScriptToConstellationMessage};
 use embedder_traits::{
     Cursor, EditingActionEvent, EmbedderMsg, ImeEvent, InputEvent, InputEventAndId,
     InputEventResult, KeyboardEvent as EmbedderKeyboardEvent, MouseButton, MouseButtonAction,
-    MouseButtonEvent, MouseLeftViewportEvent, ScrollEvent, TouchEvent as EmbedderTouchEvent,
-    TouchEventType, TouchId, UntrustedNodeAddress, WheelEvent as EmbedderWheelEvent,
+    MouseButtonEvent, MouseLeftViewportEvent, TouchEvent as EmbedderTouchEvent, TouchEventType,
+    TouchId, UntrustedNodeAddress, WheelEvent as EmbedderWheelEvent,
 };
 #[cfg(feature = "gamepad")]
 use embedder_traits::{
     GamepadEvent as EmbedderGamepadEvent, GamepadSupportedHapticEffects, GamepadUpdateType,
 };
 use euclid::{Point2D, Vector2D};
-use ipc_channel::ipc;
 use js::jsapi::JSAutoRealm;
 use keyboard_types::{Code, Key, KeyState, Modifiers, NamedKey};
 use layout_api::{ScrollContainerQueryFlags, node_id_from_scroll_id};
+use rustc_hash::FxHashMap;
 use script_bindings::codegen::GenericBindings::DocumentBinding::DocumentMethods;
 use script_bindings::codegen::GenericBindings::EventBinding::EventMethods;
+use script_bindings::codegen::GenericBindings::HTMLLabelElementBinding::HTMLLabelElementMethods;
 use script_bindings::codegen::GenericBindings::NavigatorBinding::NavigatorMethods;
-use script_bindings::codegen::GenericBindings::NodeBinding::NodeMethods;
 use script_bindings::codegen::GenericBindings::PerformanceBinding::PerformanceMethods;
 use script_bindings::codegen::GenericBindings::TouchBinding::TouchMethods;
 use script_bindings::codegen::GenericBindings::WindowBinding::{ScrollBehavior, WindowMethods};
@@ -42,8 +44,10 @@ use script_bindings::str::DOMString;
 use script_traits::ConstellationInputEvent;
 use servo_config::pref;
 use style_traits::CSSPixel;
+use webrender_api::ExternalScrollId;
 
 use crate::dom::bindings::cell::DomRefCell;
+use crate::dom::bindings::inheritance::{ElementTypeId, HTMLElementTypeId, NodeTypeId};
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::root::MutNullableDom;
 use crate::dom::clipboardevent::ClipboardEventType;
@@ -55,15 +59,77 @@ use crate::dom::gamepad::gamepad::{Gamepad, contains_user_gesture};
 use crate::dom::gamepad::gamepadevent::GamepadEventType;
 use crate::dom::inputevent::HitTestResult;
 use crate::dom::node::{self, Node, NodeTraits, ShadowIncluding};
-use crate::dom::pointerevent::PointerId;
+use crate::dom::pointerevent::{PointerEvent, PointerId};
 use crate::dom::scrolling_box::ScrollingBoxAxis;
 use crate::dom::types::{
     ClipboardEvent, CompositionEvent, DataTransfer, Element, Event, EventTarget, GlobalScope,
-    HTMLAnchorElement, KeyboardEvent, MouseEvent, PointerEvent, Touch, TouchEvent, TouchList,
+    HTMLAnchorElement, HTMLLabelElement, KeyboardEvent, MouseEvent, Touch, TouchEvent, TouchList,
     WheelEvent, Window,
 };
 use crate::drag_data_store::{DragDataStore, Kind, Mode};
 use crate::realms::enter_realm;
+
+/// A data structure used for tracking the current click count. This can be
+/// reset to 0 if a mouse button event happens at a sufficient distance or time
+/// from the previous one.
+///
+/// From <https://w3c.github.io/uievents/#current-click-count>:
+/// > Implementations MUST maintain the current click count when generating mouse
+/// > events. This MUST be a non-negative integer indicating the number of consecutive
+/// > clicks of a pointing device button within a specific time. The delay after which
+/// > the count resets is specific to the environment configuration.
+#[derive(Default, JSTraceable, MallocSizeOf)]
+struct ClickCountingInfo {
+    time: Option<Instant>,
+    #[no_trace]
+    point: Option<Point2D<f32, CSSPixel>>,
+    #[no_trace]
+    button: Option<MouseButton>,
+    count: usize,
+}
+
+impl ClickCountingInfo {
+    fn reset_click_count_if_necessary(
+        &mut self,
+        button: MouseButton,
+        point_in_frame: Point2D<f32, CSSPixel>,
+    ) {
+        let (Some(previous_button), Some(previous_point), Some(previous_time)) =
+            (self.button, self.point, self.time)
+        else {
+            assert_eq!(self.count, 0);
+            return;
+        };
+
+        let double_click_timeout =
+            Duration::from_millis(pref!(dom_document_dblclick_timeout) as u64);
+        let double_click_distance_threshold = pref!(dom_document_dblclick_dist) as u64;
+
+        // Calculate distance between this click and the previous click.
+        let line = point_in_frame - previous_point;
+        let distance = (line.dot(line) as f64).sqrt();
+        if previous_button != button ||
+            Instant::now().duration_since(previous_time) > double_click_timeout ||
+            distance > double_click_distance_threshold as f64
+        {
+            self.count = 0;
+            self.time = None;
+            self.point = None;
+        }
+    }
+
+    fn increment_click_count(
+        &mut self,
+        button: MouseButton,
+        point: Point2D<f32, CSSPixel>,
+    ) -> usize {
+        self.time = Some(Instant::now());
+        self.point = Some(point);
+        self.button = Some(button);
+        self.count += 1;
+        self.count
+    }
+}
 
 /// The [`DocumentEventHandler`] is a structure responsible for handling input events for
 /// the [`crate::Document`] and storing data related to event handling. It exists to
@@ -80,11 +146,12 @@ pub(crate) struct DocumentEventHandler {
     /// The index of the last mouse move event in the pending input events queue.
     mouse_move_event_index: DomRefCell<Option<usize>>,
     /// <https://w3c.github.io/uievents/#event-type-dblclick>
-    #[ignore_malloc_size_of = "Defined in std"]
-    #[no_trace]
-    last_click_info: DomRefCell<Option<(Instant, Point2D<f32, CSSPixel>)>>,
+    click_counting_info: DomRefCell<ClickCountingInfo>,
     #[no_trace]
     last_mouse_button_down_point: Cell<Option<Point2D<f32, CSSPixel>>>,
+    /// The number of currently down buttons, used to decide which kind
+    /// of pointer event to dispatch on MouseDown/MouseUp.
+    down_button_count: Cell<u32>,
     /// The element that is currently hovered by the cursor.
     current_hover_target: MutNullableDom<Element>,
     /// The element that was most recently clicked.
@@ -101,6 +168,10 @@ pub(crate) struct DocumentEventHandler {
     /// The active keyboard modifiers for the WebView. This is updated when receiving any input event.
     #[no_trace]
     active_keyboard_modifiers: Cell<Modifiers>,
+    /// Map from touch identifier to pointer ID for active touch points
+    active_pointer_ids: DomRefCell<FxHashMap<i32, i32>>,
+    /// Counter for generating unique pointer IDs for touch inputs
+    next_touch_pointer_id: Cell<i32>,
 }
 
 impl DocumentEventHandler {
@@ -109,14 +180,17 @@ impl DocumentEventHandler {
             window: Dom::from_ref(window),
             pending_input_events: Default::default(),
             mouse_move_event_index: Default::default(),
-            last_click_info: Default::default(),
+            click_counting_info: Default::default(),
             last_mouse_button_down_point: Default::default(),
+            down_button_count: Cell::new(0),
             current_hover_target: Default::default(),
             most_recently_clicked_element: Default::default(),
             most_recent_mousemove_point: Default::default(),
             current_cursor: Default::default(),
             active_touch_points: Default::default(),
             active_keyboard_modifiers: Default::default(),
+            active_pointer_ids: Default::default(),
+            next_touch_pointer_id: Cell::new(1),
         }
     }
 
@@ -208,10 +282,6 @@ impl DocumentEventHandler {
                 InputEvent::EditingAction(editing_action_event) => {
                     self.handle_editing_action(None, editing_action_event, can_gc)
                 },
-                InputEvent::Scroll(scroll_event) => {
-                    self.handle_embedder_scroll_event(scroll_event);
-                    InputEventResult::default()
-                },
             };
 
             self.notify_embedder_that_event_was_handled(event.event, result);
@@ -258,11 +328,11 @@ impl DocumentEventHandler {
         if let Some(current_hover_target) = self.current_hover_target.get() {
             let current_hover_target = current_hover_target.upcast::<Node>();
             for element in current_hover_target
-                .inclusive_ancestors(ShadowIncluding::No)
+                .inclusive_ancestors(ShadowIncluding::Yes)
                 .filter_map(DomRoot::downcast::<Element>)
             {
                 element.set_hover_state(false);
-                element.set_active_state(false);
+                self.element_for_activation(element).set_active_state(false);
             }
 
             if let Some(hit_test_result) = self
@@ -270,17 +340,24 @@ impl DocumentEventHandler {
                 .get()
                 .and_then(|point| self.window.hit_test_from_point_in_viewport(point))
             {
-                MouseEvent::new_simple(
+                let mouse_out_event = MouseEvent::new_for_platform_motion_event(
                     &self.window,
                     FireMouseEventType::Out,
-                    EventBubbles::Bubbles,
-                    EventCancelable::Cancelable,
                     &hit_test_result,
                     input_event,
                     can_gc,
-                )
-                .upcast::<Event>()
-                .fire(current_hover_target.upcast(), can_gc);
+                );
+
+                // Fire pointerout before mouseout
+                mouse_out_event
+                    .to_pointer_hover_event("pointerout", can_gc)
+                    .upcast::<Event>()
+                    .fire(current_hover_target.upcast(), can_gc);
+
+                mouse_out_event
+                    .upcast::<Event>()
+                    .fire(current_hover_target.upcast(), can_gc);
+
                 self.handle_mouse_enter_leave_event(
                     DomRoot::from_ref(current_hover_target),
                     None,
@@ -327,7 +404,7 @@ impl DocumentEventHandler {
 
         let common_ancestor = match related_target.as_ref() {
             Some(related_target) => event_target
-                .common_ancestor(related_target, ShadowIncluding::No)
+                .common_ancestor_in_flat_tree(related_target)
                 .unwrap_or_else(|| DomRoot::from_ref(&*event_target)),
             None => DomRoot::from_ref(&*event_target),
         };
@@ -340,28 +417,42 @@ impl DocumentEventHandler {
             if node == common_ancestor {
                 break;
             }
-            current = node.GetParentNode();
+            current = node.parent_in_flat_tree();
             targets.push(node);
         }
 
-        // The order for dispatching mouseenter events starts from the topmost
+        // The order for dispatching mouseenter/pointerenter events starts from the topmost
         // common ancestor of the event target and the related target.
         if event_type == FireMouseEventType::Enter {
             targets = targets.into_iter().rev().collect();
         }
 
+        let pointer_event_name = match event_type {
+            FireMouseEventType::Enter => "pointerenter",
+            FireMouseEventType::Leave => "pointerleave",
+            _ => unreachable!(),
+        };
+
         for target in targets {
-            MouseEvent::new_simple(
+            let mouse_event = MouseEvent::new_for_platform_motion_event(
                 &self.window,
                 event_type,
-                EventBubbles::DoesNotBubble,
-                EventCancelable::NotCancelable,
                 hit_test_result,
                 input_event,
                 can_gc,
-            )
-            .upcast::<Event>()
-            .fire(target.upcast(), can_gc);
+            );
+            mouse_event
+                .upcast::<Event>()
+                .set_related_target(related_target.as_ref().map(|target| target.upcast()));
+
+            // Fire pointer event before mouse event
+            mouse_event
+                .to_pointer_hover_event(pointer_event_name, can_gc)
+                .upcast::<Event>()
+                .fire(target.upcast(), can_gc);
+
+            // Fire mouse event
+            mouse_event.upcast::<Event>().fire(target.upcast(), can_gc);
         }
     }
 
@@ -372,26 +463,33 @@ impl DocumentEventHandler {
             return;
         };
 
+        let old_mouse_move_point = self
+            .most_recent_mousemove_point
+            .replace(Some(hit_test_result.point_in_frame));
+        if old_mouse_move_point == Some(hit_test_result.point_in_frame) {
+            return;
+        }
+
         // Update the cursor when the mouse moves, if it has changed.
         self.set_cursor(Some(hit_test_result.cursor));
 
         let Some(new_target) = hit_test_result
             .node
-            .inclusive_ancestors(ShadowIncluding::No)
+            .inclusive_ancestors(ShadowIncluding::Yes)
             .find_map(DomRoot::downcast::<Element>)
         else {
             return;
         };
 
-        let target_has_changed = self
-            .current_hover_target
-            .get()
-            .is_none_or(|old_target| old_target != new_target);
+        let old_hover_target = self.current_hover_target.get();
+        let target_has_changed = old_hover_target
+            .as_ref()
+            .is_none_or(|old_target| *old_target != new_target);
 
         // Here we know the target has changed, so we must update the state,
         // dispatch mouseout to the previous one, mouseover to the new one.
         if target_has_changed {
-            // Dispatch mouseout and mouseleave to previous target.
+            // Dispatch pointerout/mouseout and pointerleave/mouseleave to previous target.
             if let Some(old_target) = self.current_hover_target.get() {
                 let old_target_is_ancestor_of_new_target = old_target
                     .upcast::<Node>()
@@ -406,21 +504,30 @@ impl DocumentEventHandler {
                         .filter_map(DomRoot::downcast::<Element>)
                     {
                         element.set_hover_state(false);
-                        element.set_active_state(false);
+                        self.element_for_activation(element).set_active_state(false);
                     }
                 }
 
-                MouseEvent::new_simple(
+                let mouse_out_event = MouseEvent::new_for_platform_motion_event(
                     &self.window,
                     FireMouseEventType::Out,
-                    EventBubbles::Bubbles,
-                    EventCancelable::Cancelable,
                     &hit_test_result,
                     input_event,
                     can_gc,
-                )
-                .upcast::<Event>()
-                .fire(old_target.upcast(), can_gc);
+                );
+                mouse_out_event
+                    .upcast::<Event>()
+                    .set_related_target(Some(new_target.upcast()));
+
+                // Fire pointerout before mouseout
+                mouse_out_event
+                    .to_pointer_hover_event("pointerout", can_gc)
+                    .upcast::<Event>()
+                    .fire(old_target.upcast(), can_gc);
+
+                mouse_out_event
+                    .upcast::<Event>()
+                    .fire(old_target.upcast(), can_gc);
 
                 if !old_target_is_ancestor_of_new_target {
                     let event_target = DomRoot::from_ref(old_target.upcast::<Node>());
@@ -436,31 +543,38 @@ impl DocumentEventHandler {
                 }
             }
 
-            // Dispatch mouseover and mouseenter to new target.
+            // Dispatch pointerover/mouseover and pointerenter/mouseenter to new target.
             for element in new_target
                 .upcast::<Node>()
-                .inclusive_ancestors(ShadowIncluding::No)
+                .inclusive_ancestors(ShadowIncluding::Yes)
                 .filter_map(DomRoot::downcast::<Element>)
             {
                 element.set_hover_state(true);
             }
 
-            MouseEvent::new_simple(
+            let mouse_over_event = MouseEvent::new_for_platform_motion_event(
                 &self.window,
                 FireMouseEventType::Over,
-                EventBubbles::Bubbles,
-                EventCancelable::Cancelable,
                 &hit_test_result,
                 input_event,
                 can_gc,
-            )
-            .upcast::<Event>()
-            .fire(new_target.upcast(), can_gc);
+            );
+            mouse_over_event
+                .upcast::<Event>()
+                .set_related_target(old_hover_target.as_ref().map(|target| target.upcast()));
 
-            let moving_from = self
-                .current_hover_target
-                .get()
-                .map(|old_target| DomRoot::from_ref(old_target.upcast::<Node>()));
+            // Fire pointerover before mouseover
+            mouse_over_event
+                .to_pointer_hover_event("pointerover", can_gc)
+                .upcast::<Event>()
+                .dispatch(new_target.upcast(), false, can_gc);
+
+            mouse_over_event
+                .upcast::<Event>()
+                .dispatch(new_target.upcast(), false, can_gc);
+
+            let moving_from =
+                old_hover_target.map(|old_target| DomRoot::from_ref(old_target.upcast::<Node>()));
             let event_target = DomRoot::from_ref(new_target.upcast::<Node>());
             self.handle_mouse_enter_leave_event(
                 event_target,
@@ -474,21 +588,27 @@ impl DocumentEventHandler {
 
         // Send mousemove event to topmost target, unless it's an iframe, in which case
         // `Paint` should have also sent an event to the inner document.
-        MouseEvent::new_simple(
+        let mouse_event = MouseEvent::new_for_platform_motion_event(
             &self.window,
             FireMouseEventType::Move,
-            EventBubbles::Bubbles,
-            EventCancelable::Cancelable,
             &hit_test_result,
             input_event,
             can_gc,
-        )
-        .upcast::<Event>()
-        .fire(new_target.upcast(), can_gc);
+        );
+
+        // Send pointermove event before mousemove.
+        let pointer_event = mouse_event.to_pointer_event("pointermove", can_gc);
+        pointer_event
+            .upcast::<Event>()
+            .fire(new_target.upcast(), can_gc);
+
+        // Send mousemove event to topmost target, unless it's an iframe, in which case
+        // `Paint` should have also sent an event to the inner document.
+        mouse_event
+            .upcast::<Event>()
+            .fire(new_target.upcast(), can_gc);
 
         self.update_current_hover_target_and_status(Some(new_target));
-        self.most_recent_mousemove_point
-            .set(Some(hit_test_result.point_in_frame));
     }
 
     fn update_current_hover_target_and_status(&self, new_hover_target: Option<DomRoot<Element>>) {
@@ -505,7 +625,7 @@ impl DocumentEventHandler {
         if let Some(target) = self.current_hover_target.get() {
             if let Some(anchor) = target
                 .upcast::<Node>()
-                .inclusive_ancestors(ShadowIncluding::No)
+                .inclusive_ancestors(ShadowIncluding::Yes)
                 .find_map(DomRoot::downcast::<HTMLAnchorElement>)
             {
                 let status = anchor
@@ -524,7 +644,7 @@ impl DocumentEventHandler {
         if previous_hover_target.is_none_or(|previous_hover_target| {
             previous_hover_target
                 .upcast::<Node>()
-                .inclusive_ancestors(ShadowIncluding::No)
+                .inclusive_ancestors(ShadowIncluding::Yes)
                 .any(|node| node.is::<HTMLAnchorElement>())
         }) {
             self.window
@@ -545,6 +665,21 @@ impl DocumentEventHandler {
         };
 
         self.set_cursor(Some(hit_test_result.cursor));
+    }
+
+    fn element_for_activation(&self, element: DomRoot<Element>) -> DomRoot<Element> {
+        // If the element is a label, the activable element is the control element.
+        if element.upcast::<Node>().type_id() ==
+            NodeTypeId::Element(ElementTypeId::HTMLElement(
+                HTMLElementTypeId::HTMLLabelElement,
+            ))
+        {
+            let label = element.downcast::<HTMLLabelElement>().unwrap();
+            if let Some(control) = label.GetControl() {
+                return DomRoot::from_ref(control.upcast::<Element>());
+            }
+        }
+        element
     }
 
     /// <https://w3c.github.io/uievents/#mouseevent-algorithms>
@@ -576,6 +711,18 @@ impl DocumentEventHandler {
         let node = element.upcast::<Node>();
         debug!("{:?} on {:?}", event.action, node.debug_str());
 
+        // <https://html.spec.whatwg.org/multipage/#selector-active>
+        // If the element is being actively pointed at the element is being activated.
+        // Disabled elements can also be activated.
+        if event.action == MouseButtonAction::Down {
+            self.element_for_activation(element.clone())
+                .set_active_state(true);
+        }
+        if event.action == MouseButtonAction::Up {
+            self.element_for_activation(element.clone())
+                .set_active_state(false);
+        }
+
         // https://w3c.github.io/uievents/#hit-test
         // Prevent mouse event if element is disabled.
         // TODO: also inert.
@@ -587,27 +734,51 @@ impl DocumentEventHandler {
             embedder_traits::MouseButtonAction::Up => "mouseup",
             embedder_traits::MouseButtonAction::Down => "mousedown",
         };
-        let dom_event = DomRoot::upcast::<Event>(MouseEvent::for_platform_mouse_event(
+
+        // From <https://w3c.github.io/uievents/#event-type-mousedown>
+        // and <https://w3c.github.io/uievents/#event-type-mouseup>:
+        //
+        // UIEvent.detail: indicates the current click count incremented by one. For
+        // example, if no click happened before the mousedown, detail will contain
+        // the value 1
+        if event.action == MouseButtonAction::Down {
+            self.click_counting_info
+                .borrow_mut()
+                .reset_click_count_if_necessary(event.button, hit_test_result.point_in_frame);
+        }
+
+        let dom_event = DomRoot::upcast::<Event>(MouseEvent::for_platform_button_event(
             mouse_event_type_string,
             event,
             input_event.pressed_mouse_buttons,
             &self.window,
             &hit_test_result,
             input_event.active_keyboard_modifiers,
+            self.click_counting_info.borrow().count + 1,
             can_gc,
         ));
 
-        let activatable = element.as_maybe_activatable();
         match event.action {
             MouseButtonAction::Down => {
                 self.last_mouse_button_down_point
                     .set(Some(hit_test_result.point_in_frame));
 
-                if let Some(a) = activatable {
-                    a.enter_formal_activation_state();
-                }
+                // Step 6. Dispatch pointerdown event.
+                let down_button_count = self.down_button_count.get();
 
-                // (TODO) Step 6. Maybe send pointerdown event with `dom_event`.
+                let event_type = if down_button_count == 0 {
+                    "pointerdown"
+                } else {
+                    "pointermove"
+                };
+                let pointer_event = dom_event
+                    .downcast::<MouseEvent>()
+                    .unwrap()
+                    .to_pointer_event(event_type, can_gc);
+
+                pointer_event.upcast::<Event>().fire(node.upcast(), can_gc);
+
+                self.down_button_count.set(down_button_count + 1);
 
                 // For a node within a text input UA shadow DOM,
                 // delegate the focus target into its shadow host.
@@ -644,14 +815,34 @@ impl DocumentEventHandler {
             },
             // https://w3c.github.io/uievents/#handle-native-mouse-up
             MouseButtonAction::Up => {
-                if let Some(a) = activatable {
-                    a.exit_formal_activation_state();
+                // Step 6. Dispatch pointerup event.
+                let down_button_count = self.down_button_count.get();
+
+                if down_button_count > 0 {
+                    self.down_button_count.set(down_button_count - 1);
                 }
 
-                // (TODO) Step 6. Maybe send pointerup event with `dom_event``.
+                let event_type = if down_button_count == 0 {
+                    "pointerup"
+                } else {
+                    "pointermove"
+                };
+                let pointer_event = dom_event
+                    .downcast::<MouseEvent>()
+                    .unwrap()
+                    .to_pointer_event(event_type, can_gc);
+
+                pointer_event.upcast::<Event>().fire(node.upcast(), can_gc);
 
                 // Step 7. dispatch event at target.
                 dom_event.dispatch(node.upcast(), false, can_gc);
+
+                // Click counts should still work for other buttons even though they
+                // do not trigger "click" and "dblclick" events, so we increment
+                // even when those events are not fired.
+                self.click_counting_info
+                    .borrow_mut()
+                    .increment_click_count(event.button, hit_test_result.point_in_frame);
 
                 self.maybe_trigger_click_for_mouse_button_down_event(
                     event,
@@ -665,6 +856,7 @@ impl DocumentEventHandler {
     }
 
     /// <https://w3c.github.io/uievents/#handle-native-mouse-click>
+    /// <https://w3c.github.io/uievents/#event-type-dblclick>
     fn maybe_trigger_click_for_mouse_button_down_event(
         &self,
         event: MouseButtonEvent,
@@ -676,6 +868,7 @@ impl DocumentEventHandler {
         if event.button != MouseButton::Left {
             return;
         }
+
         let Some(last_mouse_button_down_point) = self.last_mouse_button_down_point.take() else {
             return;
         };
@@ -689,27 +882,49 @@ impl DocumentEventHandler {
         // From <https://w3c.github.io/uievents/#event-type-click>
         // > The click event type MUST be dispatched on the topmost event target indicated by the
         // > pointer, when the user presses down and releases the primary pointer button.
-
         // For nodes inside a text input UA shadow DOM, dispatch dblclick at the shadow host.
         let delegated = element.find_focusable_shadow_host_if_necessary();
         let element = delegated.as_deref().unwrap_or(element);
         self.most_recently_clicked_element.set(Some(element));
 
+        let click_count = self.click_counting_info.borrow().count;
         element.set_click_in_progress(true);
-        let dom_event = DomRoot::upcast::<Event>(MouseEvent::for_platform_mouse_event(
+        MouseEvent::for_platform_button_event(
             "click",
             event,
             input_event.pressed_mouse_buttons,
             &self.window,
             hit_test_result,
             input_event.active_keyboard_modifiers,
+            click_count,
             can_gc,
-        ));
-        let node = element.upcast::<Node>();
-        dom_event.dispatch(node.upcast(), false, can_gc);
+        )
+        .upcast::<Event>()
+        .dispatch(element.upcast(), false, can_gc);
         element.set_click_in_progress(false);
 
-        self.maybe_fire_dblclick(node, hit_test_result, input_event, can_gc);
+        // The firing of "dbclick" events is dependent on the platform, so we have
+        // some flexibility here. Some browsers on some platforms only fire a
+        // "dbclick" when the click count is 2 and others essentially fire one for
+        // every 2 clicks in a sequence. In all cases, browsers set the click count
+        // `detail` property to 2.
+        //
+        // We follow the latter approach here, considering that every sequence of
+        // even numbered clicks is a series of double clicks.
+        if click_count % 2 == 0 {
+            MouseEvent::for_platform_button_event(
+                "dblclick",
+                event,
+                input_event.pressed_mouse_buttons,
+                &self.window,
+                hit_test_result,
+                input_event.active_keyboard_modifiers,
+                2,
+                can_gc,
+            )
+            .upcast::<Event>()
+            .dispatch(element.upcast(), false, can_gc);
+        }
     }
 
     /// <https://www.w3.org/TR/uievents/#maybe-show-context-menu>
@@ -767,64 +982,6 @@ impl DocumentEventHandler {
         };
     }
 
-    fn maybe_fire_dblclick(
-        &self,
-        target: &Node,
-        hit_test_result: &HitTestResult,
-        input_event: &ConstellationInputEvent,
-        can_gc: CanGc,
-    ) {
-        // https://w3c.github.io/uievents/#event-type-dblclick
-        let now = Instant::now();
-        let point_in_frame = hit_test_result.point_in_frame;
-        let opt = self.last_click_info.borrow_mut().take();
-
-        if let Some((last_time, last_pos)) = opt {
-            let double_click_timeout =
-                Duration::from_millis(pref!(dom_document_dblclick_timeout) as u64);
-            let double_click_distance_threshold = pref!(dom_document_dblclick_dist) as u64;
-
-            // Calculate distance between this click and the previous click.
-            let line = point_in_frame - last_pos;
-            let dist = (line.dot(line) as f64).sqrt();
-
-            if now.duration_since(last_time) < double_click_timeout &&
-                dist < double_click_distance_threshold as f64
-            {
-                // A double click has occurred if this click is within a certain time and dist. of previous click.
-                let click_count = 2;
-
-                let event = MouseEvent::new(
-                    &self.window,
-                    DOMString::from("dblclick"),
-                    EventBubbles::Bubbles,
-                    EventCancelable::Cancelable,
-                    Some(&self.window),
-                    click_count,
-                    point_in_frame.to_i32(),
-                    point_in_frame.to_i32(),
-                    hit_test_result
-                        .point_relative_to_initial_containing_block
-                        .to_i32(),
-                    input_event.active_keyboard_modifiers,
-                    0i16,
-                    input_event.pressed_mouse_buttons,
-                    None,
-                    None,
-                    can_gc,
-                );
-                event.upcast::<Event>().fire(target.upcast(), can_gc);
-
-                // When a double click occurs, self.last_click_info is left as None so that a
-                // third sequential click will not cause another double click.
-                return;
-            }
-        }
-
-        // Update last_click_info with the time and position of the click.
-        *self.last_click_info.borrow_mut() = Some((now, point_in_frame));
-    }
-
     fn handle_touch_event(
         &self,
         event: EmbedderTouchEvent,
@@ -837,24 +994,18 @@ impl DocumentEventHandler {
             return Default::default();
         };
 
-        let TouchId(identifier) = event.id;
-        let event_name = match event.event_type {
-            TouchEventType::Down => "touchstart",
-            TouchEventType::Move => "touchmove",
-            TouchEventType::Up => "touchend",
-            TouchEventType::Cancel => "touchcancel",
-        };
+        let TouchId(identifier) = event.touch_id;
 
-        let Some(el) = hit_test_result
+        let Some(element) = hit_test_result
             .node
-            .inclusive_ancestors(ShadowIncluding::No)
+            .inclusive_ancestors(ShadowIncluding::Yes)
             .find_map(DomRoot::downcast::<Element>)
         else {
             self.update_active_touch_points_when_early_return(event);
             return Default::default();
         };
 
-        let target = DomRoot::upcast::<EventTarget>(el);
+        let current_target = DomRoot::upcast::<EventTarget>(element.clone());
         let window = &*self.window;
 
         let client_x = Finite::wrap(hit_test_result.point_in_frame.x as f64);
@@ -864,50 +1015,180 @@ impl DocumentEventHandler {
         let page_y =
             Finite::wrap(hit_test_result.point_in_frame.y as f64 + window.PageYOffset() as f64);
 
-        let touch = Touch::new(
-            window, identifier, &target, client_x,
+        // This is used to construct pointerevent and touchdown event.
+        let pointer_touch = Touch::new(
+            window,
+            identifier,
+            &current_target,
+            client_x,
             client_y, // TODO: Get real screen coordinates?
-            client_x, client_y, page_x, page_y, can_gc,
+            client_x,
+            client_y,
+            page_x,
+            page_y,
+            can_gc,
         );
 
-        match event.event_type {
+        // Dispatch pointer event before updating active touch points and before touch event.
+        let pointer_event_name = match event.event_type {
+            TouchEventType::Down => "pointerdown",
+            TouchEventType::Move => "pointermove",
+            TouchEventType::Up => "pointerup",
+            TouchEventType::Cancel => "pointercancel",
+        };
+
+        // Get or create pointer ID for this touch
+        let pointer_id = self.get_or_create_pointer_id_for_touch(identifier);
+        let is_primary = self.is_primary_pointer(pointer_id);
+
+        // For touch devices (which don't support hover), fire pointerover/pointerenter
+        // <https://w3c.github.io/pointerevents/#mapping-for-devices-that-do-not-support-hover>
+        if matches!(event.event_type, TouchEventType::Down) {
+            // Fire pointerover
+            let pointer_over = pointer_touch.to_pointer_event(
+                window,
+                "pointerover",
+                pointer_id,
+                is_primary,
+                input_event.active_keyboard_modifiers,
+                true, // cancelable
+                Some(hit_test_result.point_in_node),
+                can_gc,
+            );
+            pointer_over.upcast::<Event>().fire(&current_target, can_gc);
+
+            // Fire pointerenter hierarchically (from topmost ancestor to target)
+            self.fire_pointer_event_for_touch(
+                &element,
+                &pointer_touch,
+                pointer_id,
+                "pointerenter",
+                is_primary,
+                input_event,
+                &hit_test_result,
+                can_gc,
+            );
+        }
+
+        let pointer_event = pointer_touch.to_pointer_event(
+            window,
+            pointer_event_name,
+            pointer_id,
+            is_primary,
+            input_event.active_keyboard_modifiers,
+            event.is_cancelable(),
+            Some(hit_test_result.point_in_node),
+            can_gc,
+        );
+        pointer_event
+            .upcast::<Event>()
+            .fire(&current_target, can_gc);
+
+        // For touch devices, fire pointerout/pointerleave after pointerup/pointercancel
+        // <https://w3c.github.io/pointerevents/#mapping-for-devices-that-do-not-support-hover>
+        if matches!(
+            event.event_type,
+            TouchEventType::Up | TouchEventType::Cancel
+        ) {
+            // Fire pointerout
+            let pointer_out = pointer_touch.to_pointer_event(
+                window,
+                "pointerout",
+                pointer_id,
+                is_primary,
+                input_event.active_keyboard_modifiers,
+                true, // cancelable
+                Some(hit_test_result.point_in_node),
+                can_gc,
+            );
+            pointer_out.upcast::<Event>().fire(&current_target, can_gc);
+
+            // Fire pointerleave hierarchically (from target to topmost ancestor)
+            self.fire_pointer_event_for_touch(
+                &element,
+                &pointer_touch,
+                pointer_id,
+                "pointerleave",
+                is_primary,
+                input_event,
+                &hit_test_result,
+                can_gc,
+            );
+        }
+
+        let (touch_dispatch_target, changed_touch) = match event.event_type {
             TouchEventType::Down => {
                 // Add a new touch point
                 self.active_touch_points
                     .borrow_mut()
-                    .push(Dom::from_ref(&*touch));
+                    .push(Dom::from_ref(&*pointer_touch));
+                // <https://html.spec.whatwg.org/multipage/#selector-active>
+                // If the element is being actively pointed at the element is being activated.
+                self.element_for_activation(element).set_active_state(true);
+                (current_target, pointer_touch)
             },
-            TouchEventType::Move => {
-                // Replace an existing touch point
+            _ => {
+                // From <https://w3c.github.io/touch-events/#dfn-touchend>:
+                // > For move/up/cancel:
+                // > The target of this event must be the same Element on which the touch
+                // > point started when it was first placed on the surface, even if the touch point
+                // > has since moved outside the interactive area of the target element.
                 let mut active_touch_points = self.active_touch_points.borrow_mut();
-                match active_touch_points
-                    .iter_mut()
-                    .find(|t| t.Identifier() == identifier)
-                {
-                    Some(t) => *t = Dom::from_ref(&*touch),
-                    None => warn!("Got a touchmove event for a non-active touch point"),
-                }
-            },
-            TouchEventType::Up | TouchEventType::Cancel => {
-                // Remove an existing touch point
-                let mut active_touch_points = self.active_touch_points.borrow_mut();
-                match active_touch_points
+                let Some(index) = active_touch_points
                     .iter()
-                    .position(|t| t.Identifier() == identifier)
-                {
-                    Some(i) => {
-                        active_touch_points.swap_remove(i);
+                    .position(|point| point.Identifier() == identifier)
+                else {
+                    warn!("No active touch point for {:?}", event.event_type);
+                    return Default::default();
+                };
+                // This is the original target that was selected during `touchstart` event handling.
+                let original_target = active_touch_points[index].Target();
+
+                let touch_with_touchstart_target = Touch::new(
+                    window,
+                    identifier,
+                    &original_target,
+                    client_x,
+                    client_y,
+                    client_x,
+                    client_y,
+                    page_x,
+                    page_y,
+                    can_gc,
+                );
+
+                // Update or remove the stored touch
+                match event.event_type {
+                    TouchEventType::Move => {
+                        active_touch_points[index] = Dom::from_ref(&*touch_with_touchstart_target);
                     },
-                    None => warn!("Got a touchend event for a non-active touch point"),
+                    TouchEventType::Up | TouchEventType::Cancel => {
+                        active_touch_points.swap_remove(index);
+                        self.remove_pointer_id_for_touch(identifier);
+                        // <https://html.spec.whatwg.org/multipage/#selector-active>
+                        // If the element is being actively pointed at the element is being activated.
+                        self.element_for_activation(element).set_active_state(false);
+                    },
+                    TouchEventType::Down => unreachable!("Should have been handled above"),
                 }
+                (original_target, touch_with_touchstart_target)
             },
-        }
+        };
 
         rooted_vec!(let mut target_touches);
-        let touches = {
-            let touches = self.active_touch_points.borrow();
-            target_touches.extend(touches.iter().filter(|t| t.Target() == target).cloned());
-            TouchList::new(window, touches.r(), can_gc)
+        target_touches.extend(
+            self.active_touch_points
+                .borrow()
+                .iter()
+                .filter(|touch| touch.Target() == touch_dispatch_target)
+                .cloned(),
+        );
+
+        let event_name = match event.event_type {
+            TouchEventType::Down => "touchstart",
+            TouchEventType::Move => "touchmove",
+            TouchEventType::Up => "touchend",
+            TouchEventType::Cancel => "touchcancel",
         };
 
         let touch_event = TouchEvent::new(
@@ -918,8 +1199,8 @@ impl DocumentEventHandler {
             EventComposed::Composed,
             Some(window),
             0i32,
-            &touches,
-            &TouchList::new(window, from_ref(&&*touch), can_gc),
+            &TouchList::new(window, self.active_touch_points.borrow().r(), can_gc),
+            &TouchList::new(window, from_ref(&&*changed_touch), can_gc),
             &TouchList::new(window, target_touches.r(), can_gc),
             // FIXME: modifier keys
             false,
@@ -928,35 +1209,35 @@ impl DocumentEventHandler {
             false,
             can_gc,
         );
-
         let event = touch_event.upcast::<Event>();
-        event.fire(&target, can_gc);
+        event.fire(&touch_dispatch_target, can_gc);
         event.flags().into()
     }
 
-    // If hittest fails, we still need to update the active point information.
+    /// Updates the active touch points when a hit test fails early.
+    ///
+    /// - For `Down`: No action needed; a failed down event won't create an active point.
+    /// - For `Move`: No action needed; position information is unavailable, so we cannot update.
+    /// - For `Up`/`Cancel`: Remove the corresponding touch point and its pointer ID mapping.
+    ///
+    /// When a touchup or touchcancel occurs at that touch point,
+    /// a warning is triggered: Received touchup/touchcancel event for a non-active touch point.
     fn update_active_touch_points_when_early_return(&self, event: EmbedderTouchEvent) {
         match event.event_type {
-            TouchEventType::Down => {
-                // If the touchdown fails, we don't need to do anything.
-                // When a touchmove or touchdown occurs at that touch point,
-                // a warning is triggered: Got a touchmove/touchend event for a non-active touch point
-            },
-            TouchEventType::Move => {
-                // The failure of touchmove does not affect the number of active points.
-                // Since there is no position information when it fails, we do not need to update.
-            },
+            TouchEventType::Down | TouchEventType::Move => {},
             TouchEventType::Up | TouchEventType::Cancel => {
-                // Remove an existing touch point
                 let mut active_touch_points = self.active_touch_points.borrow_mut();
-                match active_touch_points
+                if let Some(index) = active_touch_points
                     .iter()
-                    .position(|t| t.Identifier() == event.id.0)
+                    .position(|t| t.Identifier() == event.touch_id.0)
                 {
-                    Some(i) => {
-                        active_touch_points.swap_remove(i);
-                    },
-                    None => warn!("Got a touchend event for a non-active touch point"),
+                    active_touch_points.swap_remove(index);
+                    self.remove_pointer_id_for_touch(event.touch_id.0);
+                } else {
+                    warn!(
+                        "Received {:?} for a non-active touch point {}",
+                        event.event_type, event.touch_id.0
+                    );
                 }
             },
         }
@@ -1118,7 +1399,7 @@ impl DocumentEventHandler {
 
         let Some(el) = hit_test_result
             .node
-            .inclusive_ancestors(ShadowIncluding::No)
+            .inclusive_ancestors(ShadowIncluding::Yes)
             .find_map(DomRoot::downcast::<Element>)
         else {
             return Default::default();
@@ -1417,10 +1698,11 @@ impl DocumentEventHandler {
                 drag_data_store.set_mode(Mode::ReadWrite);
             },
             ClipboardEventType::Paste => {
-                let (sender, receiver) = ipc::channel().unwrap();
+                let (callback, receiver) =
+                    GenericCallback::new_blocking().expect("Could not create callback");
                 self.window.send_to_embedder(EmbedderMsg::GetClipboardText(
                     self.window.webview_id(),
-                    sender,
+                    callback,
                 ));
                 let text_contents = receiver
                     .recv()
@@ -1509,24 +1791,24 @@ impl DocumentEventHandler {
         }
     }
 
-    /// Handle scroll event triggered by user interactions from embedder side.
+    /// Handle a scroll event triggered by user interactions from the embedder.
     /// <https://drafts.csswg.org/cssom-view/#scrolling-events>
     #[expect(unsafe_code)]
-    fn handle_embedder_scroll_event(&self, event: ScrollEvent) {
+    pub(crate) fn handle_embedder_scroll_event(&self, scrolled_node: ExternalScrollId) {
         // If it is a viewport scroll.
         let document = self.window.Document();
-        if event.external_id.is_root() {
+        if scrolled_node.is_root() {
             document.handle_viewport_scroll_event();
         } else {
             // Otherwise, check whether it is for a relevant element within the document.
-            let Some(node_id) = node_id_from_scroll_id(event.external_id.0 as usize) else {
+            let Some(node_id) = node_id_from_scroll_id(scrolled_node.0 as usize) else {
                 return;
             };
             let node = unsafe {
                 node::from_untrusted_node_address(UntrustedNodeAddress::from_id(node_id))
             };
             let Some(element) = node
-                .inclusive_ancestors(ShadowIncluding::No)
+                .inclusive_ancestors(ShadowIncluding::Yes)
                 .find_map(DomRoot::downcast::<Element>)
             else {
                 return;
@@ -1536,13 +1818,11 @@ impl DocumentEventHandler {
         }
     }
 
-    pub(crate) fn run_default_keyboard_event_handler(&self, event: &KeyboardEvent) {
+    pub(crate) fn run_default_keyboard_event_handler(&self, event: &KeyboardEvent, can_gc: CanGc) {
         if event.upcast::<Event>().type_() != atom!("keydown") {
             return;
         }
-        if !event.modifiers().is_empty() {
-            return;
-        }
+
         let scroll = match event.key() {
             Key::Named(NamedKey::ArrowDown) => KeyboardScroll::Down,
             Key::Named(NamedKey::ArrowLeft) => KeyboardScroll::Left,
@@ -1552,9 +1832,195 @@ impl DocumentEventHandler {
             Key::Named(NamedKey::Home) => KeyboardScroll::Home,
             Key::Named(NamedKey::PageDown) => KeyboardScroll::PageDown,
             Key::Named(NamedKey::PageUp) => KeyboardScroll::PageUp,
+            Key::Named(NamedKey::Tab) => {
+                self.do_tab_navigation(event, can_gc);
+                return;
+            },
             _ => return,
         };
-        self.do_keyboard_scroll(scroll);
+
+        if event.modifiers().is_empty() {
+            self.do_keyboard_scroll(scroll);
+        }
+    }
+
+    pub(crate) fn do_tab_navigation(&self, event: &KeyboardEvent, can_gc: CanGc) {
+        let focus_direction = if event.modifiers().contains(Modifiers::SHIFT) {
+            FocusDirection::Backward
+        } else {
+            FocusDirection::Forward
+        };
+
+        if let Some(element) = self.find_element_for_tab_focus(focus_direction) {
+            let document = self.window.Document();
+            document.begin_focus_transaction();
+
+            document.request_focus(None, FocusInitiator::Local, can_gc);
+            document.request_focus(Some(&*element), FocusInitiator::Local, can_gc);
+
+            assert!(document.has_focus_transaction());
+            document.commit_focus_transaction(FocusInitiator::Local, can_gc);
+        }
+    }
+
+    fn find_element_for_tab_focus(&self, direction: FocusDirection) -> Option<DomRoot<Element>> {
+        match self.window.Document().get_focused_element() {
+            Some(focused_element) => {
+                self.find_element_for_tab_focus_following_element(direction, focused_element)
+            },
+            None => self.find_first_tab_focusable_element(direction),
+        }
+    }
+
+    fn find_element_for_tab_focus_following_element(
+        &self,
+        direction: FocusDirection,
+        focused_element: DomRoot<Element>,
+    ) -> Option<DomRoot<Element>> {
+        let root_node = self.window.Document().GetDocumentElement()?;
+        let focused_element_tab_index = focused_element.tab_index();
+        let mut winning_node_and_tab_index: Option<(DomRoot<Element>, i32)> = None;
+        let mut saw_focused_element = false;
+        for node in root_node
+            .upcast::<Node>()
+            .traverse_preorder(ShadowIncluding::Yes)
+        {
+            let Some(candidate_element) = DomRoot::downcast(node) else {
+                continue;
+            };
+            if candidate_element == focused_element {
+                saw_focused_element = true;
+                continue;
+            }
+            if !candidate_element.is_keyboard_focusable() {
+                continue;
+            }
+
+            let candidate_element_tab_index = candidate_element.tab_index();
+            let ordering =
+                compare_tab_indices(focused_element_tab_index, candidate_element_tab_index);
+            match direction {
+                FocusDirection::Forward => {
+                    // If moving forward the first element with equal tab index after the current
+                    // element is the winner.
+                    if saw_focused_element && ordering == Ordering::Equal {
+                        return Some(candidate_element);
+                    }
+                    // If the candidate element does not have a lesser tab index, then discard it.
+                    if ordering != Ordering::Less {
+                        continue;
+                    }
+                    let Some((_, winning_tab_index)) = winning_node_and_tab_index else {
+                        // If this candidate has a tab index which is one greater than the current
+                        // tab index, then we know it is the winner, because we give precedence to
+                        // elements earlier in the DOM.
+                        if candidate_element_tab_index == focused_element_tab_index + 1 {
+                            return Some(candidate_element);
+                        }
+
+                        winning_node_and_tab_index =
+                            Some((candidate_element, candidate_element_tab_index));
+                        continue;
+                    };
+                    // If the candidate element has a lesser tab index than than the current winner,
+                    // then it becomes the winner.
+                    if compare_tab_indices(candidate_element_tab_index, winning_tab_index) ==
+                        Ordering::Less
+                    {
+                        winning_node_and_tab_index =
+                            Some((candidate_element, candidate_element_tab_index))
+                    }
+                },
+                FocusDirection::Backward => {
+                    // If moving backward the last element with an equal tab index that precedes
+                    // the focused element in the DOM is the winner.
+                    if !saw_focused_element && ordering == Ordering::Equal {
+                        winning_node_and_tab_index =
+                            Some((candidate_element, candidate_element_tab_index));
+                        continue;
+                    }
+                    // If the candidate does not have a greater tab index, then discard it.
+                    if ordering != Ordering::Greater {
+                        continue;
+                    }
+                    let Some((_, winning_tab_index)) = winning_node_and_tab_index else {
+                        winning_node_and_tab_index =
+                            Some((candidate_element, candidate_element_tab_index));
+                        continue;
+                    };
+                    // If the candidate element's tab index is not less than the current winner,
+                    // then it becomes the new winner. This means that when the tab indices are
+                    // equal, we give preference to the last one in DOM order.
+                    if compare_tab_indices(candidate_element_tab_index, winning_tab_index) !=
+                        Ordering::Less
+                    {
+                        winning_node_and_tab_index =
+                            Some((candidate_element, candidate_element_tab_index))
+                    }
+                },
+            }
+        }
+
+        Some(winning_node_and_tab_index?.0)
+    }
+
+    fn find_first_tab_focusable_element(
+        &self,
+        direction: FocusDirection,
+    ) -> Option<DomRoot<Element>> {
+        let root_node = self.window.Document().GetDocumentElement()?;
+        let mut winning_node_and_tab_index: Option<(DomRoot<Element>, i32)> = None;
+        for node in root_node
+            .upcast::<Node>()
+            .traverse_preorder(ShadowIncluding::Yes)
+        {
+            let Some(candidate_element) = DomRoot::downcast::<Element>(node) else {
+                continue;
+            };
+            if !candidate_element.is_keyboard_focusable() {
+                continue;
+            }
+
+            let element_tab_index = candidate_element.tab_index();
+            match direction {
+                FocusDirection::Forward => {
+                    // We can immediately return the first time we find an element with the lowest
+                    // possible tab index (1). We are guaranteed not to find any lower tab index
+                    // and all other equal tab indices are later in the DOM.
+                    if element_tab_index == 1 {
+                        return Some(candidate_element);
+                    }
+
+                    // Only promote a candidate to the current winner if it has a lesser tab
+                    // index than the current winner or there is currently no winer.
+                    if winning_node_and_tab_index
+                        .as_ref()
+                        .is_none_or(|(_, winning_tab_index)| {
+                            compare_tab_indices(element_tab_index, *winning_tab_index) ==
+                                Ordering::Less
+                        })
+                    {
+                        winning_node_and_tab_index = Some((candidate_element, element_tab_index));
+                    }
+                },
+                FocusDirection::Backward => {
+                    // Only promote a candidate to winner if it has tab index equal to or
+                    // greater than the winner's tab index. This gives precedence to elements
+                    // later in the DOM.
+                    if winning_node_and_tab_index
+                        .as_ref()
+                        .is_none_or(|(_, winning_tab_index)| {
+                            compare_tab_indices(element_tab_index, *winning_tab_index) !=
+                                Ordering::Less
+                        })
+                    {
+                        winning_node_and_tab_index = Some((candidate_element, element_tab_index));
+                    }
+                },
+            }
+        }
+
+        Some(winning_node_and_tab_index?.0)
     }
 
     pub(crate) fn do_keyboard_scroll(&self, scroll: KeyboardScroll) {
@@ -1651,5 +2117,100 @@ impl DocumentEventHandler {
 
         let (current_scroll_offset, delta) = calculate_current_scroll_offset_and_delta();
         scrolling_box.scroll_to(delta + current_scroll_offset, ScrollBehavior::Auto);
+    }
+
+    /// Get or create a pointer ID for the given touch identifier.
+    /// Returns the pointer ID to use for this touch.
+    fn get_or_create_pointer_id_for_touch(&self, touch_id: i32) -> i32 {
+        let mut active_pointer_ids = self.active_pointer_ids.borrow_mut();
+
+        if let Some(&pointer_id) = active_pointer_ids.get(&touch_id) {
+            return pointer_id;
+        }
+
+        let pointer_id = self.next_touch_pointer_id.get();
+        active_pointer_ids.insert(touch_id, pointer_id);
+        self.next_touch_pointer_id.set(pointer_id + 1);
+        pointer_id
+    }
+
+    /// Remove the pointer ID mapping for the given touch identifier.
+    fn remove_pointer_id_for_touch(&self, touch_id: i32) {
+        self.active_pointer_ids.borrow_mut().remove(&touch_id);
+    }
+
+    /// Check if this is the primary pointer (for touch events).
+    /// The first touch to make contact is the primary pointer.
+    fn is_primary_pointer(&self, pointer_id: i32) -> bool {
+        // For touch, the primary pointer is the one with the smallest pointer ID
+        // that is still active.
+        self.active_pointer_ids
+            .borrow()
+            .values()
+            .min()
+            .is_some_and(|primary_pointer| *primary_pointer == pointer_id)
+    }
+
+    /// Fire pointerenter events hierarchically from topmost ancestor to target element.
+    /// Fire pointerleave events hierarchically from target element to topmost ancestor.
+    /// Used for touch devices that don't support hover.
+    #[allow(clippy::too_many_arguments)]
+    fn fire_pointer_event_for_touch(
+        &self,
+        target_element: &Element,
+        touch: &Touch,
+        pointer_id: i32,
+        event_name: &str,
+        is_primary: bool,
+        input_event: &ConstellationInputEvent,
+        hit_test_result: &HitTestResult,
+        can_gc: CanGc,
+    ) {
+        // Collect ancestors from target to root
+        let mut targets: Vec<DomRoot<Node>> = vec![];
+        let mut current: Option<DomRoot<Node>> = Some(DomRoot::from_ref(target_element.upcast()));
+        while let Some(node) = current {
+            targets.push(DomRoot::from_ref(&*node));
+            current = node.parent_in_flat_tree();
+        }
+
+        // Reverse to dispatch from topmost ancestor to target
+        if event_name == "pointerenter" {
+            targets.reverse();
+        }
+
+        for target in targets {
+            let pointer_event = touch.to_pointer_event(
+                &self.window,
+                event_name,
+                pointer_id,
+                is_primary,
+                input_event.active_keyboard_modifiers,
+                false,
+                Some(hit_test_result.point_in_node),
+                can_gc,
+            );
+            pointer_event
+                .upcast::<Event>()
+                .fire(target.upcast(), can_gc);
+        }
+    }
+}
+
+#[derive(PartialEq)]
+enum FocusDirection {
+    Forward,
+    Backward,
+}
+
+fn compare_tab_indices(a: i32, b: i32) -> Ordering {
+    if a == b {
+        Ordering::Equal
+    } else if a == 0 {
+        Ordering::Greater
+    } else if b == 0 {
+        Ordering::Less
+    } else {
+        a.cmp(&b)
     }
 }

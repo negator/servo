@@ -6,15 +6,15 @@
 
 use std::borrow::Cow;
 use std::fmt::Debug;
+use std::ops::Range;
 
-use atomic_refcell::AtomicRef;
+use atomic_refcell::{AtomicRef, AtomicRefCell};
 use base::id::{BrowsingContextId, PipelineId};
-use fonts_traits::ByteIndex;
+use fonts::TextByteRange;
 use html5ever::{LocalName, Namespace};
 use malloc_size_of_derive::MallocSizeOf;
 use net_traits::image_cache::Image;
 use pixels::ImageMetadata;
-use range::Range;
 use servo_arc::Arc;
 use servo_url::ServoUrl;
 use style::attr::AttrValue;
@@ -147,7 +147,7 @@ pub trait ThreadSafeLayoutNode<'dom>: Clone + Copy + Debug + NodeInfo + PartialE
     /// it can be used to reach siblings and cousins. A simple immutable borrow
     /// of the parent data is fine, since the bottom-up traversal will not process
     /// the parent until all the children have been processed.
-    fn parent_style(&self) -> Arc<ComputedValues>;
+    fn parent_style(&self, context: &SharedStyleContext) -> Arc<ComputedValues>;
 
     /// Initialize this node with empty opaque layout data.
     ///
@@ -183,7 +183,7 @@ pub trait ThreadSafeLayoutNode<'dom>: Clone + Copy + Debug + NodeInfo + PartialE
             // Text nodes are not styled during traversal,instead we simply
             // return parent style here and do cascading during layout.
             debug_assert!(self.is_text_node());
-            self.parent_style()
+            self.parent_style(context)
         }
     }
 
@@ -201,10 +201,13 @@ pub trait ThreadSafeLayoutNode<'dom>: Clone + Copy + Debug + NodeInfo + PartialE
     /// data flags, and we have this annoying trait separation between script and layout :-(
     fn unsafe_get(self) -> Self::ConcreteNode;
 
-    fn node_text_content(self) -> Cow<'dom, str>;
+    /// Get the text content of this node, if it is a text node.
+    ///
+    /// Note: This should only be called on text nodes.
+    fn text_content(self) -> Cow<'dom, str>;
 
-    /// If selection intersects this node, return it. Otherwise, returns `None`.
-    fn selection(&self) -> Option<Range<ByteIndex>>;
+    /// If this node manages a selection, this returns the shared selection for the node.
+    fn selection(&self) -> Option<SharedSelection>;
 
     /// If this is an image element, returns its URL. If this is not an image element, fails.
     fn image_url(&self) -> Option<ServoUrl>;
@@ -220,7 +223,7 @@ pub trait ThreadSafeLayoutNode<'dom>: Clone + Copy + Debug + NodeInfo + PartialE
 
     fn canvas_data(&self) -> Option<HTMLCanvasData>;
 
-    fn svg_data(&self) -> Option<SVGElementData>;
+    fn svg_data(&self) -> Option<SVGElementData<'dom>>;
 
     fn media_data(&self) -> Option<HTMLMediaData>;
 
@@ -426,7 +429,31 @@ impl PseudoElementChain {
         }
     }
 
+    pub fn without_innermost(&self) -> Option<Self> {
+        let primary = self.primary?;
+        Some(
+            self.secondary
+                .map_or_else(Self::default, |_| Self::unnested(primary)),
+        )
+    }
+
     pub fn is_empty(&self) -> bool {
         self.primary.is_none()
     }
 }
+
+/// A selection shared between script and layout. This selection is managed by the DOM
+/// node that maintains it, and can be modified from script. Once modified, layout is
+/// expected to reflect the new selection visual on the next display list update.
+#[derive(Clone, Debug, Default, MallocSizeOf, PartialEq)]
+pub struct ScriptSelection {
+    /// The range of this selection in the DOM node that manages it.
+    pub range: TextByteRange,
+    /// The character range of this selection in the DOM node that manages it.
+    pub character_range: Range<usize>,
+    /// Whether or not this selection is enabled. Selections may be disabled
+    /// when their node loses focus.
+    pub enabled: bool,
+}
+
+pub type SharedSelection = std::sync::Arc<AtomicRefCell<ScriptSelection>>;

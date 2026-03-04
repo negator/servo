@@ -6,9 +6,12 @@ use std::cell::RefCell;
 use std::cmp::{Ordering, PartialOrd};
 use std::iter;
 
+use app_units::Au;
 use dom_struct::dom_struct;
+use euclid::Rect;
 use js::jsapi::JSTracer;
 use js::rust::HandleObject;
+use style_traits::CSSPixel;
 
 use crate::dom::abstractrange::{AbstractRange, BoundaryPoint, bp_position};
 use crate::dom::bindings::cell::DomRefCell;
@@ -204,7 +207,7 @@ impl Range {
     }
 
     /// <https://dom.spec.whatwg.org/#concept-range-bp-set>
-    fn set_start(&self, node: &Node, offset: u32) {
+    pub(crate) fn set_start(&self, node: &Node, offset: u32) {
         if self.start().node() != node || self.start_offset() != offset {
             self.report_change();
         }
@@ -222,7 +225,7 @@ impl Range {
     }
 
     /// <https://dom.spec.whatwg.org/#concept-range-bp-set>
-    fn set_end(&self, node: &Node, offset: u32) {
+    pub(crate) fn set_end(&self, node: &Node, offset: u32) {
         if self.end().node() != node || self.end_offset() != offset {
             self.report_change();
         }
@@ -329,9 +332,7 @@ impl Range {
         self.abstract_range().Collapsed()
     }
 
-    fn client_rects(
-        &self,
-    ) -> impl Iterator<Item = euclid::Rect<app_units::Au, euclid::UnknownUnit>> {
+    fn client_rects(&self) -> impl Iterator<Item = Rect<Au, CSSPixel>> {
         // FIXME: For text nodes that are only partially selected, this should return the client
         // rect of the selected part, not the whole text node.
         let start = self.start_container();
@@ -1112,8 +1113,8 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
     /// <https://html.spec.whatwg.org/multipage/#dom-range-createcontextualfragment>
     fn CreateContextualFragment(
         &self,
+        cx: &mut js::context::JSContext,
         fragment: TrustedHTMLOrString,
-        can_gc: CanGc,
     ) -> Fallible<DomRoot<DocumentFragment>> {
         // Step 2. Let node be this's start node.
         //
@@ -1128,7 +1129,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
             node.owner_window().upcast(),
             fragment,
             "Range createContextualFragment",
-            can_gc,
+            CanGc::from_cx(cx),
         )?;
 
         let owner_doc = node.owner_doc();
@@ -1144,10 +1145,11 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
         };
 
         // Step 6. If element is null or all of the following are true:
-        let element = Element::fragment_parsing_context(&owner_doc, element.as_deref(), can_gc);
+        let element =
+            Element::fragment_parsing_context(&owner_doc, element.as_deref(), CanGc::from_cx(cx));
 
         // Step 7. Let fragment node be the result of invoking the fragment parsing algorithm steps with element and compliantString.
-        let fragment_node = element.parse_fragment(fragment, can_gc)?;
+        let fragment_node = element.parse_fragment(fragment, cx)?;
 
         // Step 8. For each script of fragment node's script element descendants:
         for node in fragment_node

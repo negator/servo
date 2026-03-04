@@ -14,7 +14,7 @@ use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::CryptoKeyBinding::{
     CryptoKeyMethods, CryptoKeyPair, KeyType, KeyUsage,
 };
-use crate::dom::bindings::reflector::{Reflector, reflect_dom_object};
+use crate::dom::bindings::reflector::{Reflector, reflect_dom_object_with_cx};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::subtlecrypto::KeyAlgorithmAndDerivatives;
@@ -37,9 +37,9 @@ pub(crate) enum Handle {
     P521PublicKey(p521::PublicKey),
     X25519PrivateKey(x25519_dalek::StaticSecret),
     X25519PublicKey(x25519_dalek::PublicKey),
-    Aes128(Vec<u8>),
-    Aes192(Vec<u8>),
-    Aes256(Vec<u8>),
+    Aes128Key(aes::cipher::crypto_common::Key<aes::Aes128>),
+    Aes192Key(aes::cipher::crypto_common::Key<aes::Aes192>),
+    Aes256Key(aes::cipher::crypto_common::Key<aes::Aes256>),
     HkdfSecret(Vec<u8>),
     Pbkdf2(Vec<u8>),
     Hmac(Vec<u8>),
@@ -119,15 +119,15 @@ impl CryptoKey {
     }
 
     pub(crate) fn new(
+        cx: &mut js::context::JSContext,
         global: &GlobalScope,
         key_type: KeyType,
         extractable: bool,
         algorithm: KeyAlgorithmAndDerivatives,
         usages: Vec<KeyUsage>,
         handle: Handle,
-        can_gc: CanGc,
     ) -> DomRoot<CryptoKey> {
-        let crypto_key = reflect_dom_object(
+        let crypto_key = reflect_dom_object_with_cx(
             Box::new(CryptoKey::new_inherited(
                 key_type,
                 extractable,
@@ -136,21 +136,27 @@ impl CryptoKey {
                 handle,
             )),
             global,
-            can_gc,
+            cx,
         );
 
-        let cx = GlobalScope::get_cx();
-
         // Create and store a cached object of algorithm
-        rooted!(in(*cx) let mut algorithm_object_value: Value);
-        algorithm.safe_to_jsval(cx, algorithm_object_value.handle_mut(), can_gc);
+        rooted!(&in(cx) let mut algorithm_object_value: Value);
+        algorithm.safe_to_jsval(
+            cx.into(),
+            algorithm_object_value.handle_mut(),
+            CanGc::from_cx(cx),
+        );
         crypto_key
             .algorithm_cached
             .set(algorithm_object_value.to_object());
 
         // Create and store a cached object of usages
-        rooted!(in(*cx) let mut usages_object_value: Value);
-        usages.safe_to_jsval(cx, usages_object_value.handle_mut(), can_gc);
+        rooted!(&in(cx) let mut usages_object_value: Value);
+        usages.safe_to_jsval(
+            cx.into(),
+            usages_object_value.handle_mut(),
+            CanGc::from_cx(cx),
+        );
         crypto_key
             .usages_cached
             .set(usages_object_value.to_object());
@@ -174,13 +180,16 @@ impl CryptoKey {
         self.extractable.set(extractable);
     }
 
-    pub(crate) fn set_usages(&self, usages: &[KeyUsage]) {
+    pub(crate) fn set_usages(&self, cx: &mut js::context::JSContext, usages: &[KeyUsage]) {
         *self.usages.borrow_mut() = usages.to_owned();
 
         // Create and store a cached object of usages
-        let cx = GlobalScope::get_cx();
-        rooted!(in(*cx) let mut usages_object_value: Value);
-        usages.safe_to_jsval(cx, usages_object_value.handle_mut(), CanGc::note());
+        rooted!(&in(cx) let mut usages_object_value: Value);
+        usages.safe_to_jsval(
+            cx.into(),
+            usages_object_value.handle_mut(),
+            CanGc::from_cx(cx),
+        );
         self.usages_cached.set(usages_object_value.to_object());
     }
 }
@@ -216,9 +225,6 @@ impl CryptoKeyMethods<crate::DomTypeHolder> for CryptoKey {
 impl Handle {
     pub(crate) fn as_bytes(&self) -> &[u8] {
         match self {
-            Self::Aes128(bytes) => bytes,
-            Self::Aes192(bytes) => bytes,
-            Self::Aes256(bytes) => bytes,
             Self::Pbkdf2(bytes) => bytes,
             Self::Hmac(bytes) => bytes,
             Self::Ed25519(bytes) => bytes,
@@ -240,9 +246,9 @@ impl MallocSizeOf for Handle {
             Handle::P521PublicKey(public_key) => public_key.size_of(ops),
             Handle::X25519PrivateKey(private_key) => private_key.size_of(ops),
             Handle::X25519PublicKey(public_key) => public_key.size_of(ops),
-            Handle::Aes128(bytes) => bytes.size_of(ops),
-            Handle::Aes192(bytes) => bytes.size_of(ops),
-            Handle::Aes256(bytes) => bytes.size_of(ops),
+            Handle::Aes128Key(key) => key.size_of(ops),
+            Handle::Aes192Key(key) => key.size_of(ops),
+            Handle::Aes256Key(key) => key.size_of(ops),
             Handle::HkdfSecret(secret) => secret.size_of(ops),
             Handle::Pbkdf2(bytes) => bytes.size_of(ops),
             Handle::Hmac(bytes) => bytes.size_of(ops),

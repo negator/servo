@@ -1,6 +1,10 @@
 name: Linux
 on:
   workflow_call:
+    outputs:
+      artifact_ids:
+        value: ${{ jobs.build.outputs.artifact_ids }}
+        description: Comma-separated list of artifact IDs for the release artifacts
     inputs:
       profile:
         required: false
@@ -33,13 +37,6 @@ on:
         required: false
         default: false
         type: boolean
-      upload:
-        required: false
-        default: false
-        type: boolean
-      github-release-id:
-        required: false
-        type: string
       force-github-hosted-runner:
         required: false
         type: boolean
@@ -82,10 +79,6 @@ on:
         required: false
         default: false
         type: boolean
-      upload:
-        required: false
-        default: false
-        type: boolean
       force-github-hosted-runner:
         required: false
         type: boolean
@@ -112,7 +105,7 @@ jobs:
     steps:
       - name: Runner select
         id: select
-        uses: servo/ci-runners/actions/runner-select@44317e3cd86c5ff2ef0b08878b90da246bc237da
+        uses: servo/ci-runners/actions/runner-select@6d88b19dda997f1ce2a11e4c1c34717c2bbcafba
         with:
           GITHUB_TOKEN: ${{ github.token }}
           # Before updating the GH action runner image for the nightly job, ensure
@@ -125,15 +118,17 @@ jobs:
           # <https://github.com/servo/servo/settings/variables/actions>
           NO_SELF_HOSTED_RUNNERS: ${{ vars.NO_SELF_HOSTED_RUNNERS }}
           # Any other boolean conditions that disable self-hosted runners go here.
-          force-github-hosted-runner: ${{ inputs.upload || inputs.force-github-hosted-runner }}
+          force-github-hosted-runner: ${{ inputs.force-github-hosted-runner }}
 
   build:
     needs:
       - runner-select
     name: Linux Build [${{ needs.runner-select.outputs.unique-id }}]
     runs-on: ${{ needs.runner-select.outputs.selected-runner-label }}
+    outputs:
+      artifact_ids: ${{ steps.artifact_ids.outputs.artifact_ids }}
     steps:
-      - uses: servo/ci-runners/actions/checkout@44317e3cd86c5ff2ef0b08878b90da246bc237da
+      - uses: servo/ci-runners/actions/checkout@6d88b19dda997f1ce2a11e4c1c34717c2bbcafba
       - name: Free Disk Space (Ubuntu)
         uses: jlumbroso/free-disk-space@main
         if: ${{ runner.environment != 'self-hosted' }}
@@ -155,12 +150,12 @@ jobs:
           tool: nextest
       - name: Bootstrap dependencies
         if: ${{ runner.environment != 'self-hosted' }}
-        timeout-minutes: 10
+        timeout-minutes: 30
         run: |
           sudo apt update
           echo "wireshark-common wireshark-common/install-setuid boolean true" | sudo debconf-set-selections
           sudo apt install -qy tshark
-          ./mach bootstrap --skip-lints
+          ./mach bootstrap --yes --skip-lints
 
       # Always install crown, even on self-hosted runners, because it is tightly
       # coupled to the rustc version, and we may have the wrong version if the
@@ -181,6 +176,7 @@ jobs:
         if: ${{ inputs.unit-tests }}
         env:
           NEXTEST_RETRIES: 2 # https://github.com/servo/servo/issues/30683
+          LANG: en-US
         run: ./mach test-unit --profile ${{ inputs.profile }} --nextest-profile ci
       # We upload the test-results to Codecov to help us identify flaky unit-tests.
       - name: Upload test results to Codecov
@@ -196,10 +192,10 @@ jobs:
           flags: unittests,unittests-linux,unittests-linux-${{ inputs.profile }}
           token: ${{ secrets.CODECOV_TOKEN }}
       - name: Devtools tests
-        if: ${{ false && inputs.unit-tests }}  # FIXME #39273
+        if: ${{ false && inputs.unit-tests }} # FIXME #39273
         run: ./mach test-devtools --profile ${{ inputs.profile }}
       - name: Archive build timing
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: cargo-timings-linux-${{ inputs.profile }}
           # Using a wildcard here ensures that the archive includes the path.
@@ -207,20 +203,16 @@ jobs:
       - name: Build mach package
         run: ./mach package --profile ${{ inputs.profile }}
       - name: Upload artifact for mach package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
+        id: upload-tarball
         with:
           name: ${{ inputs.profile }}-binary-linux
           path: target/${{ inputs.profile }}/servo-tech-demo.tar.gz
-      - name: Upload nightly
-        if: ${{ inputs.upload }}
+      - name: Collect artifact IDs needed by the release workflow
+        id: artifact_ids
+        shell: bash
         run: |
-          ./mach upload-nightly linux \
-            --secret-from-environment \
-            --github-release-id ${{ inputs.github-release-id }}
-        env:
-          S3_UPLOAD_CREDENTIALS: ${{ secrets.S3_UPLOAD_CREDENTIALS }}
-          NIGHTLY_REPO_TOKEN: ${{ secrets.NIGHTLY_REPO_TOKEN }}
-          NIGHTLY_REPO: ${{ github.repository_owner }}/servo-nightly-builds
+          echo "artifact_ids=${{steps.upload-tarball.outputs.artifact-id}}" >> $GITHUB_OUTPUT
 
   wpt-2020:
     if: ${{ inputs.wpt }}
@@ -240,7 +232,7 @@ jobs:
     if: ${{ inputs.bencher && inputs.profile != 'debug' && github.event_name != 'workflow_dispatch' && github.event_name != 'merge_group' }}
     uses: ./.github/workflows/bencher.yml
     with:
-      target: 'linux'
+      target: "linux"
       profile: ${{ inputs.profile }}
       compressed-file-path: ${{ inputs.profile }}-binary-linux/servo-tech-demo.tar.gz
       binary-path: servo/servo
@@ -299,7 +291,7 @@ jobs:
     steps:
       - name: Runner select
         id: select
-        uses: servo/ci-runners/actions/runner-select@44317e3cd86c5ff2ef0b08878b90da246bc237da
+        uses: servo/ci-runners/actions/runner-select@6d88b19dda997f1ce2a11e4c1c34717c2bbcafba
         with:
           GITHUB_TOKEN: ${{ github.token }}
           # Before updating the GH action runner image for the nightly job, ensure
@@ -321,7 +313,7 @@ jobs:
     runs-on: ${{ needs.runner-select-coverage.outputs.selected-runner-label }}
     continue-on-error: true
     steps:
-      - uses: servo/ci-runners/actions/checkout@44317e3cd86c5ff2ef0b08878b90da246bc237da
+      - uses: servo/ci-runners/actions/checkout@6d88b19dda997f1ce2a11e4c1c34717c2bbcafba
       - name: Free Disk Space (Ubuntu)
         uses: jlumbroso/free-disk-space@main
         if: ${{ runner.environment != 'self-hosted' }}
@@ -345,10 +337,11 @@ jobs:
           tool: cargo-llvm-cov,cargo-nextest
       - name: Bootstrap dependencies
         if: ${{ runner.environment != 'self-hosted' }}
+        timeout-minutes: 30
         shell: bash
         run: |
           sudo apt update
-          ./mach bootstrap --skip-lints
+          ./mach bootstrap --yes --skip-lints
       - name: Determine options
         id: options
         run: |
@@ -364,6 +357,7 @@ jobs:
         shell: bash
         env:
           NEXTEST_RETRIES: 2 # https://github.com/servo/servo/issues/30683
+          LANG: en-US
         run: |
           ./mach test-unit --code-coverage \
               --profile=${{ steps.options.outputs.cargo_profile }} \
@@ -376,3 +370,68 @@ jobs:
           files: codecov.json,support/crown/codecov.json
           fail_ci_if_error: true
           flags: unittests
+
+  media-examples:
+    name: Media Examples
+    if: ${{ inputs.unit-tests }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+        if: github.event_name != 'pull_request_target'
+        with:
+          fetch-depth: 1
+      - name: Change Mirror Priorities
+        uses: ./.github/actions/apt-mirrors
+      - name: Install Dependencies
+        run: |
+          sudo bash -c 'apt-add-repository -y https://mirrors.kernel.org/ubuntu'
+          sudo apt update
+          sudo apt install -y \
+            gstreamer1.0-libav \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-tools \
+            jackd2 \
+            libasound2-plugins \
+            libfaad2 \
+            libffi7 \
+            libfftw3-single3 \
+            libges-1.0-dev \
+            libgstreamer-plugins-bad1.0-dev\
+            libgstreamer-plugins-base1.0-dev \
+            libgstreamer1.0-dev \
+            libgstrtspserver-1.0-dev \
+            libjack-jackd2-0 \
+            libmms0 \
+            libmpg123-0 \
+            libopus0 \
+            liborc-0.4-0 \
+            liborc-0.4-dev \
+            libpulsedsp \
+            libsamplerate0 \
+            libspeexdsp1 \
+            libtdb1 \
+            libtheora0 \
+            libtwolame0 \
+            libwayland-egl1-mesa \
+            libwebrtc-audio-processing1 \
+            pulseaudio \
+            pulseaudio-utils \
+            webp
+      - name: Determine MSRV
+        id: msrv
+        uses: ./.github/actions/parse_msrv
+      - name: Install MSRV
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.rust_version }}
+      - name: Virtual Audio Devices
+        run: |
+          jackd -d dummy &
+          pulseaudio --start
+          gst-inspect-1.0 | grep Total
+      - name: Run Examples
+        run: |
+          ls components/media/examples/examples/*.rs | xargs -I{} basename  {} .rs  | grep -v params_connect | RUST_BACKTRACE=1 GST_DEBUG=3 xargs -I{} cargo run -p servo-media-examples --example {}

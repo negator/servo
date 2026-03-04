@@ -6,15 +6,14 @@
 use std::rc::Rc;
 
 use app_units::Au;
-use compositing_traits::display_list::ScrollTree;
-use euclid::default::{Point2D, Rect as UntypedRect};
-use euclid::{Rect, SideOffsets2D, Size2D};
+use euclid::{Point2D, Rect, SideOffsets2D, Size2D};
 use itertools::Itertools;
 use layout_api::wrapper_traits::{LayoutNode, ThreadSafeLayoutElement, ThreadSafeLayoutNode};
 use layout_api::{
-    AxesOverflow, BoxAreaType, LayoutElementType, LayoutNodeType, OffsetParentResponse,
-    PhysicalSides, ScrollContainerQueryFlags, ScrollContainerResponse,
+    AxesOverflow, BoxAreaType, CSSPixelRectIterator, LayoutElementType, LayoutNodeType,
+    OffsetParentResponse, PhysicalSides, ScrollContainerQueryFlags, ScrollContainerResponse,
 };
+use paint_api::display_list::ScrollTree;
 use script::layout_dom::{ServoLayoutNode, ServoThreadSafeLayoutNode};
 use servo_arc::Arc as ServoArc;
 use servo_geometry::{FastLayoutTransform, au_rect_to_f32_rect, f32_rect_to_au_rect};
@@ -24,7 +23,7 @@ use style::computed_values::position::T as Position;
 use style::computed_values::visibility::T as Visibility;
 use style::computed_values::white_space_collapse::T as WhiteSpaceCollapseValue;
 use style::context::{QuirksMode, SharedStyleContext, StyleContext, ThreadLocalStyleContext};
-use style::dom::{NodeInfo, OpaqueNode, TElement, TNode};
+use style::dom::{NodeInfo, TElement, TNode};
 use style::properties::style_structs::Font;
 use style::properties::{
     ComputedValues, Importance, LonghandId, PropertyDeclarationBlock, PropertyDeclarationId,
@@ -42,14 +41,14 @@ use style::values::generics::position::AspectRatio;
 use style::values::specified::GenericGridTemplateComponent;
 use style::values::specified::box_::DisplayInside;
 use style::values::specified::text::TextTransformCase;
-use style_traits::{ParsingMode, ToCss};
+use style_traits::{CSSPixel, ParsingMode, ToCss};
 
 use crate::ArcRefCell;
 use crate::display_list::{StackingContextTree, au_rect_to_length_rect};
 use crate::dom::NodeExt;
 use crate::flow::inline::construct::{TextTransformation, WhitespaceCollapse, capitalize_string};
 use crate::fragment_tree::{
-    BoxFragment, Fragment, FragmentFlags, FragmentTree, SpecificLayoutInfo,
+    BoxFragment, Fragment, FragmentFlags, FragmentTree, SpecificLayoutInfo, TextFragment,
 };
 use crate::style_ext::ComputedValuesExt;
 use crate::taffy::SpecificTaffyGridInfo;
@@ -93,9 +92,9 @@ pub(crate) fn process_box_area_request(
     node: ServoThreadSafeLayoutNode<'_>,
     area: BoxAreaType,
     exclude_transform_and_inline: bool,
-) -> Option<UntypedRect<Au>> {
-    let rects: Vec<_> = node
-        .fragments_for_pseudo(None)
+) -> Option<Rect<Au, CSSPixel>> {
+    let fragments = node.fragments_for_pseudo(None);
+    let mut rects = fragments
         .iter()
         .filter(|fragment| {
             !exclude_transform_and_inline ||
@@ -104,13 +103,10 @@ pub(crate) fn process_box_area_request(
                     .is_none_or(|fragment| !fragment.borrow().is_inline_box())
         })
         .filter_map(|node| node.cumulative_box_area_rect(area))
-        .collect();
-    if rects.is_empty() {
-        return None;
-    }
-    let rect_union = rects.iter().fold(Rect::zero(), |unioned_rect, rect| {
-        rect.to_untyped().union(&unioned_rect)
-    });
+        .peekable();
+
+    rects.peek()?;
+    let rect_union = rects.fold(Rect::zero(), |unioned_rect, rect| rect.union(&unioned_rect));
 
     if exclude_transform_and_inline {
         return Some(rect_union);
@@ -129,27 +125,22 @@ pub(crate) fn process_box_areas_request(
     stacking_context_tree: &StackingContextTree,
     node: ServoThreadSafeLayoutNode<'_>,
     area: BoxAreaType,
-) -> Vec<UntypedRect<Au>> {
-    let fragments = node.fragments_for_pseudo(None);
-    let box_areas = fragments
-        .iter()
-        .filter_map(|node| node.cumulative_box_area_rect(area))
-        .map(|rect| rect.to_untyped());
+) -> CSSPixelRectIterator {
+    let fragments = node
+        .fragments_for_pseudo(None)
+        .into_iter()
+        .filter_map(move |fragment| fragment.cumulative_box_area_rect(area));
 
     let Some(transform) =
         root_transform_for_layout_node(&stacking_context_tree.paint_info.scroll_tree, node)
     else {
-        return box_areas
-            .map(|rect| Rect::new(rect.origin, Size2D::zero()))
-            .collect();
+        return Box::new(fragments.map(|rect| Rect::new(rect.origin, Size2D::zero())));
     };
 
-    box_areas
-        .filter_map(|rect| transform_au_rectangle(rect, transform))
-        .collect()
+    Box::new(fragments.filter_map(move |rect| transform_au_rectangle(rect, transform)))
 }
 
-pub fn process_client_rect_request(node: ServoThreadSafeLayoutNode<'_>) -> UntypedRect<i32> {
+pub fn process_client_rect_request(node: ServoThreadSafeLayoutNode<'_>) -> Rect<i32, CSSPixel> {
     node.fragments_for_pseudo(None)
         .first()
         .map(Fragment::client_rect)
@@ -179,7 +170,7 @@ pub fn process_current_css_zoom_query(node: ServoLayoutNode<'_>) -> f32 {
 pub fn process_node_scroll_area_request(
     requested_node: Option<ServoThreadSafeLayoutNode<'_>>,
     fragment_tree: Option<Rc<FragmentTree>>,
-) -> UntypedRect<i32> {
+) -> Rect<i32, CSSPixel> {
     let Some(tree) = fragment_tree else {
         return Rect::zero();
     };
@@ -194,12 +185,11 @@ pub fn process_node_scroll_area_request(
     };
 
     Rect::new(
-        Point2D::new(rect.origin.x.to_f32_px(), rect.origin.y.to_f32_px()),
-        Size2D::new(rect.size.width.to_f32_px(), rect.size.height.to_f32_px()),
+        rect.origin.map(Au::to_f32_px),
+        rect.size.to_vector().map(Au::to_f32_px).to_size(),
     )
     .round()
     .to_i32()
-    .to_untyped()
 }
 
 /// Return the resolved value of property for a given (pseudo)element.
@@ -698,7 +688,7 @@ pub fn process_offset_parent_query(
     let Some(offset_parent_fragment) = offset_parent_fragments(node) else {
         return Some(OffsetParentResponse {
             node_address: None,
-            rect: border_box.to_untyped(),
+            rect: border_box,
         });
     };
 
@@ -757,7 +747,7 @@ pub fn process_offset_parent_query(
 
     Some(OffsetParentResponse {
         node_address: parent_fragment.base.tag.map(|tag| tag.node.into()),
-        rect: border_box.to_untyped(),
+        rect: border_box,
     })
 }
 
@@ -894,7 +884,7 @@ pub fn get_the_text_steps(node: ServoLayoutNode<'_>) -> String {
         results.append(&mut current);
     }
 
-    let mut output = Vec::new();
+    let mut output = String::new();
     for item in results {
         match item {
             InnerOrOuterTextItem::Text(s) => {
@@ -902,10 +892,10 @@ pub fn get_the_text_steps(node: ServoLayoutNode<'_>) -> String {
                 if !s.is_empty() {
                     if max_req_line_break_count > 0 {
                         // Step 5.
-                        output.push("\u{000A}".repeat(max_req_line_break_count));
+                        output.push_str(&"\u{000A}".repeat(max_req_line_break_count));
                         max_req_line_break_count = 0;
                     }
-                    output.push(s);
+                    output.push_str(&s);
                 }
             },
             InnerOrOuterTextItem::RequiredLineBreakCount(count) => {
@@ -923,7 +913,7 @@ pub fn get_the_text_steps(node: ServoLayoutNode<'_>) -> String {
             },
         }
     }
-    output.into_iter().collect()
+    output
 }
 
 enum InnerOrOuterTextItem {
@@ -1050,7 +1040,7 @@ fn rendered_text_collection_steps(
                     }
                 }
 
-                let text_content = node.to_threadsafe().node_text_content();
+                let text_content = node.to_threadsafe().text_content();
 
                 let white_space_collapse = style.clone_white_space_collapse();
                 let preserve_whitespace = white_space_collapse == WhiteSpaceCollapseValue::Preserve;
@@ -1127,7 +1117,7 @@ fn rendered_text_collection_steps(
                 // If we don't have a parent element then there's no style data available,
                 // in this (pretty unlikely) case we just return the Text fragment as is.
                 items.push(InnerOrOuterTextItem::Text(
-                    node.to_threadsafe().node_text_content().into(),
+                    node.to_threadsafe().text_content().into(),
                 ));
             }
         },
@@ -1307,8 +1297,64 @@ fn rendered_text_collection_steps(
     items
 }
 
-pub fn process_text_index_request(_node: OpaqueNode, _point: Point2D<Au>) -> Option<usize> {
-    None
+pub fn find_character_offset_in_fragment_descendants(
+    node: &ServoThreadSafeLayoutNode,
+    stacking_context_tree: &StackingContextTree,
+    point_in_viewport: Point2D<Au, CSSPixel>,
+) -> Option<usize> {
+    type ClosestFragment = Option<(Au, Point2D<Au, CSSPixel>, ArcRefCell<TextFragment>)>;
+    fn maybe_update_closest(
+        fragment: &Fragment,
+        point_in_fragment: Point2D<Au, CSSPixel>,
+        closest_relative_fragment: &mut ClosestFragment,
+    ) {
+        let Fragment::Text(text_fragment) = fragment else {
+            return;
+        };
+        let Some(new_distance) = text_fragment
+            .borrow()
+            .distance_to_point_for_glyph_offset(point_in_fragment)
+        else {
+            return;
+        };
+        if matches!(closest_relative_fragment, Some((old_distance, _, _)) if *old_distance < new_distance)
+        {
+            return;
+        };
+        *closest_relative_fragment = Some((new_distance, point_in_fragment, text_fragment.clone()))
+    }
+
+    fn collect_relevant_children(
+        fragment: &Fragment,
+        point_in_viewport: Point2D<Au, CSSPixel>,
+        closest_relative_fragment: &mut ClosestFragment,
+    ) {
+        maybe_update_closest(fragment, point_in_viewport, closest_relative_fragment);
+
+        if let Some(children) = fragment.children() {
+            for child in children.iter() {
+                let offset = child
+                    .base()
+                    .map(|base| base.rect.origin)
+                    .unwrap_or_default();
+                let point = point_in_viewport - offset.to_vector();
+                collect_relevant_children(child, point, closest_relative_fragment);
+            }
+        }
+    }
+
+    let mut closest_relative_fragment = None;
+    for fragment in &node.fragments_for_pseudo(None) {
+        if let Some(point_in_fragment) =
+            stacking_context_tree.offset_in_fragment(fragment, point_in_viewport)
+        {
+            collect_relevant_children(fragment, point_in_fragment, &mut closest_relative_fragment);
+        }
+    }
+
+    closest_relative_fragment.map(|(_, point_in_parent, text_fragment)| {
+        text_fragment.borrow().character_offset(point_in_parent)
+    })
 }
 
 pub fn process_resolved_font_style_query<'dom, E>(
@@ -1406,9 +1452,9 @@ where
 }
 
 pub(crate) fn transform_au_rectangle(
-    rect_to_transform: UntypedRect<Au>,
+    rect_to_transform: Rect<Au, CSSPixel>,
     transform: FastLayoutTransform,
-) -> Option<UntypedRect<Au>> {
+) -> Option<Rect<Au, CSSPixel>> {
     let rect_to_transform = &au_rect_to_f32_rect(rect_to_transform).cast_unit();
     let outer_transformed_rect = match transform {
         FastLayoutTransform::Offset(offset) => Some(rect_to_transform.translate(offset)),
@@ -1416,6 +1462,5 @@ pub(crate) fn transform_au_rectangle(
             transform.outer_transformed_rect(rect_to_transform)
         },
     };
-    outer_transformed_rect
-        .map(|transformed_rect| f32_rect_to_au_rect(transformed_rect.to_untyped()))
+    outer_transformed_rect.map(|transformed_rect| f32_rect_to_au_rect(transformed_rect).cast_unit())
 }

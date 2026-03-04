@@ -189,6 +189,10 @@ def get_pr_number() -> Optional[str]:
     return None
 
 
+def get_commit_sha() -> str:
+    return subprocess.check_output(["git", "log", "-1", "--format=%H"]).decode("utf-8").strip()
+
+
 def create_github_reports(body: str, tag: str = ""):
     # GitHub will set a special environment variable which points to a file where
     # a job summary can be appended. This is produced in addition to the GitHub
@@ -213,14 +217,12 @@ def create_github_reports(body: str, tag: str = ""):
 
     github_token = os.environ.get("GITHUB_TOKEN")
     github_context = json.loads(os.environ.get("GITHUB_CONTEXT", "{}"))
-    if "sha" not in github_context:
-        return None
     if "repository" not in github_context:
         return None
     repo = github_context["repository"]
     data = {
         "name": tag,
-        "head_sha": github_context["sha"],
+        "head_sha": get_commit_sha(),
         "status": "completed",
         "started_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
         "conclusion": conclusion,
@@ -270,8 +272,12 @@ def main():
 
         pr_number = get_pr_number()
         if pr_number:
-            process = subprocess.Popen(["gh", "pr", "comment", pr_number, "-F", "-"], stdin=subprocess.PIPE)
-            print(process.communicate(input=html_string.encode("utf-8"))[0])
+            process = subprocess.Popen(
+                ["gh", "pr", "comment", pr_number, "-F", "-"],
+                stdin=subprocess.PIPE,
+                text=True,
+            )
+            print(process.communicate(input=html_string)[0])
         else:
             print("Could not find PR number in environment. Not making GitHub comment.")
 

@@ -14,7 +14,6 @@ use base::id::{
     ServiceWorkerRegistrationId, WebViewId,
 };
 use canvas_traits::canvas::{CanvasId, CanvasMsg};
-use compositing_traits::CrossProcessPaintApi;
 use content_security_policy::sandboxing_directive::SandboxingFlagSet;
 use devtools_traits::{DevtoolScriptControlMsg, ScriptToDevtoolsControlMsg, WorkerId};
 use embedder_traits::user_contents::UserContentManagerId;
@@ -31,11 +30,12 @@ use malloc_size_of_derive::MallocSizeOf;
 use net_traits::policy_container::PolicyContainer;
 use net_traits::request::{Destination, InsecureRequestsPolicy, Referrer, RequestBody};
 use net_traits::{ReferrerPolicy, ResourceThreads};
+use paint_api::CrossProcessPaintApi;
 use profile_traits::mem::MemoryReportResult;
 use profile_traits::{mem, time as profile_time};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use servo_url::{ImmutableOrigin, ServoUrl};
+use servo_url::{ImmutableOrigin, OriginSnapshot, ServoUrl};
 use storage_traits::StorageThreads;
 use storage_traits::webstorage_thread::WebStorageType;
 use strum::IntoStaticStr;
@@ -77,7 +77,7 @@ pub enum LoadOrigin {
     /// A load originating in webdriver.
     WebDriver,
     /// A load originating in script.
-    Script(ImmutableOrigin),
+    Script(OriginSnapshot),
 }
 
 /// can be passed to `LoadUrl` to load a page with GET/POST
@@ -88,6 +88,8 @@ pub struct LoadData {
     pub load_origin: LoadOrigin,
     /// The URL.
     pub url: ServoUrl,
+    /// <https://html.spec.whatwg.org/multipage/#concept-document-about-base-url>
+    pub about_base_url: Option<ServoUrl>,
     /// The creator pipeline id if this is an about:blank load.
     pub creator_pipeline_id: Option<PipelineId>,
     /// The method.
@@ -149,6 +151,7 @@ impl LoadData {
     pub fn new(
         load_origin: LoadOrigin,
         url: ServoUrl,
+        about_base_url: Option<ServoUrl>,
         creator_pipeline_id: Option<PipelineId>,
         referrer: Referrer,
         referrer_policy: ReferrerPolicy,
@@ -160,6 +163,7 @@ impl LoadData {
         Self {
             load_origin,
             url,
+            about_base_url,
             creator_pipeline_id,
             method: Method::GET,
             headers: HeaderMap::new(),
@@ -185,6 +189,7 @@ impl LoadData {
         Self::new(
             LoadOrigin::Constellation,
             url,
+            None,
             None,
             Referrer::NoReferrer,
             ReferrerPolicy::EmptyString,
@@ -553,7 +558,7 @@ pub enum ScriptToConstellationMessage {
     /// A new message-port was created or transferred, with corresponding control-sender.
     NewMessagePort(MessagePortRouterId, MessagePortId),
     /// A global has started managing message-ports
-    NewMessagePortRouter(MessagePortRouterId, IpcSender<MessagePortMsg>),
+    NewMessagePortRouter(MessagePortRouterId, GenericCallback<MessagePortMsg>),
     /// A global has stopped managing message-ports
     RemoveMessagePortRouter(MessagePortRouterId),
     /// A task requires re-routing to an already shipped message-port.
@@ -598,7 +603,7 @@ pub enum ScriptToConstellationMessage {
     /// 2D canvases may use the GPU and we don't want to give untrusted content access to the GPU.)
     CreateCanvasPaintThread(
         UntypedSize2D<u64>,
-        IpcSender<Option<(GenericSender<CanvasMsg>, CanvasId)>>,
+        GenericSender<Option<(GenericSender<CanvasMsg>, CanvasId)>>,
     ),
     /// Notifies the constellation that this pipeline is requesting focus.
     ///
@@ -660,7 +665,7 @@ pub enum ScriptToConstellationMessage {
     /// Inform the constellation of a replaced history state.
     ReplaceHistoryState(HistoryStateId, ServoUrl),
     /// Gets the length of the joint session history from the constellation.
-    JointSessionHistoryLength(IpcSender<u32>),
+    JointSessionHistoryLength(GenericSender<u32>),
     /// Notification that this iframe should be removed.
     /// Returns a list of pipelines which were closed.
     RemoveIFrame(BrowsingContextId, IpcSender<Vec<PipelineId>>),
@@ -697,7 +702,7 @@ pub enum ScriptToConstellationMessage {
     #[cfg(feature = "webgpu")]
     /// Create a WebGPU Adapter instance
     RequestAdapter(
-        IpcSender<WebGPUAdapterResponse>,
+        GenericCallback<WebGPUAdapterResponse>,
         wgpu_core::instance::RequestAdapterOptions,
         wgpu_core::id::AdapterId,
     ),
@@ -709,7 +714,7 @@ pub enum ScriptToConstellationMessage {
     /// Notify the constellation that the size of some `<iframe>`s has changed.
     IFrameSizes(Vec<IFrameSizeMsg>),
     /// Request results from the memory reporter.
-    ReportMemory(IpcSender<MemoryReportResult>),
+    ReportMemory(GenericCallback<MemoryReportResult>),
     /// Return the result of the evaluated JavaScript with the given [`JavaScriptEvaluationId`].
     FinishJavaScriptEvaluation(
         JavaScriptEvaluationId,
@@ -719,6 +724,8 @@ pub enum ScriptToConstellationMessage {
     ForwardKeyboardScroll(PipelineId, KeyboardScroll),
     /// Notify the Constellation of the screenshot readiness of a given pipeline.
     RespondToScreenshotReadinessRequest(ScreenshotReadinessResponse),
+    /// Request the constellation to force garbage collection in all `ScriptThread`'s.
+    TriggerGarbageCollection,
 }
 
 impl fmt::Debug for ScriptToConstellationMessage {

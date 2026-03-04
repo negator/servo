@@ -4,19 +4,22 @@
 
 use std::mem;
 
+use atomic_refcell::AtomicRefCell;
 use base::generic_channel::GenericSender;
 use base::id::PipelineId;
 use devtools_traits::DevtoolScriptControlMsg;
+use malloc_size_of_derive::MallocSizeOf;
 
 use crate::actor::{Actor, ActorRegistry};
 use crate::actors::timeline::HighResolutionStamp;
 
-pub struct FramerateActor {
+#[derive(MallocSizeOf)]
+pub(crate) struct FramerateActor {
     name: String,
     pipeline_id: PipelineId,
     script_sender: GenericSender<DevtoolScriptControlMsg>,
     is_recording: bool,
-    ticks: Vec<HighResolutionStamp>,
+    ticks: AtomicRefCell<Vec<HighResolutionStamp>>,
 }
 
 impl Actor for FramerateActor {
@@ -32,22 +35,24 @@ impl FramerateActor {
         pipeline_id: PipelineId,
         script_sender: GenericSender<DevtoolScriptControlMsg>,
     ) -> String {
-        let actor_name = registry.new_name("framerate");
+        let actor_name = registry.new_name::<Self>();
         let mut actor = FramerateActor {
             name: actor_name.clone(),
             pipeline_id,
             script_sender,
             is_recording: false,
-            ticks: Vec::new(),
+            ticks: Default::default(),
         };
 
         actor.start_recording();
-        registry.register_later(actor);
+        registry.register(actor);
         actor_name
     }
 
-    pub fn add_tick(&mut self, tick: f64) {
-        self.ticks.push(HighResolutionStamp::wrap(tick));
+    pub fn add_tick(&self, tick: f64) {
+        self.ticks
+            .borrow_mut()
+            .push(HighResolutionStamp::wrap(tick));
 
         if self.is_recording {
             let msg = DevtoolScriptControlMsg::RequestAnimationFrame(self.pipeline_id, self.name());
@@ -55,8 +60,8 @@ impl FramerateActor {
         }
     }
 
-    pub fn take_pending_ticks(&mut self) -> Vec<HighResolutionStamp> {
-        mem::take(&mut self.ticks)
+    pub fn take_pending_ticks(&self) -> Vec<HighResolutionStamp> {
+        mem::take(&mut self.ticks.borrow_mut())
     }
 
     fn start_recording(&mut self) {

@@ -6,7 +6,10 @@ use std::borrow::Cow;
 use std::char::{ToLowercase, ToUppercase};
 
 use icu_segmenter::WordSegmenter;
+use layout_api::wrapper_traits::{SharedSelection, ThreadSafeLayoutNode};
+use style::computed_values::_webkit_text_security::T as WebKitTextSecurity;
 use style::computed_values::white_space_collapse::T as WhiteSpaceCollapse;
+use style::selector_parser::PseudoElement;
 use style::values::specified::text::TextTransformCase;
 use unicode_bidi::Level;
 
@@ -21,7 +24,7 @@ use crate::dom::LayoutBox;
 use crate::dom_traversal::NodeAndStyleInfo;
 use crate::flow::float::FloatBox;
 use crate::flow::inline::AnonymousBlockBox;
-use crate::flow::{BlockContainer, BlockLevelBox, PseudoElement};
+use crate::flow::{BlockContainer, BlockLevelBox};
 use crate::formatting_contexts::IndependentFormattingContext;
 use crate::layout_box_base::LayoutBoxBase;
 use crate::positioned::AbsolutelyPositionedBox;
@@ -43,6 +46,15 @@ pub(crate) struct InlineFormattingContextBuilder {
     /// used to properly set the text range of new [`InlineItem::TextRun`]s.
     current_text_offset: usize,
 
+    /// The current character offset in the final text string of this [`InlineFormattingContext`],
+    /// used to properly set the text range of new [`InlineItem::TextRun`]s. Note that this is
+    /// different from the UTF-8 code point offset.
+    current_character_offset: usize,
+
+    /// If the [`InlineFormattingContext`] that we are building has a selection shared with its
+    /// originating node in the DOM, this will not be `None`.
+    pub shared_selection: Option<SharedSelection>,
+
     /// Whether the last processed node ended with whitespace. This is used to
     /// implement rule 4 of <https://www.w3.org/TR/css-text-3/#collapse>:
     ///
@@ -62,7 +74,7 @@ pub(crate) struct InlineFormattingContextBuilder {
     /// The current list of [`InlineItem`]s in this [`InlineFormattingContext`] under
     /// construction. This is stored in a flat list to make it easy to access the last
     /// item.
-    pub inline_items: Vec<ArcRefCell<InlineItem>>,
+    pub inline_items: Vec<InlineItem>,
 
     /// The current [`InlineBox`] tree of this [`InlineFormattingContext`] under construction.
     pub inline_boxes: InlineBoxes,
@@ -84,18 +96,15 @@ pub(crate) struct InlineFormattingContextBuilder {
 }
 
 impl InlineFormattingContextBuilder {
-    pub(crate) fn new(info: &NodeAndStyleInfo) -> Self {
-        Self::new_for_shared_styles(vec![info.into()])
-    }
-
-    pub(crate) fn new_for_shared_styles(
-        shared_inline_styles_stack: Vec<SharedInlineStyles>,
-    ) -> Self {
+    pub(crate) fn new(info: &NodeAndStyleInfo, context: &LayoutContext) -> Self {
         Self {
             // For the purposes of `text-transform: capitalize` the start of the IFC is a word boundary.
             on_word_boundary: true,
             is_empty: true,
-            shared_inline_styles_stack,
+            shared_inline_styles_stack: vec![SharedInlineStyles::from_info_and_context(
+                info, context,
+            )],
+            shared_selection: info.node.selection(),
             ..Default::default()
         }
     }
@@ -107,6 +116,7 @@ impl InlineFormattingContextBuilder {
     fn push_control_character_string(&mut self, string_to_push: &str) {
         self.text_segments.push(string_to_push.to_owned());
         self.current_text_offset += string_to_push.len();
+        self.current_character_offset += string_to_push.chars().count();
     }
 
     fn shared_inline_styles(&self) -> SharedInlineStyles {
@@ -121,23 +131,20 @@ impl InlineFormattingContextBuilder {
         independent_formatting_context_creator: impl FnOnce()
             -> ArcRefCell<IndependentFormattingContext>,
         old_layout_box: Option<LayoutBox>,
-    ) -> ArcRefCell<InlineItem> {
+    ) -> InlineItem {
         // If there is an existing undamaged layout box that's compatible, use that.
         let independent_formatting_context = old_layout_box
             .and_then(|layout_box| match layout_box {
-                LayoutBox::InlineLevel(inline_item) => match &*inline_item.borrow() {
-                    InlineItem::Atomic(atomic, ..) => Some(atomic.clone()),
-                    _ => None,
-                },
+                LayoutBox::InlineLevel(InlineItem::Atomic(atomic, ..)) => Some(atomic.clone()),
                 _ => None,
             })
             .unwrap_or_else(independent_formatting_context_creator);
 
-        let inline_level_box = ArcRefCell::new(InlineItem::Atomic(
+        let inline_level_box = InlineItem::Atomic(
             independent_formatting_context,
             self.current_text_offset,
             Level::ltr(), /* This will be assigned later if necessary. */
-        ));
+        );
         self.inline_items.push(inline_level_box.clone());
         self.is_empty = false;
 
@@ -155,24 +162,22 @@ impl InlineFormattingContextBuilder {
         &mut self,
         absolutely_positioned_box_creator: impl FnOnce() -> ArcRefCell<AbsolutelyPositionedBox>,
         old_layout_box: Option<LayoutBox>,
-    ) -> ArcRefCell<InlineItem> {
+    ) -> InlineItem {
         let absolutely_positioned_box = old_layout_box
             .and_then(|layout_box| match layout_box {
-                LayoutBox::InlineLevel(inline_item) => match &*inline_item.borrow() {
-                    InlineItem::OutOfFlowAbsolutelyPositionedBox(positioned_box, ..) => {
-                        Some(positioned_box.clone())
-                    },
-                    _ => None,
-                },
+                LayoutBox::InlineLevel(InlineItem::OutOfFlowAbsolutelyPositionedBox(
+                    positioned_box,
+                    ..,
+                )) => Some(positioned_box.clone()),
                 _ => None,
             })
             .unwrap_or_else(absolutely_positioned_box_creator);
 
         // We cannot just reuse the old inline item, because the `current_text_offset` may have changed.
-        let inline_level_box = ArcRefCell::new(InlineItem::OutOfFlowAbsolutelyPositionedBox(
+        let inline_level_box = InlineItem::OutOfFlowAbsolutelyPositionedBox(
             absolutely_positioned_box,
             self.current_text_offset,
-        ));
+        );
 
         self.inline_items.push(inline_level_box.clone());
         self.is_empty = false;
@@ -183,19 +188,16 @@ impl InlineFormattingContextBuilder {
         &mut self,
         float_box_creator: impl FnOnce() -> ArcRefCell<FloatBox>,
         old_layout_box: Option<LayoutBox>,
-    ) -> ArcRefCell<InlineItem> {
+    ) -> InlineItem {
         let inline_level_box = old_layout_box
             .and_then(|layout_box| match layout_box {
                 LayoutBox::InlineLevel(inline_item) => Some(inline_item),
                 _ => None,
             })
-            .unwrap_or_else(|| ArcRefCell::new(InlineItem::OutOfFlowFloatBox(float_box_creator())));
+            .unwrap_or_else(|| InlineItem::OutOfFlowFloatBox(float_box_creator()));
 
         debug_assert!(
-            matches!(
-                &*inline_level_box.borrow(),
-                InlineItem::OutOfFlowFloatBox(..),
-            ),
+            matches!(inline_level_box, InlineItem::OutOfFlowFloatBox(..),),
             "Created float box with incompatible `old_layout_box`"
         );
 
@@ -214,25 +216,23 @@ impl InlineFormattingContextBuilder {
         assert!(self.currently_processing_inline_box());
         self.contains_floats = self.contains_floats || block_level_box.borrow().contains_floats();
 
-        if let Some(inline_item) = self.inline_items.last() {
-            if let InlineItem::AnonymousBlock(anonymous_block) = &*inline_item.borrow() {
-                if let BlockContainer::BlockLevelBoxes(ref mut block_level_boxes) =
-                    anonymous_block.borrow_mut().contents
-                {
-                    block_level_boxes.push(block_level_box);
-                    return;
-                }
+        if let Some(InlineItem::AnonymousBlock(anonymous_block)) = self.inline_items.last() {
+            if let BlockContainer::BlockLevelBoxes(ref mut block_level_boxes) =
+                anonymous_block.borrow_mut().contents
+            {
+                block_level_boxes.push(block_level_box);
+                return;
             }
         }
         let info = &block_builder_info
             .with_pseudo_element(layout_context, PseudoElement::ServoAnonymousBox)
             .expect("Should never fail to create anonymous box");
         self.inline_items
-            .push(ArcRefCell::new(InlineItem::AnonymousBlock(
-                ArcRefCell::new(AnonymousBlockBox {
+            .push(InlineItem::AnonymousBlock(ArcRefCell::new(
+                AnonymousBlockBox {
                     base: LayoutBoxBase::new(info.into(), info.style.clone()),
                     contents: BlockContainer::BlockLevelBoxes(vec![block_level_box]),
-                }),
+                },
             )));
     }
 
@@ -244,10 +244,7 @@ impl InlineFormattingContextBuilder {
         // If there is an existing undamaged layout box that's compatible, use the `InlineBox` within it.
         let inline_box = old_layout_box
             .and_then(|layout_box| match layout_box {
-                LayoutBox::InlineLevel(inline_item) => match &*inline_item.borrow() {
-                    InlineItem::StartInlineBox(inline_box) => Some(inline_box.clone()),
-                    _ => None,
-                },
+                LayoutBox::InlineLevel(InlineItem::StartInlineBox(inline_box)) => Some(inline_box),
                 _ => None,
             })
             .unwrap_or_else(inline_box_creator);
@@ -260,8 +257,8 @@ impl InlineFormattingContextBuilder {
         std::mem::drop(borrowed_inline_box);
 
         let identifier = self.inline_boxes.start_inline_box(inline_box.clone());
-        let inline_level_box = ArcRefCell::new(InlineItem::StartInlineBox(inline_box));
-        self.inline_items.push(inline_level_box.clone());
+        self.inline_items
+            .push(InlineItem::StartInlineBox(inline_box));
         self.inline_box_stack.push(identifier);
         self.is_empty = false;
     }
@@ -272,8 +269,7 @@ impl InlineFormattingContextBuilder {
     /// box is split around a block-level element.
     pub(crate) fn end_inline_box(&mut self) {
         self.shared_inline_styles_stack.pop();
-        self.inline_items
-            .push(ArcRefCell::new(InlineItem::EndInlineBox));
+        self.inline_items.push(InlineItem::EndInlineBox);
         let identifier = self
             .inline_box_stack
             .pop()
@@ -316,9 +312,22 @@ impl InlineFormattingContextBuilder {
             },
         };
 
+        let char_iterator = if info.style.clone__webkit_text_security() != WebKitTextSecurity::None
+        {
+            Box::new(TextSecurityTransform::new(
+                char_iterator,
+                info.style.clone__webkit_text_security(),
+            ))
+        } else {
+            char_iterator
+        };
+
         let white_space_collapse = info.style.clone_white_space_collapse();
+        let mut character_count = 0;
         let new_text: String = char_iterator
             .inspect(|&character| {
+                character_count += 1;
+
                 self.is_empty = self.is_empty &&
                     match white_space_collapse {
                         WhiteSpaceCollapse::Collapse => character.is_ascii_whitespace(),
@@ -334,7 +343,6 @@ impl InlineFormattingContextBuilder {
             return;
         }
 
-        let selection_range = info.get_selection_range();
         if let Some(last_character) = new_text.chars().next_back() {
             self.on_word_boundary = last_character.is_whitespace();
             self.last_inline_box_ended_with_collapsible_white_space =
@@ -343,23 +351,33 @@ impl InlineFormattingContextBuilder {
 
         let new_range = self.current_text_offset..self.current_text_offset + new_text.len();
         self.current_text_offset = new_range.end;
+
+        let new_character_range =
+            self.current_character_offset..self.current_character_offset + character_count;
+        self.current_character_offset = new_character_range.end;
+
         self.text_segments.push(new_text);
 
-        if let Some(inline_item) = self.inline_items.last() {
-            if let InlineItem::TextRun(text_run) = &mut *inline_item.borrow_mut() {
+        let current_inline_styles = self.shared_inline_styles();
+
+        if let Some(InlineItem::TextRun(text_run)) = self.inline_items.last() {
+            if text_run
+                .borrow()
+                .inline_styles
+                .ptr_eq(&current_inline_styles)
+            {
                 text_run.borrow_mut().text_range.end = new_range.end;
+                text_run.borrow_mut().character_range.end = new_character_range.end;
                 return;
             }
         }
 
         self.inline_items
-            .push(ArcRefCell::new(InlineItem::TextRun(ArcRefCell::new(
-                TextRun::new(
-                    info.into(),
-                    self.shared_inline_styles(),
-                    new_range,
-                    selection_range,
-                ),
+            .push(InlineItem::TextRun(ArcRefCell::new(TextRun::new(
+                info.into(),
+                current_inline_styles,
+                new_range,
+                new_character_range,
             ))));
     }
 
@@ -648,6 +666,49 @@ where
             }
         }
         None
+    }
+}
+
+pub struct TextSecurityTransform<InputIterator> {
+    /// The input character iterator.
+    char_iterator: InputIterator,
+    /// The `-webkit-text-security` value to use.
+    text_security: WebKitTextSecurity,
+}
+
+impl<InputIterator> TextSecurityTransform<InputIterator> {
+    pub fn new(char_iterator: InputIterator, text_security: WebKitTextSecurity) -> Self {
+        Self {
+            char_iterator,
+            text_security,
+        }
+    }
+}
+
+impl<InputIterator> Iterator for TextSecurityTransform<InputIterator>
+where
+    InputIterator: Iterator<Item = char>,
+{
+    type Item = char;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // The behavior of `-webkit-text-security` isn't specified, so we have some
+        // flexibility in the implementation. We just need to maintain a rough
+        // compatability with other browsers.
+        Some(match self.char_iterator.next()? {
+            // This is not ideal, but zero width space is used for some special reasons in
+            // `<input>` fields, so these remain untransformed, otherwise they would show up
+            // in empty text fields.
+            '\u{200B}' => '\u{200B}',
+            // Newlines are preserved, so that `<br>` keeps working as expected.
+            '\n' => '\n',
+            character => match self.text_security {
+                WebKitTextSecurity::None => character,
+                WebKitTextSecurity::Circle => '○',
+                WebKitTextSecurity::Disc => '●',
+                WebKitTextSecurity::Square => '■',
+            },
+        })
     }
 }
 

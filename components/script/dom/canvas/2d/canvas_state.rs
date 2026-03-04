@@ -8,8 +8,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use app_units::Au;
-use base::Epoch;
 use base::generic_channel::GenericSender;
+use base::{Epoch, generic_channel};
 use canvas_traits::canvas::{
     Canvas2dMsg, CanvasFont, CanvasId, CanvasMsg, CompositionOptions, CompositionOrBlending,
     FillOrStrokeStyle, FillRule, GlyphAndPosition, LineCapStyle, LineJoinStyle, LineOptions,
@@ -21,21 +21,20 @@ use cssparser::{Parser, ParserInput};
 use euclid::default::{Point2D, Rect, Size2D, Transform2D};
 use euclid::{Vector2D, vec2};
 use fonts::{
-    ByteIndex, FontBaseline, FontContext, FontGroup, FontIdentifier, FontMetrics, FontRef,
+    FontBaseline, FontContext, FontGroup, FontIdentifier, FontMetrics, FontRef,
     LAST_RESORT_GLYPH_ADVANCE, ShapingFlags, ShapingOptions,
 };
-use ipc_channel::ipc;
+use js::context::JSContext;
 use net_traits::image_cache::{ImageCache, ImageResponse};
 use net_traits::request::CorsSettings;
 use pixels::{Snapshot, SnapshotAlphaMode, SnapshotPixelFormat};
-use profile_traits::ipc as profiled_ipc;
-use range::Range;
 use servo_arc::Arc as ServoArc;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use style::color::{AbsoluteColor, ColorFlags, ColorSpace};
 use style::properties::longhands::font_variant_caps::computed_value::T as FontVariantCaps;
 use style::properties::style_structs::Font;
 use style::stylesheets::CssRuleType;
+use style::values::computed::XLang;
 use style::values::computed::font::FontStyle;
 use style::values::specified::color::Color;
 use style_traits::values::ToCss;
@@ -222,7 +221,7 @@ impl CanvasState {
     pub(super) fn new(global: &GlobalScope, size: Size2D<u64>) -> Option<CanvasState> {
         debug!("Creating new canvas rendering context.");
         let (sender, receiver) =
-            profiled_ipc::channel(global.time_profiler_chan().clone()).unwrap();
+            profile_traits::generic_channel::channel(global.time_profiler_chan().clone()).unwrap();
         let script_to_constellation_chan = global.script_to_constellation_chan();
         debug!("Asking constellation to create new canvas thread.");
         let size = adjust_canvas_size(size);
@@ -1191,16 +1190,16 @@ impl CanvasState {
     pub(super) fn create_linear_gradient(
         &self,
         global: &GlobalScope,
+        cx: &mut JSContext,
         x0: Finite<f64>,
         y0: Finite<f64>,
         x1: Finite<f64>,
         y1: Finite<f64>,
-        can_gc: CanGc,
     ) -> DomRoot<CanvasGradient> {
         CanvasGradient::new(
             global,
+            cx,
             CanvasGradientStyle::Linear(LinearGradientStyle::new(*x0, *y0, *x1, *y1, Vec::new())),
-            can_gc,
         )
     }
 
@@ -1209,13 +1208,13 @@ impl CanvasState {
     pub(super) fn create_radial_gradient(
         &self,
         global: &GlobalScope,
+        cx: &mut JSContext,
         x0: Finite<f64>,
         y0: Finite<f64>,
         r0: Finite<f64>,
         x1: Finite<f64>,
         y1: Finite<f64>,
         r1: Finite<f64>,
-        can_gc: CanGc,
     ) -> Fallible<DomRoot<CanvasGradient>> {
         if *r0 < 0. || *r1 < 0. {
             return Err(Error::IndexSize(None));
@@ -1223,6 +1222,7 @@ impl CanvasState {
 
         Ok(CanvasGradient::new(
             global,
+            cx,
             CanvasGradientStyle::Radial(RadialGradientStyle::new(
                 *x0,
                 *y0,
@@ -1232,7 +1232,6 @@ impl CanvasState {
                 *r1,
                 Vec::new(),
             )),
-            can_gc,
         ))
     }
 
@@ -1240,9 +1239,9 @@ impl CanvasState {
     pub(super) fn create_pattern(
         &self,
         global: &GlobalScope,
+        cx: &mut JSContext,
         image: CanvasImageSource,
         mut repetition: DOMString,
-        can_gc: CanGc,
     ) -> Fallible<Option<DomRoot<CanvasPattern>>> {
         let snapshot = match image {
             CanvasImageSource::HTMLImageElement(ref image) => {
@@ -1306,11 +1305,11 @@ impl CanvasState {
             let size = snapshot.size();
             Ok(Some(CanvasPattern::new(
                 global,
+                cx,
                 snapshot,
                 size.cast(),
                 rep,
                 self.is_origin_clean(image),
-                can_gc,
             )))
         } else {
             Err(Error::Syntax(None))
@@ -1324,7 +1323,7 @@ impl CanvasState {
             .push(self.state.borrow().clone());
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-restore>
     pub(super) fn restore(&self) {
         let mut saved_states = self.saved_states.borrow_mut();
@@ -1473,7 +1472,7 @@ impl CanvasState {
         global: &GlobalScope,
         canvas: Option<&HTMLCanvasElement>,
         text: DOMString,
-        can_gc: CanGc,
+        cx: &mut JSContext,
     ) -> DomRoot<TextMetrics> {
         // > Step 1: If maxWidth was provided but is less than or equal to zero or equal to NaN, then return an empty array.0
         // Max width is not provided for `measureText()`.
@@ -1489,7 +1488,7 @@ impl CanvasState {
 
         let Some(font_context) = global.font_context() else {
             warn!("Tried to paint to a canvas of GlobalScope without a FontContext.");
-            return TextMetrics::default(global, can_gc);
+            return TextMetrics::default(global, cx);
         };
 
         let font_style = self.font_style();
@@ -1542,6 +1541,7 @@ impl CanvasState {
 
         TextMetrics::new(
             global,
+            cx,
             total_advance as f64,
             anchor_x - bounding_box.min_x(),
             bounding_box.max_x() - anchor_x,
@@ -1554,7 +1554,6 @@ impl CanvasState {
             hanging_baseline - anchor_y,
             alphabetic_baseline - anchor_y,
             ideographic_baseline - anchor_y,
-            can_gc,
         )
     }
 
@@ -1795,7 +1794,7 @@ impl CanvasState {
         };
 
         let data = if self.is_paintable() {
-            let (sender, receiver) = ipc::channel().unwrap();
+            let (sender, receiver) = generic_channel::channel().unwrap();
             self.send_canvas_2d_msg(Canvas2dMsg::GetImageData(Some(read_rect), sender));
 
             let mut snapshot = receiver.recv().unwrap().to_owned();
@@ -2108,9 +2107,13 @@ impl CanvasState {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-gettransform
-    pub(super) fn get_transform(&self, global: &GlobalScope, can_gc: CanGc) -> DomRoot<DOMMatrix> {
+    pub(super) fn get_transform(
+        &self,
+        global: &GlobalScope,
+        cx: &mut JSContext,
+    ) -> DomRoot<DOMMatrix> {
         let transform = self.state.borrow_mut().transform;
-        DOMMatrix::new(global, true, transform.to_3d(), can_gc)
+        DOMMatrix::new(global, true, transform.to_3d(), CanGc::from_cx(cx))
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-settransform>
@@ -2347,7 +2350,12 @@ impl CanvasState {
             // TODO: This should ultimately handle emoji variation selectors, but raqote does not yet
             // have support for color glyphs.
             let script = Script::from(character);
-            let font = font_group.find_by_codepoint(font_context, character, None, None, None);
+            let font = font_group.find_by_codepoint(
+                font_context,
+                character,
+                None,
+                XLang::get_initial_value(),
+            );
 
             if !current_text_run.script_and_font_compatible(script, &font) {
                 let previous_text_run = std::mem::replace(
@@ -2467,7 +2475,7 @@ impl UnshapedTextRun<'_> {
         let mut advance = 0.0;
         let mut bounds = None;
         let glyphs_and_positions = glyphs
-            .iter_glyphs_for_byte_range(&Range::new(ByteIndex(0), glyphs.len()))
+            .glyphs()
             .map(|glyph| {
                 let glyph_offset = glyph.offset().unwrap_or(Point2D::zero());
                 let glyph_and_position = GlyphAndPosition {

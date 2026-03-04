@@ -6,6 +6,7 @@ use std::cell::Cell;
 
 use dom_struct::dom_struct;
 use euclid::{Scale, Size2D};
+use js::context::JSContext;
 use script_bindings::reflector::Reflector;
 use servo_url::ServoUrl;
 use style_traits::CSSPixel;
@@ -44,7 +45,7 @@ pub(crate) struct PaintRenderingContext2D {
 }
 
 impl PaintRenderingContext2D {
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     fn new_inherited(global: &PaintWorkletGlobalScope) -> Option<PaintRenderingContext2D> {
         let canvas_state = CanvasState::new(global.upcast(), Size2D::zero())?;
         let image_cache = global.image_cache();
@@ -59,7 +60,7 @@ impl PaintRenderingContext2D {
         })
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     pub(crate) fn new(
         global: &PaintWorkletGlobalScope,
         can_gc: CanGc,
@@ -140,8 +141,8 @@ impl PaintRenderingContext2DMethods<crate::DomTypeHolder> for PaintRenderingCont
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-gettransform>
-    fn GetTransform(&self, can_gc: CanGc) -> DomRoot<DOMMatrix> {
-        self.canvas_state.get_transform(&self.global(), can_gc)
+    fn GetTransform(&self, cx: &mut JSContext) -> DomRoot<DOMMatrix> {
+        self.canvas_state.get_transform(&self.global(), cx)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-settransform>
@@ -370,40 +371,40 @@ impl PaintRenderingContext2DMethods<crate::DomTypeHolder> for PaintRenderingCont
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-createlineargradient>
     fn CreateLinearGradient(
         &self,
+        cx: &mut JSContext,
         x0: Finite<f64>,
         y0: Finite<f64>,
         x1: Finite<f64>,
         y1: Finite<f64>,
-        can_gc: CanGc,
     ) -> DomRoot<CanvasGradient> {
         self.canvas_state
-            .create_linear_gradient(&self.global(), x0, y0, x1, y1, can_gc)
+            .create_linear_gradient(&self.global(), cx, x0, y0, x1, y1)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-createradialgradient>
     fn CreateRadialGradient(
         &self,
+        cx: &mut JSContext,
         x0: Finite<f64>,
         y0: Finite<f64>,
         r0: Finite<f64>,
         x1: Finite<f64>,
         y1: Finite<f64>,
         r1: Finite<f64>,
-        can_gc: CanGc,
     ) -> Fallible<DomRoot<CanvasGradient>> {
         self.canvas_state
-            .create_radial_gradient(&self.global(), x0, y0, r0, x1, y1, r1, can_gc)
+            .create_radial_gradient(&self.global(), cx, x0, y0, r0, x1, y1, r1)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-createpattern>
     fn CreatePattern(
         &self,
+        cx: &mut JSContext,
         image: CanvasImageSource,
         repetition: DOMString,
-        can_gc: CanGc,
     ) -> Fallible<Option<DomRoot<CanvasPattern>>> {
         self.canvas_state
-            .create_pattern(&self.global(), image, repetition, can_gc)
+            .create_pattern(&self.global(), cx, image, repetition)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-linewidth>

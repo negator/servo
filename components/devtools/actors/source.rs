@@ -2,18 +2,21 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::str::FromStr;
 
+use atomic_refcell::AtomicRefCell;
 use base::generic_channel::{GenericSender, channel};
 use base::id::PipelineId;
 use devtools_traits::DevtoolScriptControlMsg;
-use serde::Serialize;
+use malloc_size_of_derive::MallocSizeOf;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use servo_url::ServoUrl;
 
 use crate::StreamId;
-use crate::actor::{Actor, ActorError, ActorRegistry};
+use crate::actor::{Actor, ActorError, ActorRegistry, DowncastableActorArc};
+use crate::actors::breakpoint::BreakpointRequestLocation;
 use crate::protocol::ClientRequest;
 
 /// A `sourceForm` as used in responses to thread `sources` requests.
@@ -25,12 +28,12 @@ use crate::protocol::ClientRequest;
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SourceForm {
-    pub actor: String,
+    actor: String,
     /// URL of the script, or URL of the page for inline scripts.
-    pub url: String,
-    pub is_black_boxed: bool,
+    url: String,
+    is_black_boxed: bool,
     /// `introductionType` in SpiderMonkey `CompileOptionsWrapper`.
-    pub introduction_type: String,
+    introduction_type: String,
 }
 
 #[derive(Serialize)]
@@ -39,31 +42,67 @@ pub(crate) struct SourcesReply {
     pub sources: Vec<SourceForm>,
 }
 
+#[derive(MallocSizeOf)]
 pub(crate) struct SourceManager {
-    source_actor_names: RefCell<BTreeSet<String>>,
+    source_actor_names: AtomicRefCell<BTreeSet<String>>,
 }
 
-#[derive(Clone, Debug)]
-pub struct SourceActor {
+impl SourceManager {
+    pub fn new() -> Self {
+        Self {
+            source_actor_names: AtomicRefCell::new(BTreeSet::default()),
+        }
+    }
+
+    pub fn add_source(&self, actor_name: &str) {
+        self.source_actor_names
+            .borrow_mut()
+            .insert(actor_name.to_owned());
+    }
+
+    pub fn source_forms(&self, actors: &ActorRegistry) -> Vec<SourceForm> {
+        self.source_actor_names
+            .borrow()
+            .iter()
+            .map(|actor_name| actors.find::<SourceActor>(actor_name).source_form())
+            .collect()
+    }
+
+    pub fn find_source(
+        &self,
+        registry: &ActorRegistry,
+        source_url: &str,
+    ) -> Option<DowncastableActorArc<SourceActor>> {
+        for name in self.source_actor_names.borrow().iter() {
+            let source = registry.find::<SourceActor>(name);
+            if source.url == ServoUrl::from_str(source_url).ok()? {
+                return Some(source);
+            }
+        }
+        None
+    }
+}
+
+#[derive(Clone, Debug, MallocSizeOf)]
+pub(crate) struct SourceActor {
     /// Actor name.
-    pub name: String,
+    name: String,
 
     /// URL of the script, or URL of the page for inline scripts.
-    pub url: ServoUrl,
+    url: ServoUrl,
 
     /// The ‘black-boxed’ flag, which tells the debugger to avoid pausing inside this script.
     /// <https://firefox-source-docs.mozilla.org/devtools/backend/protocol.html#black-boxing-sources>
-    pub is_black_boxed: bool,
+    is_black_boxed: bool,
 
-    pub content: Option<String>,
-    pub content_type: Option<String>,
+    pub content: AtomicRefCell<Option<String>>,
+    content_type: Option<String>,
 
-    // TODO: use it in #37667, then remove this allow
     pub spidermonkey_id: u32,
     /// `introductionType` in SpiderMonkey `CompileOptionsWrapper`.
-    pub introduction_type: String,
+    introduction_type: String,
 
-    script_sender: GenericSender<DevtoolScriptControlMsg>,
+    pub script_sender: GenericSender<DevtoolScriptControlMsg>,
 }
 
 #[derive(Serialize)]
@@ -92,26 +131,15 @@ struct GetBreakpointPositionsCompressedReply {
     positions: BTreeMap<u32, BTreeSet<u32>>,
 }
 
-impl SourceManager {
-    pub fn new() -> Self {
-        Self {
-            source_actor_names: RefCell::new(BTreeSet::default()),
-        }
-    }
+#[derive(Deserialize)]
+struct GetBreakpointPositionsQuery {
+    start: BreakpointRequestLocation,
+    end: BreakpointRequestLocation,
+}
 
-    pub fn add_source(&self, actor_name: &str) {
-        self.source_actor_names
-            .borrow_mut()
-            .insert(actor_name.to_owned());
-    }
-
-    pub fn source_forms(&self, actors: &ActorRegistry) -> Vec<SourceForm> {
-        self.source_actor_names
-            .borrow()
-            .iter()
-            .map(|actor_name| actors.find::<SourceActor>(actor_name).source_form())
-            .collect()
-    }
+#[derive(Deserialize)]
+struct GetBreakpointPositionsRequest {
+    query: GetBreakpointPositionsQuery,
 }
 
 impl SourceActor {
@@ -127,7 +155,7 @@ impl SourceActor {
         SourceActor {
             name,
             url,
-            content,
+            content: AtomicRefCell::new(content),
             content_type,
             is_black_boxed: false,
             spidermonkey_id,
@@ -138,7 +166,7 @@ impl SourceActor {
 
     #[expect(clippy::too_many_arguments)]
     pub fn new_registered(
-        actors: &mut ActorRegistry,
+        actors: &ActorRegistry,
         pipeline_id: PipelineId,
         url: ServoUrl,
         content: Option<String>,
@@ -146,8 +174,8 @@ impl SourceActor {
         spidermonkey_id: u32,
         introduction_type: String,
         script_sender: GenericSender<DevtoolScriptControlMsg>,
-    ) -> &SourceActor {
-        let source_actor_name = actors.new_name("source");
+    ) -> String {
+        let source_actor_name = actors.new_name::<Self>();
 
         let source_actor = SourceActor::new(
             source_actor_name.clone(),
@@ -161,7 +189,7 @@ impl SourceActor {
         actors.register(source_actor);
         actors.register_source_actor(pipeline_id, &source_actor_name);
 
-        actors.find(&source_actor_name)
+        source_actor_name
     }
 
     pub fn source_form(&self) -> SourceForm {
@@ -184,7 +212,7 @@ impl Actor for SourceActor {
         request: ClientRequest,
         _registry: &ActorRegistry,
         msg_type: &str,
-        _msg: &Map<String, Value>,
+        msg: &Map<String, Value>,
         _id: StreamId,
     ) -> Result<(), ActorError> {
         match msg_type {
@@ -201,6 +229,7 @@ impl Actor for SourceActor {
                     // become available later (e.g. after a fetch)?
                     source: self
                         .content
+                        .borrow()
                         .as_deref()
                         .unwrap_or("<!-- not available; please reload! -->")
                         .to_owned(),
@@ -222,7 +251,7 @@ impl Actor for SourceActor {
                 let result = rx.recv().map_err(|_| ActorError::Internal)?;
                 let lines = result
                     .into_iter()
-                    .map(|entry| entry.line_number)
+                    .map(|location| location.line_number)
                     .collect::<BTreeSet<_>>();
                 let reply = GetBreakableLinesReply {
                     from: self.name(),
@@ -233,9 +262,12 @@ impl Actor for SourceActor {
             // Client wants to know which columns in the line can have breakpoints.
             // Sent when the user tries to set a breakpoint by clicking a line number in a source.
             "getBreakpointPositionsCompressed" => {
-                let Some((tx, rx)) = channel() else {
-                    return Err(ActorError::Internal);
-                };
+                let query =
+                    serde_json::from_value::<GetBreakpointPositionsRequest>(msg.clone().into())
+                        .ok()
+                        .map(|msg| (msg.query.start, msg.query.end));
+
+                let (tx, rx) = channel().ok_or(ActorError::Internal)?;
                 self.script_sender
                     .send(DevtoolScriptControlMsg::GetPossibleBreakpoints(
                         self.spidermonkey_id,
@@ -243,15 +275,21 @@ impl Actor for SourceActor {
                     ))
                     .map_err(|_| ActorError::Internal)?;
                 let result = rx.recv().map_err(|_| ActorError::Internal)?;
+
                 let mut positions: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::default();
-                for entry in result {
+                for location in result {
                     // Line number are one-based. Column numbers are zero-based.
                     // FIXME: the docs say column numbers are one-based, but this appears to be incorrect.
                     // <https://firefox-source-docs.mozilla.org/devtools/backend/protocol.html#source-locations>
+                    if query.as_ref().is_some_and(|(start, end)| {
+                        location.line_number < start.line || location.line_number > end.line
+                    }) {
+                        continue;
+                    }
                     positions
-                        .entry(entry.line_number)
+                        .entry(location.line_number)
                         .or_default()
-                        .insert(entry.column_number - 1);
+                        .insert(location.column_number - 1);
                 }
                 let reply = GetBreakpointPositionsCompressedReply {
                     from: self.name(),
@@ -262,5 +300,27 @@ impl Actor for SourceActor {
             _ => return Err(ActorError::UnrecognizedPacketType),
         };
         Ok(())
+    }
+}
+
+impl SourceActor {
+    pub fn find_offset(&self, line: u32, column: u32) -> Option<(u32, u32)> {
+        let (tx, rx) = channel()?;
+        self.script_sender
+            .send(DevtoolScriptControlMsg::GetPossibleBreakpoints(
+                self.spidermonkey_id,
+                tx,
+            ))
+            .ok()?;
+        let result = rx.recv().ok()?;
+        for location in result {
+            // Line number are one-based. Column numbers are zero-based.
+            // FIXME: the docs say column numbers are one-based, but this appears to be incorrect.
+            // <https://firefox-source-docs.mozilla.org/devtools/backend/protocol.html#source-locations>
+            if location.line_number == line && location.column_number - 1 == column {
+                return Some((location.script_id, location.offset));
+            }
+        }
+        None
     }
 }

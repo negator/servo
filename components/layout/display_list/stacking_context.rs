@@ -10,14 +10,14 @@ use std::sync::Arc;
 use app_units::Au;
 use base::id::ScrollTreeNodeId;
 use base::print_tree::PrintTree;
-use compositing_traits::display_list::{
-    AxesScrollSensitivity, PaintDisplayListInfo, ReferenceFrameNodeInfo, ScrollableNodeInfo,
-    SpatialTreeNodeInfo, StickyNodeInfo,
-};
 use embedder_traits::ViewportDetails;
 use euclid::{Point2D, Rect, SideOffsets2D, Size2D};
 use log::warn;
 use malloc_size_of_derive::MallocSizeOf;
+use paint_api::display_list::{
+    AxesScrollSensitivity, PaintDisplayListInfo, ReferenceFrameNodeInfo, ScrollableNodeInfo,
+    SpatialTreeNodeInfo, StickyNodeInfo,
+};
 use servo_config::opts::DiagnosticsLogging;
 use style::Zero;
 use style::color::AbsoluteColor;
@@ -29,8 +29,9 @@ use style::computed_values::text_decoration_style::T as TextDecorationStyle;
 use style::values::computed::angle::Angle;
 use style::values::computed::basic_shape::ClipPath;
 use style::values::computed::{ClipRectOrAuto, Length, TextDecorationLine};
-use style::values::generics::box_::Perspective;
+use style::values::generics::box_::{OverflowClipMarginBox, Perspective};
 use style::values::generics::transform::{self, GenericRotate, GenericScale, GenericTranslate};
+use style::values::specified::TransformStyle;
 use style::values::specified::box_::DisplayOutside;
 use style_traits::CSSPixel;
 use webrender_api::units::{LayoutPoint, LayoutRect, LayoutTransform, LayoutVector2D};
@@ -47,7 +48,7 @@ use crate::fragment_tree::{
     BoxFragment, ContainingBlockManager, Fragment, FragmentFlags, FragmentTree,
     PositioningFragment, SpecificLayoutInfo,
 };
-use crate::geom::{AuOrAuto, LengthPercentageOrAuto, PhysicalRect, PhysicalSides};
+use crate::geom::{AuOrAuto, LengthPercentageOrAuto, PhysicalPoint, PhysicalRect, PhysicalSides};
 use crate::style_ext::{ComputedValuesExt, TransformExt};
 
 #[derive(Clone)]
@@ -259,6 +260,46 @@ impl StackingContextTree {
                 horizontal_offset_bounds,
             }),
         )
+    }
+
+    /// Given a [`Fragment`] and a point in the viewport of the page, return the point in
+    /// the [`Fragment`]'s content rectangle in its transformed coordinate system
+    /// (untransformed CSS pixels). Note that the point may be outside the [`Fragment`]'s
+    /// boundaries.
+    ///
+    /// TODO: Currently, this only works for [`BoxFragment`], but we should extend it to
+    /// other types of [`Fragment`]s in the future.
+    pub(crate) fn offset_in_fragment(
+        &self,
+        fragment: &Fragment,
+        point_in_viewport: PhysicalPoint<Au>,
+    ) -> Option<Point2D<Au, CSSPixel>> {
+        let Fragment::Box(fragment) = fragment else {
+            return None;
+        };
+
+        let fragment = fragment.borrow();
+        let spatial_tree_node = fragment.spatial_tree_node()?;
+        let transform = self
+            .paint_info
+            .scroll_tree
+            .cumulative_root_to_node_transform(spatial_tree_node)?;
+        let transformed_point = transform
+            .project_point2d(point_in_viewport.map(Au::to_f32_px).cast_unit())?
+            .map(Au::from_f32_px)
+            .cast_unit();
+
+        // Find the origin of the fragment relative to its reference frame in the same coordinate system.
+        let reference_frame_origin = self
+            .paint_info
+            .scroll_tree
+            .reference_frame_offset(spatial_tree_node)
+            .map(Au::from_f32_px);
+        let fragment_origin =
+            fragment.cumulative_content_box_rect().origin - reference_frame_origin.cast_unit();
+
+        // Use that to find the offset from the fragment origin.
+        Some(transformed_point - fragment_origin)
     }
 }
 
@@ -553,11 +594,13 @@ impl StackingContext {
         // actually need to create a stacking context, just avoid creating one.
         let style = fragment.style();
         let effects = style.get_effects();
+        let transform_style = style.get_used_transform_style();
         if effects.filter.0.is_empty() &&
             effects.opacity == 1.0 &&
             effects.mix_blend_mode == ComputedMixBlendMode::Normal &&
             !style.has_effective_transform_or_perspective(FragmentFlags::empty()) &&
-            style.clone_clip_path() == ClipPath::None
+            style.clone_clip_path() == ClipPath::None &&
+            transform_style == TransformStyle::Flat
         {
             return false;
         }
@@ -590,7 +633,7 @@ impl StackingContext {
             spatial_id,
             style.get_webrender_primitive_flags(),
             clip_chain_id,
-            style.get_used_transform_style().to_webrender(),
+            transform_style.to_webrender(),
             effects.mix_blend_mode.to_webrender(),
             &filters,
             &[], // filter_datas
@@ -947,7 +990,7 @@ impl Fragment {
 }
 
 struct ReferenceFrameData {
-    origin: crate::geom::PhysicalPoint<Au>,
+    origin: PhysicalPoint<Au>,
     transform: LayoutTransform,
     kind: wr::ReferenceFrameKind,
 }
@@ -1378,10 +1421,10 @@ impl BoxFragment {
             );
         }
 
-        if matches!(&fragment, Fragment::Box(box_fragment) if matches!(
-            box_fragment.borrow().specific_layout_info(),
+        if matches!(
+            self.specific_layout_info(),
             Some(SpecificLayoutInfo::TableGridWithCollapsedBorders(_))
-        )) {
+        ) {
             stacking_context
                 .contents
                 .push(StackingContextContent::Fragment {
@@ -1448,25 +1491,36 @@ impl BoxFragment {
 
         // Non-scrollable overflow path
         if overflow.x == ComputedOverflow::Clip || overflow.y == ComputedOverflow::Clip {
-            // TODO: The spec allows `overflow-clip-rect` to specify which box edge to use
-            // as the overflow clip edge origin, but Stylo doesn't currently support that.
-            // It will need to be handled here, for now always use the padding rect.
-            let mut overflow_clip_rect = self
-                .padding_rect()
-                .translate(containing_block_rect.origin.to_vector())
-                .to_webrender();
+            let overflow_clip_margin = style.get_margin().overflow_clip_margin;
+            let mut overflow_clip_rect = match overflow_clip_margin.visual_box {
+                OverflowClipMarginBox::ContentBox => self.content_rect(),
+                OverflowClipMarginBox::PaddingBox => self.padding_rect(),
+                OverflowClipMarginBox::BorderBox => self.border_rect(),
+            }
+            .translate(containing_block_rect.origin.to_vector())
+            .to_webrender();
 
             // Adjust by the overflow clip margin.
             // https://drafts.csswg.org/css-overflow-3/#overflow-clip-margin
-            let clip_margin = style.get_margin().overflow_clip_margin.px();
-            overflow_clip_rect = overflow_clip_rect.inflate(clip_margin, clip_margin);
+            let clip_margin_offset = overflow_clip_margin.offset.px();
+            overflow_clip_rect = overflow_clip_rect.inflate(clip_margin_offset, clip_margin_offset);
 
             // The clipping region only gets rounded corners if both axes have `overflow: clip`.
             // https://drafts.csswg.org/css-overflow-3/#corner-clipping
             let radii;
             if overflow.x == ComputedOverflow::Clip && overflow.y == ComputedOverflow::Clip {
                 let builder = BuilderForBoxFragment::new(self, containing_block_rect, false, false);
-                radii = offset_radii(builder.border_radius, clip_margin);
+                let mut offsets_from_border = SideOffsets2D::new_all_same(clip_margin_offset);
+                match overflow_clip_margin.visual_box {
+                    OverflowClipMarginBox::ContentBox => {
+                        offsets_from_border -= (self.border + self.padding).to_webrender();
+                    },
+                    OverflowClipMarginBox::PaddingBox => {
+                        offsets_from_border -= self.border.to_webrender();
+                    },
+                    OverflowClipMarginBox::BorderBox => {},
+                };
+                radii = offset_radii(builder.border_radius, offsets_from_border);
             } else if overflow.x != ComputedOverflow::Clip {
                 overflow_clip_rect.min.x = f32::MIN;
                 overflow_clip_rect.max.x = f32::MAX;

@@ -28,6 +28,17 @@ ignore = [
     # cryptographic secret via side channel. Wait for a patch in stable
     # release version from upstream.
     "RUSTSEC-2023-0071",
+    # The crate `bincode` is unmaintained. This crate is now pinned in Servo.
+    # See the comment above `bincode` entry in Cargo.toml.
+    "RUSTSEC-2025-0141",
+    # The crate `ml-dsa 0.0.4` is the latest stable release.
+    # The attack complexity of this vulnerability is high,
+    # and no exploit is known yet.
+    "RUSTSEC-2025-0144",
+    # The crate `time` has vulnerability.
+    # Need to upgrade to 0.3.47 above.
+    # Cannot right now due to MSRV.
+    "RUSTSEC-2026-0009",
 ]
 
 # This section is considered when running `cargo deny check licenses`
@@ -90,14 +101,20 @@ deny = [
 skip = [
     "bitflags",
     "cookie",
-    "futures",
     "redox_syscall",
+    # Duplicated by getrandom 0.1 and getrandom 0.2
+    "wasi",
 
     # New versions of these dependencies is pulled in by GStreamer / GLib.
     "itertools",
 
     # Duplicated by egui
+    "foldhash",
+    "windows-collections",
+    "windows-future",
+    "windows-numerics",
     "windows-strings",
+    "windows-threading",
 
     # Duplicated by egui-file-dialog
     "windows",
@@ -128,7 +145,6 @@ skip = [
 
     # Duplicated by gilrs.
     "core-foundation",
-    "mach2",
 
     # wgpu crates still depend on 1.1.0
     "rustc-hash",
@@ -147,6 +163,7 @@ skip = [
     "socket2",
 
     # duplicated by winit
+    "block2",
     "objc2-app-kit",
     "objc2-foundation",
     "objc2",
@@ -166,9 +183,6 @@ skip = [
     # duplicated by async-io
     "rustix",
 
-    # duplicated by zbus-xml
-    "quick-xml",
-
     # duplicated by sea-query
     "heck",
 
@@ -176,11 +190,6 @@ skip = [
     # Remove when cexpr updates its nom version
     # and bindgen updates the cexpr version
     "nom",
-
-    # duplicated by image 0.25
-    "cfg-expr",
-    "system-deps",
-    "target-lexicon",
 
     # duplicated by core-graphics
     "core-graphics-types",
@@ -202,8 +211,24 @@ skip = [
     # 0.3.0 and ml-dsa releases the next version 0.1.0, we can remove
     # this.
     "hybrid-array",
+
+
+    # The following 5 duplicates were introduced when Servo's CI was failing to
+    # detect duplicates introduced in automatic dependabot PRs (#38945). They
+    # are added here to allow the fix for this issue to land as a priority.
+    # These need to be investigated separately to see if the duplication can be
+    # avoided.
+    "libloading",
+    "cfg-expr",
+    "system-deps",
+    "target-lexicon",
 ]
 
 # github.com organizations to allow git sources for
 [sources.allow-org]
-github = ["servo"]
+github = [
+    "servo",
+
+    # Temporarily needed by servoshell: see root Cargo.toml
+    "emilk",
+]

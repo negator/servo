@@ -99,7 +99,9 @@ use background_hang_monitor::HangMonitorRegister;
 use background_hang_monitor_api::{
     BackgroundHangMonitorControlMsg, BackgroundHangMonitorRegister, HangMonitorAlert,
 };
-use base::generic_channel::{GenericCallback, GenericSend, GenericSender, RoutedReceiver};
+use base::generic_channel::{
+    GenericCallback, GenericSend, GenericSender, RoutedReceiver, SendError,
+};
 use base::id::{
     BrowsingContextGroupId, BrowsingContextId, HistoryStateId, MessagePortId, MessagePortRouterId,
     PainterId, PipelineId, PipelineNamespace, PipelineNamespaceId, PipelineNamespaceRequest,
@@ -112,16 +114,12 @@ use canvas::canvas_paint_thread::CanvasPaintThread;
 use canvas_traits::ConstellationCanvasMsg;
 use canvas_traits::canvas::{CanvasId, CanvasMsg};
 use canvas_traits::webgl::WebGLThreads;
-use compositing_traits::{
-    PaintMessage, PaintProxy, PipelineExitSource, SendableFrameTree,
-    WebRenderExternalImageIdManager,
-};
 use constellation_traits::{
     AuxiliaryWebViewCreationRequest, AuxiliaryWebViewCreationResponse, DocumentState,
     EmbedderToConstellationMessage, IFrameLoadInfo, IFrameLoadInfoWithData, IFrameSizeMsg, Job,
     LoadData, LogEntry, MessagePortMsg, NavigationHistoryBehavior, PaintMetricEvent,
     PortMessageTask, PortTransferInfo, SWManagerMsg, SWManagerSenders, ScreenshotReadinessResponse,
-    ScriptToConstellationMessage, ServiceWorkerManagerFactory, ServiceWorkerMsg,
+    ScriptToConstellationMessage, ScrollStateUpdate, ServiceWorkerManagerFactory, ServiceWorkerMsg,
     StructuredSerializedData, TraversalDirection, UserContentManagerAction, WindowSizeType,
 };
 use content_security_policy::sandboxing_directive::SandboxingFlagSet;
@@ -143,8 +141,7 @@ use embedder_traits::{
 use euclid::Size2D;
 use euclid::default::Size2D as UntypedSize2D;
 use fonts::SystemFontServiceProxy;
-use ipc_channel::Error as IpcError;
-use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
+use ipc_channel::IpcError;
 use ipc_channel::router::ROUTER;
 use keyboard_types::{Key, KeyState, Modifiers, NamedKey};
 use layout_api::{LayoutFactory, ScriptThreadFactory};
@@ -153,6 +150,10 @@ use media::WindowGLContext;
 use net::image_cache::ImageCacheFactoryImpl;
 use net_traits::pub_domains::registered_domain_name;
 use net_traits::{self, AsyncRuntime, ResourceThreads, exit_fetch_thread, start_fetch_thread};
+use paint_api::{
+    PaintMessage, PaintProxy, PinchZoomInfos, PipelineExitSource, SendableFrameTree,
+    WebRenderExternalImageIdManager,
+};
 use profile_traits::mem::ProfilerMsg;
 use profile_traits::{mem, time};
 use rand::rngs::SmallRng;
@@ -163,7 +164,6 @@ use script_traits::{
     ConstellationInputEvent, DiscardBrowsingContext, DocumentActivity, NewPipelineInfo,
     ProgressiveWebMetricType, ScriptThreadMessage, UpdatePipelineIdReason,
 };
-use serde::{Deserialize, Serialize};
 use servo_config::{opts, pref};
 use servo_url::{Host, ImmutableOrigin, ServoUrl};
 use storage_traits::StorageThreads;
@@ -175,8 +175,6 @@ use style::global_style_data::StyleThreadPool;
 use webgpu::canvas_context::WebGpuExternalImageMap;
 #[cfg(feature = "webgpu")]
 use webgpu_traits::{WebGPU, WebGPURequest};
-use webrender_api::ExternalScrollId;
-use webrender_api::units::LayoutVector2D;
 
 use crate::broadcastchannel::BroadcastChannels;
 use crate::browsingcontext::{
@@ -188,9 +186,7 @@ use crate::event_loop::EventLoop;
 use crate::pipeline::Pipeline;
 use crate::process_manager::ProcessManager;
 use crate::serviceworker::ServiceWorkerUnprivilegedContent;
-use crate::session_history::{
-    JointSessionHistory, NeedsToReload, SessionHistoryChange, SessionHistoryDiff,
-};
+use crate::session_history::{NeedsToReload, SessionHistoryChange, SessionHistoryDiff};
 
 type PendingApprovalNavigations = FxHashMap<PipelineId, (LoadData, NavigationHistoryBehavior)>;
 
@@ -398,7 +394,7 @@ pub struct Constellation<STF, SWF> {
     message_ports: FxHashMap<MessagePortId, MessagePortInfo>,
 
     /// A map of router-id to ipc-sender, to route messages to ports.
-    message_port_routers: FxHashMap<MessagePortRouterId, IpcSender<MessagePortMsg>>,
+    message_port_routers: FxHashMap<MessagePortRouterId, GenericCallback<MessagePortMsg>>,
 
     /// Bookkeeping for BroadcastChannel functionnality.
     broadcast_channels: BroadcastChannels,
@@ -429,7 +425,7 @@ pub struct Constellation<STF, SWF> {
     /// and the namespaces are allocated by the constellation.
     next_pipeline_namespace_id: Cell<PipelineNamespaceId>,
 
-    /// An [`IpcSender`] to notify navigation events to webdriver.
+    /// A [`GenericSender`] to notify navigation events to webdriver.
     webdriver_load_status_sender: Option<(GenericSender<WebDriverLoadStatus>, PipelineId)>,
 
     /// Document states for loaded pipelines (used only when writing screenshots).
@@ -511,6 +507,9 @@ pub struct Constellation<STF, SWF> {
     /// to the `UserContents` need to be forwared to all the `ScriptThread`s that host
     /// the relevant `WebView`.
     pub(crate) user_contents_for_manager_id: FxHashMap<UserContentManagerId, UserContents>,
+
+    /// Whether accessibility trees are being built and sent to the underlying platform.
+    pub(crate) accessibility_active: bool,
 }
 
 /// State needed to construct a constellation.
@@ -580,23 +579,6 @@ enum ExitPipelineMode {
 
 /// The number of warnings to include in each crash report.
 const WARNINGS_BUFFER_SIZE: usize = 32;
-
-/// Route an ipc receiver to an crossbeam receiver, preserving any errors.
-pub(crate) fn route_ipc_receiver_to_new_crossbeam_receiver_preserving_errors<T>(
-    ipc_receiver: IpcReceiver<T>,
-) -> Receiver<Result<T, IpcError>>
-where
-    T: for<'de> Deserialize<'de> + Serialize + Send + 'static,
-{
-    let (crossbeam_sender, crossbeam_receiver) = unbounded();
-    ROUTER.add_typed_route(
-        ipc_receiver,
-        Box::new(move |message| {
-            let _ = crossbeam_sender.send(message);
-        }),
-    );
-    crossbeam_receiver
-}
 
 impl<STF, SWF> Constellation<STF, SWF>
 where
@@ -746,6 +728,7 @@ where
                     pending_viewport_changes: Default::default(),
                     screenshot_readiness_requests: Vec::new(),
                     user_contents_for_manager_id: Default::default(),
+                    accessibility_active: false,
                 };
 
                 constellation.run();
@@ -1054,7 +1037,7 @@ where
             is_private,
         ) {
             Ok(event_loop) => event_loop,
-            Err(error) => return self.handle_send_error(new_pipeline_id, error),
+            Err(error) => return self.handle_send_error(new_pipeline_id, error.into()),
         };
 
         let user_content_manager_id = self
@@ -1206,6 +1189,14 @@ where
         );
         self.browsing_contexts
             .insert(browsing_context_id, browsing_context);
+
+        if self.accessibility_active {
+            if let Some(pipeline) = self.pipelines.get(&pipeline_id) {
+                let _ = pipeline
+                    .event_loop
+                    .send(ScriptThreadMessage::SetAccessibilityActive(true));
+            }
+        }
 
         // If this context is a nested container, attach it to parent pipeline.
         if let Some(parent_pipeline_id) = parent_pipeline_id {
@@ -1568,6 +1559,33 @@ where
             ) => {
                 self.handle_user_content_manager_action(user_content_manager_id, action);
             },
+            EmbedderToConstellationMessage::UpdatePinchZoomInfos(pipeline_id, pinch_zoom) => {
+                self.handle_update_pinch_zoom_infos(pipeline_id, pinch_zoom);
+            },
+            EmbedderToConstellationMessage::SetAccessibilityActive(active) => {
+                self.set_accessibility_active(active);
+            },
+        }
+    }
+
+    fn mutate_user_contents_for_manager_id_and_notify_script_threads(
+        &mut self,
+        user_content_manager_id: UserContentManagerId,
+        callback: impl FnOnce(&mut UserContents),
+    ) {
+        let event_loops = self.event_loops();
+        let user_contents = self
+            .user_contents_for_manager_id
+            .entry(user_content_manager_id)
+            .or_default();
+
+        callback(user_contents);
+
+        for event_loop in event_loops {
+            let _ = event_loop.send(ScriptThreadMessage::SetUserContents(
+                user_content_manager_id,
+                user_contents.clone(),
+            ));
         }
     }
 
@@ -1578,20 +1596,40 @@ where
     ) {
         match action {
             UserContentManagerAction::AddUserScript(user_script) => {
-                let event_loops = self.event_loops();
-                let user_contents = self
-                    .user_contents_for_manager_id
-                    .entry(user_content_manager_id)
-                    .or_default();
-
-                user_contents.scripts.push(user_script);
-
-                for event_loop in event_loops {
-                    let _ = event_loop.send(ScriptThreadMessage::SetUserContents(
-                        user_content_manager_id,
-                        user_contents.clone(),
-                    ));
-                }
+                self.mutate_user_contents_for_manager_id_and_notify_script_threads(
+                    user_content_manager_id,
+                    |user_contents| {
+                        user_contents.scripts.push(user_script);
+                    },
+                );
+            },
+            UserContentManagerAction::RemoveUserScript(user_script_id) => {
+                self.mutate_user_contents_for_manager_id_and_notify_script_threads(
+                    user_content_manager_id,
+                    |user_contents| {
+                        user_contents
+                            .scripts
+                            .retain(|user_script| user_script.id() != user_script_id);
+                    },
+                );
+            },
+            UserContentManagerAction::AddUserStyleSheet(user_stylesheet) => {
+                self.mutate_user_contents_for_manager_id_and_notify_script_threads(
+                    user_content_manager_id,
+                    |user_contents| {
+                        user_contents.stylesheets.push(user_stylesheet);
+                    },
+                );
+            },
+            UserContentManagerAction::RemoveUserStyleSheet(user_stylesheet_id) => {
+                self.mutate_user_contents_for_manager_id_and_notify_script_threads(
+                    user_content_manager_id,
+                    |user_contents| {
+                        user_contents
+                            .stylesheets
+                            .retain(|user_stylesheet| user_stylesheet.id() != user_stylesheet_id);
+                    },
+                );
             },
             UserContentManagerAction::DestroyUserContentManager => {
                 self.user_contents_for_manager_id
@@ -1683,8 +1721,8 @@ where
             ScriptToConstellationMessage::MessagePortShipped(port_id) => {
                 self.handle_messageport_shipped(port_id);
             },
-            ScriptToConstellationMessage::NewMessagePortRouter(router_id, ipc_sender) => {
-                self.handle_new_messageport_router(router_id, ipc_sender);
+            ScriptToConstellationMessage::NewMessagePortRouter(router_id, callback) => {
+                self.handle_new_messageport_router(router_id, callback);
             },
             ScriptToConstellationMessage::RemoveMessagePortRouter(router_id) => {
                 self.handle_remove_messageport_router(router_id);
@@ -2013,6 +2051,11 @@ where
             },
             ScriptToConstellationMessage::RespondToScreenshotReadinessRequest(response) => {
                 self.handle_screenshot_readiness_response(source_pipeline_id, response);
+            },
+            ScriptToConstellationMessage::TriggerGarbageCollection => {
+                for event_loop in self.event_loops() {
+                    let _ = event_loop.send(ScriptThreadMessage::TriggerGarbageCollection);
+                }
             },
         }
     }
@@ -2364,10 +2407,10 @@ where
     fn handle_new_messageport_router(
         &mut self,
         router_id: MessagePortRouterId,
-        message_port_ipc_sender: IpcSender<MessagePortMsg>,
+        message_port_callbacks: GenericCallback<MessagePortMsg>,
     ) {
         self.message_port_routers
-            .insert(router_id, message_port_ipc_sender);
+            .insert(router_id, message_port_callbacks);
     }
 
     fn handle_remove_messageport_router(&mut self, router_id: MessagePortRouterId) {
@@ -2495,16 +2538,13 @@ where
                 };
 
                 if opts::get().multiprocess {
-                    let (sender, receiver) =
-                        ipc::channel().expect("Failed to create lifeline channel for sw");
+                    let (sender, receiver) = generic_channel::channel()
+                        .expect("Failed to create lifeline channel for sw");
                     let content =
                         ServiceWorkerUnprivilegedContent::new(sw_senders, origin, Some(sender));
 
                     if let Ok(process) = content.spawn_multiprocess() {
-                        let crossbeam_receiver =
-                            route_ipc_receiver_to_new_crossbeam_receiver_preserving_errors(
-                                receiver,
-                            );
+                        let crossbeam_receiver = receiver.route_preserving_errors();
                         self.process_manager.add(crossbeam_receiver, process);
                     } else {
                         return warn!("Failed to spawn process for SW manager.");
@@ -2642,7 +2682,7 @@ where
         // so we can safely block on other threads, without worrying about deadlock.
         // Channels to receive signals when threads are done exiting.
         let (core_ipc_sender, core_ipc_receiver) =
-            ipc::channel().expect("Failed to create IPC channel!");
+            generic_channel::oneshot().expect("Failed to create IPC channel!");
         let (client_storage_generic_sender, client_storage_generic_receiver) =
             generic_channel::channel().expect("Failed to create generic channel!");
         let (indexeddb_ipc_sender, indexeddb_ipc_receiver) =
@@ -2723,7 +2763,8 @@ where
             .values()
             .flat_map(|browsing_context_group| {
                 browsing_context_group.webgpus.values().map(|webgpu| {
-                    let (sender, receiver) = ipc::channel().expect("Failed to create IPC channel!");
+                    let (sender, receiver) =
+                        generic_channel::oneshot().expect("Failed to create IPC channel!");
                     if let Err(e) = webgpu.exit(sender) {
                         warn!("Exit WebGPU Thread failed ({})", e);
                         None
@@ -2791,7 +2832,7 @@ where
     }
 
     #[servo_tracing::instrument(skip_all)]
-    fn handle_send_error(&mut self, pipeline_id: PipelineId, error: IpcError) {
+    fn handle_send_error(&mut self, pipeline_id: PipelineId, error: SendError) {
         error!("Error sending message to {pipeline_id:?}: {error}",);
 
         // Ignore errors from unknown Pipelines.
@@ -2999,6 +3040,20 @@ where
         match event.event.state {
             KeyState::Down => self.active_keyboard_modifiers.insert(modified_modifier),
             KeyState::Up => self.active_keyboard_modifiers.remove(modified_modifier),
+        }
+    }
+
+    fn set_accessibility_active(&mut self, active: bool) {
+        if !(pref!(accessibility_enabled)) {
+            return;
+        }
+        if active == self.accessibility_active {
+            return;
+        }
+
+        self.accessibility_active = active;
+        for event_loop in self.event_loops() {
+            let _ = event_loop.send(ScriptThreadMessage::SetAccessibilityActive(active));
         }
     }
 
@@ -3603,8 +3658,8 @@ where
             "{}: Loading ({}replacing): {}",
             source_id,
             match history_handling {
-                NavigationHistoryBehavior::Push => "",
-                NavigationHistoryBehavior::Replace => "not ",
+                NavigationHistoryBehavior::Push => "not ",
+                NavigationHistoryBehavior::Replace => "",
                 NavigationHistoryBehavior::Auto => "unsure if ",
             },
             load_data.url,
@@ -3727,6 +3782,8 @@ where
                     new_browsing_context_info: None,
                     viewport_details,
                 });
+                self.paint_proxy
+                    .send(PaintMessage::EnableLCPCalculation(webview_id));
                 Some(new_pipeline_id)
             },
         }
@@ -3789,6 +3846,10 @@ where
             },
         };
 
+        let Some(webview) = self.webviews.get_mut(&webview_id) else {
+            return warn!("Ignoring navigation in non-existent WebView ({webview_id:?}).");
+        };
+
         match history_handling {
             NavigationHistoryBehavior::Replace => {},
             _ => {
@@ -3798,8 +3859,7 @@ where
                     old_url,
                 };
 
-                self.get_joint_session_history(webview_id).push_diff(diff);
-
+                webview.session_history.push_diff(diff);
                 self.notify_history_changed(webview_id);
             },
         }
@@ -3816,16 +3876,22 @@ where
             FxHashMap::<PipelineId, (Option<HistoryStateId>, ServoUrl)>::default();
         let mut url_to_load = FxHashMap::<PipelineId, ServoUrl>::default();
         {
-            let session_history = self.get_joint_session_history(webview_id);
+            let Some(webview) = self.webviews.get_mut(&webview_id) else {
+                return warn!(
+                    "Ignoring history traversal in non-existent WebView ({webview_id:?})."
+                );
+            };
+
             match direction {
                 TraversalDirection::Forward(forward) => {
-                    let future_length = session_history.future.len();
+                    let future_length = webview.session_history.future.len();
 
                     if future_length < forward {
                         return warn!("Cannot traverse that far into the future.");
                     }
 
-                    for diff in session_history
+                    for diff in webview
+                        .session_history
                         .future
                         .drain(future_length - forward..)
                         .rev()
@@ -3871,17 +3937,22 @@ where
                                 },
                             },
                         }
-                        session_history.past.push(diff);
+                        webview.session_history.past.push(diff);
                     }
                 },
                 TraversalDirection::Back(back) => {
-                    let past_length = session_history.past.len();
+                    let past_length = webview.session_history.past.len();
 
                     if past_length < back {
                         return warn!("Cannot traverse that far into the past.");
                     }
 
-                    for diff in session_history.past.drain(past_length - back..).rev() {
+                    for diff in webview
+                        .session_history
+                        .past
+                        .drain(past_length - back..)
+                        .rev()
+                    {
                         match diff {
                             SessionHistoryDiff::BrowsingContext {
                                 browsing_context_id,
@@ -3923,7 +3994,7 @@ where
                                 },
                             },
                         }
-                        session_history.future.push(diff);
+                        webview.session_history.future.push(diff);
                     }
                 },
             }
@@ -4079,7 +4150,7 @@ where
     fn handle_joint_session_history_length(
         &self,
         webview_id: WebViewId,
-        response_sender: IpcSender<u32>,
+        response_sender: GenericSender<u32>,
     ) {
         let length = self
             .webviews
@@ -4112,6 +4183,10 @@ where
             },
         };
 
+        let Some(webview) = self.webviews.get_mut(&webview_id) else {
+            return warn!("Ignoring history change in non-existent WebView ({webview_id:?}).");
+        };
+
         let diff = SessionHistoryDiff::Pipeline {
             pipeline_reloader: NeedsToReload::No(pipeline_id),
             new_history_state_id: history_state_id,
@@ -4119,7 +4194,7 @@ where
             old_history_state_id: old_state_id,
             old_url,
         };
-        self.get_joint_session_history(webview_id).push_diff(diff);
+        webview.session_history.push_diff(diff);
         self.notify_history_changed(webview_id);
     }
 
@@ -4144,8 +4219,13 @@ where
             },
         };
 
-        let session_history = self.get_joint_session_history(webview_id);
-        session_history.replace_history_state(pipeline_id, history_state_id, url);
+        let Some(webview) = self.webviews.get_mut(&webview_id) else {
+            return warn!("Ignoring history change in non-existent WebView ({webview_id:?}).");
+        };
+
+        webview
+            .session_history
+            .replace_history_state(pipeline_id, history_state_id, url);
         self.notify_history_changed(webview_id);
     }
 
@@ -4163,6 +4243,8 @@ where
             ScriptThreadMessage::Reload(pipeline_id),
             "Got reload event after closure",
         );
+        self.paint_proxy
+            .send(PaintMessage::EnableLCPCalculation(webview_id));
     }
 
     /// <https://html.spec.whatwg.org/multipage/#window-post-message-steps>
@@ -4485,7 +4567,7 @@ where
     fn handle_create_canvas_paint_thread_msg(
         &mut self,
         size: UntypedSize2D<u64>,
-        response_sender: IpcSender<Option<(GenericSender<CanvasMsg>, CanvasId)>>,
+        response_sender: GenericSender<Option<(GenericSender<CanvasMsg>, CanvasId)>>,
     ) {
         let (canvas_data_sender, canvas_data_receiver) = unbounded();
         let (canvas_sender, canvas_ipc_sender) = self
@@ -4727,6 +4809,14 @@ where
                 },
             };
 
+        if let Some(old_pipeline_id) = old_pipeline_id {
+            self.unload_document(old_pipeline_id);
+        }
+
+        let Some(webview) = self.webviews.get_mut(&change.webview_id) else {
+            return warn!("Ignoring history change in non-existent WebView ({webview_id:?}).");
+        };
+
         match old_pipeline_id {
             None => {
                 let Some(new_context_info) = change.new_browsing_context_info else {
@@ -4748,17 +4838,14 @@ where
                 self.update_activity(change.new_pipeline_id);
             },
             Some(old_pipeline_id) => {
-                self.unload_document(old_pipeline_id);
-
                 // Deactivate the old pipeline, and activate the new one.
                 let (pipelines_to_close, states_to_close) = if let Some(replace_reloader) =
                     change.replace
                 {
-                    self.get_joint_session_history(change.webview_id)
-                        .replace_reloader(
-                            replace_reloader.clone(),
-                            NeedsToReload::No(change.new_pipeline_id),
-                        );
+                    webview.session_history.replace_reloader(
+                        replace_reloader.clone(),
+                        NeedsToReload::No(change.new_pipeline_id),
+                    );
 
                     match replace_reloader {
                         NeedsToReload::No(pipeline_id) => (Some(vec![pipeline_id]), None),
@@ -4774,10 +4861,7 @@ where
                     let mut pipelines_to_close = vec![];
                     let mut states_to_close = FxHashMap::default();
 
-                    let diffs_to_close = self
-                        .get_joint_session_history(change.webview_id)
-                        .push_diff(diff);
-
+                    let diffs_to_close = webview.session_history.push_diff(diff);
                     for diff in diffs_to_close {
                         match diff {
                             SessionHistoryDiff::BrowsingContext { new_reloader, .. } => {
@@ -4886,35 +4970,35 @@ where
     #[servo_tracing::instrument(skip_all)]
     fn trim_history(&mut self, webview_id: WebViewId) {
         let pipelines_to_evict = {
-            let session_history = self.get_joint_session_history(webview_id);
-
+            let Some(webview) = self.webviews.get_mut(&webview_id) else {
+                return warn!("Not trimming history for non-existent WebView ({webview_id:}");
+            };
             let history_length = pref!(session_history_max_length) as usize;
 
             // The past is stored with older entries at the front.
             // We reverse the iter so that newer entries are at the front and then
             // skip _n_ entries and evict the remaining entries.
-            let mut pipelines_to_evict = session_history
+            let past_trim = webview
+                .session_history
                 .past
                 .iter()
                 .rev()
                 .map(|diff| diff.alive_old_pipeline())
                 .skip(history_length)
-                .flatten()
-                .collect::<Vec<_>>();
+                .flatten();
 
             // The future is stored with oldest entries front, so we must
             // reverse the iterator like we do for the `past`.
-            pipelines_to_evict.extend(
-                session_history
-                    .future
-                    .iter()
-                    .rev()
-                    .map(|diff| diff.alive_new_pipeline())
-                    .skip(history_length)
-                    .flatten(),
-            );
+            let future_trim = webview
+                .session_history
+                .future
+                .iter()
+                .rev()
+                .map(|diff| diff.alive_new_pipeline())
+                .skip(history_length)
+                .flatten();
 
-            pipelines_to_evict
+            past_trim.chain(future_trim).collect::<Vec<_>>()
         };
 
         let mut dead_pipelines = vec![];
@@ -4931,11 +5015,13 @@ where
             );
         }
 
-        let session_history = self.get_joint_session_history(webview_id);
-
-        for (alive_id, dead) in dead_pipelines {
-            session_history.replace_reloader(NeedsToReload::No(alive_id), dead);
-        }
+        if let Some(webview) = self.webviews.get_mut(&webview_id) {
+            for (alive_id, dead) in dead_pipelines {
+                webview
+                    .session_history
+                    .replace_reloader(NeedsToReload::No(alive_id), dead);
+            }
+        };
     }
 
     #[servo_tracing::instrument(skip_all)]
@@ -5290,9 +5376,10 @@ where
             return None;
         };
 
-        {
-            let session_history = self.get_joint_session_history(browsing_context.webview_id);
-            session_history.remove_entries_for_browsing_context(browsing_context_id);
+        if let Some(webview) = self.webviews.get_mut(&browsing_context.webview_id) {
+            webview
+                .session_history
+                .remove_entries_for_browsing_context(browsing_context_id);
         }
 
         if let Some(parent_pipeline_id) = browsing_context.parent_pipeline_id {
@@ -5509,14 +5596,6 @@ where
         }
     }
 
-    #[servo_tracing::instrument(skip_all)]
-    fn get_joint_session_history(&mut self, webview_id: WebViewId) -> &mut JointSessionHistory {
-        self.webviews
-            .get_mut(&webview_id)
-            .map(|webview| &mut webview.session_history)
-            .expect("Unknown top-level browsing context")
-    }
-
     // Convert a browsing context to a sendable form to pass to `Paint`
     #[servo_tracing::instrument(skip_all)]
     fn browsing_context_to_sendable(
@@ -5575,11 +5654,7 @@ where
     }
 
     #[servo_tracing::instrument(skip_all)]
-    fn handle_set_scroll_states(
-        &self,
-        pipeline_id: PipelineId,
-        scroll_states: FxHashMap<ExternalScrollId, LayoutVector2D>,
-    ) {
+    fn handle_set_scroll_states(&self, pipeline_id: PipelineId, scroll_states: ScrollStateUpdate) {
         let Some(pipeline) = self.pipelines.get(&pipeline_id) else {
             warn!("Discarding scroll offset update for unknown pipeline");
             return;
@@ -5612,8 +5687,8 @@ where
                 metric_value,
                 first_reflow,
             ),
-            PaintMetricEvent::LargestContentfulPaint(metric_value, area, lcp_type) => (
-                ProgressiveWebMetricType::LargestContentfulPaint { area, lcp_type },
+            PaintMetricEvent::LargestContentfulPaint(metric_value, area, url) => (
+                ProgressiveWebMetricType::LargestContentfulPaint { area, url },
                 metric_value,
                 false, // LCP doesn't care about first reflow
             ),
@@ -5652,6 +5727,26 @@ where
             warn!(
                 "Could not send embedder control response to pipeline {pipeline_id:?}: {error:?}"
             );
+        }
+    }
+
+    fn handle_update_pinch_zoom_infos(
+        &self,
+        pipeline_id: PipelineId,
+        pinch_zoom_infos: PinchZoomInfos,
+    ) {
+        let Some(pipeline) = self.pipelines.get(&pipeline_id) else {
+            warn!("Discarding pinch zoom update for unknown pipeline");
+            return;
+        };
+        if let Err(error) = pipeline
+            .event_loop
+            .send(ScriptThreadMessage::UpdatePinchZoomInfos(
+                pipeline_id,
+                pinch_zoom_infos,
+            ))
+        {
+            warn!("Could not send pinch zoom update to pipeline: {pipeline_id:?}: {error:?}");
         }
     }
 

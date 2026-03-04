@@ -82,6 +82,8 @@ mod from_embedder {
                 Self::RequestScreenshotReadiness(..) => target!("RequestScreenshotReadiness"),
                 Self::EmbedderControlResponse(..) => target!("EmbedderControlResponse"),
                 Self::UserContentManagerAction(..) => target!("UserContentManagerAction"),
+                Self::UpdatePinchZoomInfos(..) => target!("UpdatePinchZoomInfos"),
+                Self::SetAccessibilityActive(..) => target!("SetAccessibilityActive"),
             }
         }
     }
@@ -104,7 +106,6 @@ mod from_embedder {
                 InputEvent::MouseLeftViewport(..) => target_variant!("MouseLeftViewport"),
                 InputEvent::Touch(..) => target_variant!("Touch"),
                 InputEvent::Wheel(..) => target_variant!("Wheel"),
-                InputEvent::Scroll(..) => target_variant!("Scroll"),
             }
         }
     }
@@ -184,6 +185,7 @@ mod from_script {
                 Self::RespondToScreenshotReadinessRequest(..) => {
                     target!("RespondToScreenshotReadinessRequest")
                 },
+                Self::TriggerGarbageCollection => target!("TriggerGarbageCollection"),
             }
         }
     }

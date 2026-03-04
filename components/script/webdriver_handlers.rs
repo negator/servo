@@ -17,12 +17,14 @@ use embedder_traits::{
 use euclid::default::{Point2D, Rect, Size2D};
 use hyper_serde::Serde;
 use ipc_channel::ipc::{self};
+use js::context::JSContext;
 use js::conversions::jsstr_to_string;
 use js::jsapi::{
     self, GetPropertyKeys, HandleValueArray, JS_GetOwnPropertyDescriptorById, JS_GetPropertyById,
     JS_IsExceptionPending, JSAutoRealm, JSObject, JSType, PropertyDescriptor,
 };
 use js::jsval::UndefinedValue;
+use js::realm::CurrentRealm;
 use js::rust::wrappers::{JS_CallFunctionName, JS_GetProperty, JS_HasOwnProperty, JS_TypeOfValue};
 use js::rust::{Handle, HandleObject, HandleValue, IdVector, ToString};
 use net_traits::CookieSource::{HTTP, NonHTTP};
@@ -32,8 +34,10 @@ use net_traits::CoreResourceMsg::{
 use script_bindings::codegen::GenericBindings::ShadowRootBinding::ShadowRootMethods;
 use script_bindings::conversions::is_array_like;
 use script_bindings::num::Finite;
+use script_bindings::settings_stack::run_a_script;
 use webdriver::error::ErrorStatus;
 
+use crate::DomTypeHolder;
 use crate::document_collection::DocumentCollection;
 use crate::dom::attr::is_boolean_attribute;
 use crate::dom::bindings::codegen::Bindings::CSSStyleDeclarationBinding::CSSStyleDeclarationMethods;
@@ -65,7 +69,6 @@ use crate::dom::bindings::error::{Error, report_pending_exception, throw_dom_exc
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::{DomGlobal, DomObject};
 use crate::dom::bindings::root::DomRoot;
-use crate::dom::bindings::settings_stack::AutoEntryScript;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
 use crate::dom::domrect::DOMRect;
@@ -88,7 +91,7 @@ use crate::dom::types::ShadowRoot;
 use crate::dom::validitystate::ValidationFlags;
 use crate::dom::window::Window;
 use crate::dom::xmlserializer::XMLSerializer;
-use crate::realms::{AlreadyInRealm, InRealm, enter_realm};
+use crate::realms::{InRealm, enter_auto_realm, enter_realm};
 use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 use crate::script_thread::ScriptThread;
 
@@ -366,19 +369,22 @@ impl From<HandleValue<'_>> for HashableJSVal {
 
 /// <https://w3c.github.io/webdriver/#dfn-json-clone>
 pub(crate) fn jsval_to_webdriver(
-    cx: SafeJSContext,
+    cx: &mut CurrentRealm,
     global_scope: &GlobalScope,
     val: HandleValue,
-    realm: InRealm,
-    can_gc: CanGc,
 ) -> WebDriverJSResult {
-    let _aes = AutoEntryScript::new(global_scope);
-    let mut seen = HashSet::new();
-    let result = jsval_to_webdriver_inner(cx, global_scope, val, &mut seen);
-    if result.is_err() {
-        report_pending_exception(cx, true, realm, can_gc);
-    }
-    result
+    run_a_script::<DomTypeHolder, _>(global_scope, || {
+        let mut seen = HashSet::new();
+        let result = jsval_to_webdriver_inner(cx.into(), global_scope, val, &mut seen);
+
+        let in_realm_proof = cx.into();
+        let in_realm = InRealm::Already(&in_realm_proof);
+
+        if result.is_err() {
+            report_pending_exception(cx.into(), true, in_realm, CanGc::from_cx(cx));
+        }
+        result
+    })
 }
 
 #[expect(unsafe_code)]
@@ -509,7 +515,7 @@ fn clone_an_object(
         let mut result: Vec<JSValue> = Vec::new();
 
         let get_property_result =
-            get_property::<u32>(cx, object_handle, "length", ConversionBehavior::Default);
+            get_property::<u32>(cx, object_handle, c"length", ConversionBehavior::Default);
         let length = match get_property_result {
             Ok(length) => match length {
                 Some(length) => length,
@@ -529,8 +535,9 @@ fn clone_an_object(
         // Step 4. For each enumerable property in value, run the following substeps:
         for i in 0..length {
             rooted!(in(*cx) let mut item = UndefinedValue());
+            let cname = CString::new(i.to_string()).unwrap();
             let get_property_result =
-                get_property_jsval(cx, object_handle, &i.to_string(), item.handle_mut());
+                get_property_jsval(cx, object_handle, &cname, item.handle_mut());
             match get_property_result {
                 Ok(_) => {
                     let conversion_result =
@@ -621,63 +628,28 @@ fn clone_an_object(
     return_val
 }
 
-pub(crate) fn handle_execute_script(
-    window: Option<DomRoot<Window>>,
-    eval: String,
-    reply: GenericSender<WebDriverJSResult>,
-    can_gc: CanGc,
-) {
-    match window {
-        Some(window) => {
-            let cx = window.get_cx();
-            let realm = AlreadyInRealm::assert_for_cx(cx);
-            let realm = InRealm::already(&realm);
-
-            rooted!(in(*cx) let mut rval = UndefinedValue());
-            let global = window.as_global_scope();
-            let evaluation_result = global.evaluate_js_on_global(
-                eval.into(),
-                "",
-                None, // No known `introductionType` for JS code from WebDriver
-                rval.handle_mut(),
-                can_gc,
-            );
-
-            let result = evaluation_result
-                .and_then(|_| jsval_to_webdriver(cx, global, rval.handle(), realm, can_gc));
-
-            reply.send(result).unwrap_or_else(|err| {
-                error!("ExecuteScript Failed to send reply: {err}");
-            });
-        },
-        None => reply
-            .send(Err(JavaScriptEvaluationError::DocumentNotFound))
-            .unwrap_or_else(|err| {
-                error!("ExecuteScript Failed to send reply: {err}");
-            }),
-    }
-}
-
 pub(crate) fn handle_execute_async_script(
     window: Option<DomRoot<Window>>,
     eval: String,
     reply: GenericSender<WebDriverJSResult>,
-    can_gc: CanGc,
+    cx: &mut JSContext,
 ) {
     match window {
         Some(window) => {
-            let cx = window.get_cx();
             let reply_sender = reply.clone();
             window.set_webdriver_script_chan(Some(reply));
-            rooted!(in(*cx) let mut rval = UndefinedValue());
+            rooted!(&in(cx) let mut rval = UndefinedValue());
 
             let global_scope = window.as_global_scope();
+
+            let mut realm = enter_auto_realm(cx, global_scope);
+            let mut realm = realm.current_realm();
             if let Err(error) = global_scope.evaluate_js_on_global(
+                &mut realm,
                 eval.into(),
                 "",
                 None, // No known `introductionType` for JS code from WebDriver
                 rval.handle_mut(),
-                can_gc,
             ) {
                 reply_sender.send(Err(error)).unwrap_or_else(|error| {
                     error!("ExecuteAsyncScript Failed to send reply: {error}");
@@ -1729,36 +1701,38 @@ pub(crate) fn handle_get_property(
     node_id: String,
     name: String,
     reply: GenericSender<Result<JSValue, ErrorStatus>>,
-    can_gc: CanGc,
+    cx: &mut JSContext,
 ) {
     reply
         .send(
             get_known_element(documents, pipeline, node_id).map(|element| {
                 let document = documents.find_document(pipeline).unwrap();
-                let realm = enter_realm(&*document);
-                let cx = document.window().get_cx();
 
-                rooted!(in(*cx) let mut property = UndefinedValue());
+                let Ok(cname) = CString::new(name) else {
+                    return JSValue::Undefined;
+                };
+
+                let mut realm = enter_auto_realm(cx, &*document);
+                let cx = &mut realm.current_realm();
+
+                rooted!(&in(cx) let mut property = UndefinedValue());
                 match get_property_jsval(
-                    cx,
+                    cx.into(),
                     element.reflector().get_jsobject(),
-                    &name,
+                    &cname,
                     property.handle_mut(),
                 ) {
-                    Ok(_) => {
-                        match jsval_to_webdriver(
-                            cx,
-                            &element.global(),
-                            property.handle(),
-                            InRealm::entered(&realm),
-                            can_gc,
-                        ) {
-                            Ok(property) => property,
-                            Err(_) => JSValue::Undefined,
-                        }
+                    Ok(_) => match jsval_to_webdriver(cx, &element.global(), property.handle()) {
+                        Ok(property) => property,
+                        Err(_) => JSValue::Undefined,
                     },
                     Err(error) => {
-                        throw_dom_exception(cx, &element.global(), error, can_gc);
+                        throw_dom_exception(
+                            cx.into(),
+                            &element.global(),
+                            error,
+                            CanGc::from_cx(cx),
+                        );
                         JSValue::Undefined
                     },
                 }
@@ -1902,8 +1876,25 @@ pub(crate) fn handle_element_clear(
                 // Step 5. Scroll Into View
                 scroll_into_view(&element, documents, &pipeline, can_gc);
 
-                // TODO: Step 6 - 10
+                // TODO: Step 6 - 9: Implicit wait. In another PR.
                 // Wait until element become interactable and check.
+
+                // Step 10. If element is not keyboard-interactable or not pointer-interactable,
+                // return error with error code element not interactable.
+                if !is_keyboard_interactable(&element) {
+                    return Err(ErrorStatus::ElementNotInteractable);
+                }
+
+                let paint_tree = get_element_pointer_interactable_paint_tree(
+                    &element,
+                    &documents
+                        .find_document(pipeline)
+                        .expect("Document existence guaranteed by `get_known_element`"),
+                    can_gc,
+                );
+                if !is_element_in_view(&element, &paint_tree) {
+                    return Err(ErrorStatus::ElementNotInteractable);
+                }
 
                 // Step 11
                 // TODO: Clear content editable elements

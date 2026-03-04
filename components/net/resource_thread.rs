@@ -12,14 +12,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::thread;
 
-use base::generic_channel::{self, GenericReceiver, GenericReceiverSet, GenericSelectionResult};
+use base::generic_channel::{
+    self, CallbackSetter, GenericReceiver, GenericReceiverSet, GenericSelectionResult,
+};
 use base::id::CookieStoreId;
 use cookie::Cookie;
 use crossbeam_channel::Sender;
 use devtools_traits::DevtoolsControlMsg;
-use embedder_traits::EmbedderProxy;
+use embedder_traits::GenericEmbedderProxy;
 use hyper_serde::Serde;
-use ipc_channel::ipc::{IpcReceiver, IpcSender};
+use ipc_channel::ipc::IpcSender;
 use log::{debug, trace, warn};
 use net_traits::blob_url_store::parse_blob_url;
 use net_traits::filemanager_thread::FileTokenCheck;
@@ -45,6 +47,7 @@ use rustls_pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
 use servo_arc::Arc as ServoArc;
 use servo_url::{ImmutableOrigin, ServoUrl};
+use tokio::sync::Mutex as TokioMutex;
 
 use crate::async_runtime::{init_async_runtime, spawn_task};
 use crate::connector::{
@@ -52,6 +55,7 @@ use crate::connector::{
 };
 use crate::cookie::ServoCookie;
 use crate::cookie_storage::CookieStorage;
+use crate::embedder::NetToEmbedderMsg;
 use crate::fetch::cors_cache::CorsCache;
 use crate::fetch::fetch_params::{FetchParams, SharedPreloadedResources};
 use crate::fetch::methods::{
@@ -84,7 +88,7 @@ pub fn new_resource_threads(
     devtools_sender: Option<Sender<DevtoolsControlMsg>>,
     time_profiler_chan: ProfilerChan,
     mem_profiler_chan: MemProfilerChan,
-    embedder_proxy: EmbedderProxy,
+    embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
     config_dir: Option<PathBuf>,
     certificate_path: Option<String>,
     ignore_certificate_errors: bool,
@@ -124,7 +128,7 @@ pub fn new_core_resource_thread(
     devtools_sender: Option<Sender<DevtoolsControlMsg>>,
     time_profiler_chan: ProfilerChan,
     mem_profiler_chan: MemProfilerChan,
-    embedder_proxy: EmbedderProxy,
+    embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
     config_dir: Option<PathBuf>,
     ca_certificates: CACertificates<'static>,
     ignore_certificate_errors: bool,
@@ -187,7 +191,7 @@ fn create_http_states(
     config_dir: Option<&Path>,
     ca_certificates: CACertificates<'static>,
     ignore_certificate_errors: bool,
-    embedder_proxy: EmbedderProxy,
+    embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
 ) -> (Arc<HttpState>, Arc<HttpState>) {
     let mut hsts_list = HstsList::default();
     let mut auth_cache = AuthCache::default();
@@ -211,7 +215,7 @@ fn create_http_states(
             override_manager.clone(),
         )),
         override_manager,
-        embedder_proxy: Mutex::new(embedder_proxy.clone()),
+        embedder_proxy: embedder_proxy.clone(),
     };
 
     let override_manager = CertificateErrorOverrideManager::new();
@@ -227,7 +231,7 @@ fn create_http_states(
             override_manager.clone(),
         )),
         override_manager,
-        embedder_proxy: Mutex::new(embedder_proxy),
+        embedder_proxy,
     };
 
     (Arc::new(http_state), Arc::new(private_http_state))
@@ -240,7 +244,7 @@ impl ResourceChannelManager {
         private_receiver: GenericReceiver<CoreResourceMsg>,
         memory_reporter: GenericReceiver<CoreResourceMsg>,
         protocols: Arc<ProtocolRegistry>,
-        embedder_proxy: EmbedderProxy,
+        embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
     ) {
         let (public_http_state, private_http_state) = create_http_states(
             self.config_dir.as_deref(),
@@ -627,7 +631,7 @@ impl CoreResourceManager {
     pub fn new(
         devtools_sender: Option<Sender<DevtoolsControlMsg>>,
         _profiler_chan: ProfilerChan,
-        embedder_proxy: EmbedderProxy,
+        embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
         ca_certificates: CACertificates<'static>,
         ignore_certificate_errors: bool,
     ) -> CoreResourceManager {
@@ -678,7 +682,7 @@ impl CoreResourceManager {
         protocols: Arc<ProtocolRegistry>,
     ) {
         let http_state = http_state.clone();
-        let dc = self.devtools_sender.clone();
+        let devtools_chan = self.devtools_sender.clone();
         let filemanager = self.filemanager.clone();
         let request_interceptor = self.request_interceptor.clone();
 
@@ -729,10 +733,10 @@ impl CoreResourceManager {
             let context = FetchContext {
                 state: http_state,
                 user_agent: servo_config::pref!(user_agent),
-                devtools_chan: dc.map(|dc| Arc::new(Mutex::new(dc))),
-                filemanager: Arc::new(Mutex::new(filemanager)),
+                devtools_chan,
+                filemanager,
                 file_token,
-                request_interceptor: Arc::new(Mutex::new(request_interceptor)),
+                request_interceptor: Arc::new(TokioMutex::new(request_interceptor)),
                 cancellation_listener,
                 timing: ServoArc::new(Mutex::new(ResourceFetchTiming::new(request.timing_type()))),
                 protocols,
@@ -768,7 +772,6 @@ impl CoreResourceManager {
             if let Some(id) = blob_url_file_id.as_ref() {
                 context
                     .filemanager
-                    .lock()
                     .invalidate_token(&context.file_token, id);
             }
         });
@@ -779,13 +782,13 @@ impl CoreResourceManager {
         &self,
         mut request: RequestBuilder,
         event_sender: IpcSender<WebSocketNetworkEvent>,
-        action_receiver: IpcReceiver<WebSocketDomAction>,
+        action_receiver: CallbackSetter<WebSocketDomAction>,
         http_state: &Arc<HttpState>,
         cancellation_listener: Arc<CancellationListener>,
         protocols: Arc<ProtocolRegistry>,
     ) {
         let http_state = http_state.clone();
-        let dc = self.devtools_sender.clone();
+        let devtools_chan = self.devtools_sender.clone();
         let filemanager = self.filemanager.clone();
         let request_interceptor = self.request_interceptor.clone();
 
@@ -814,10 +817,10 @@ impl CoreResourceManager {
                     let context = FetchContext {
                         state: http_state,
                         user_agent: servo_config::pref!(user_agent),
-                        devtools_chan: dc.map(|dc| Arc::new(Mutex::new(dc))),
-                        filemanager: Arc::new(Mutex::new(filemanager)),
+                        devtools_chan,
+                        filemanager,
                         file_token: FileTokenCheck::NotRequired,
-                        request_interceptor: Arc::new(Mutex::new(request_interceptor)),
+                        request_interceptor: Arc::new(TokioMutex::new(request_interceptor)),
                         cancellation_listener,
                         timing: ServoArc::new(Mutex::new(ResourceFetchTiming::new(
                             request.timing_type(),

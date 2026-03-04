@@ -362,7 +362,7 @@ impl DOMString {
                 #[cfg(test)]
                 DOMStringType::Latin1Vec(ref items) => {
                     let mut v = vec![0; items.len() * 2];
-                    let real_size = tendril::encoding_rs::mem::convert_latin1_to_utf8(
+                    let real_size = encoding_rs::mem::convert_latin1_to_utf8(
                         items.as_slice(),
                         v.as_mut_slice(),
                     );
@@ -611,6 +611,32 @@ impl DOMString {
         }
     }
 
+    fn contains_space_characters(
+        &self,
+        latin1_characters: &'static [u8],
+        utf8_characters: &'static [char],
+    ) -> bool {
+        match self.view().encoded_bytes() {
+            EncodedBytes::Latin1Bytes(items) => {
+                latin1_characters.iter().any(|byte| items.contains(byte))
+            },
+            EncodedBytes::Utf8Bytes(s) => {
+                // Save because we know it was a utf8 string
+                let s = unsafe { str::from_utf8_unchecked(s) };
+                s.contains(utf8_characters)
+            },
+        }
+    }
+
+    /// <https://infra.spec.whatwg.org/#ascii-tab-or-newline>
+    pub fn contains_tab_or_newline(&self) -> bool {
+        const LATIN_TAB_OR_NEWLINE: [u8; 3] = [ASCII_TAB, ASCII_NEWLINE, ASCII_CR];
+        const UTF8_TAB_OR_NEWLINE: [char; 3] = ['\u{0009}', '\u{000a}', '\u{000d}'];
+
+        self.contains_space_characters(&LATIN_TAB_OR_NEWLINE, &UTF8_TAB_OR_NEWLINE)
+    }
+
+    /// <https://infra.spec.whatwg.org/#ascii-whitespace>
     pub fn contains_html_space_characters(&self) -> bool {
         const SPACE_BYTES: [u8; 5] = [
             ASCII_TAB,
@@ -619,14 +645,7 @@ impl DOMString {
             ASCII_CR,
             ASCII_SPACE,
         ];
-        match self.view().encoded_bytes() {
-            EncodedBytes::Latin1Bytes(items) => SPACE_BYTES.iter().any(|byte| items.contains(byte)),
-            EncodedBytes::Utf8Bytes(s) => {
-                // Save because we know it was a utf8 string
-                let s = unsafe { str::from_utf8_unchecked(s) };
-                s.contains(HTML_SPACE_CHARACTERS)
-            },
-        }
+        self.contains_space_characters(&SPACE_BYTES, HTML_SPACE_CHARACTERS)
     }
 
     /// This returns the string in utf8 bytes, i.e., `[u8]` encoded with utf8.
@@ -739,10 +758,8 @@ impl ToJSValConvertible for DOMString {
             #[cfg(test)]
             DOMStringType::Latin1Vec(ref items) => {
                 let mut v = vec![0; items.len() * 2];
-                let real_size = tendril::encoding_rs::mem::convert_latin1_to_utf8(
-                    items.as_slice(),
-                    v.as_mut_slice(),
-                );
+                let real_size =
+                    encoding_rs::mem::convert_latin1_to_utf8(items.as_slice(), v.as_mut_slice());
                 v.truncate(real_size);
 
                 String::from_utf8(v)
@@ -1002,7 +1019,7 @@ macro_rules! match_domstring_ascii_inner {
         } == $input {
           $then
         } else {
-            match_domstring_ascii_inner!($variant, $input, $($rest)*)
+            $crate::match_domstring_ascii_inner!($variant, $input, $($rest)*)
         }
 
     };
@@ -1030,15 +1047,14 @@ macro_rules! match_domstring_ascii_inner {
 macro_rules! match_domstring_ascii {
     ($input:expr, $($tail:tt)*) => {
         {
-            use $crate::match_domstring_ascii_inner;
             use $crate::domstring::EncodedBytes;
 
             let view = $input.view();
             let s = view.encoded_bytes();
             if matches!(s, EncodedBytes::Latin1Bytes(_)) {
-                match_domstring_ascii_inner!(EncodedBytes::Latin1Bytes, s, $($tail)*)
+                $crate::match_domstring_ascii_inner!(EncodedBytes::Latin1Bytes, s, $($tail)*)
             } else {
-                match_domstring_ascii_inner!(EncodedBytes::Utf8Bytes, s, $($tail)*)
+                $crate::match_domstring_ascii_inner!(EncodedBytes::Utf8Bytes, s, $($tail)*)
             }
         }
     };

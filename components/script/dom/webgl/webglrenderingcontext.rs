@@ -10,20 +10,18 @@ use std::rc::Rc;
 
 #[cfg(feature = "webgl_backtrace")]
 use backtrace::Backtrace;
-use base::Epoch;
 use base::generic_channel::GenericSharedMemory;
+use base::{Epoch, generic_channel};
 use bitflags::bitflags;
 use canvas_traits::webgl::WebGLError::*;
 use canvas_traits::webgl::{
     AlphaTreatment, GLContextAttributes, GLLimits, GlType, Parameter, SizedDataType, TexDataType,
     TexFormat, TexParameter, WebGLChan, WebGLCommand, WebGLCommandBacktrace, WebGLContextId,
     WebGLError, WebGLFramebufferBindingRequest, WebGLMsg, WebGLMsgSender, WebGLProgramId,
-    WebGLResult, WebGLSLVersion, WebGLSendResult, WebGLSender, WebGLVersion, YAxisTreatment,
-    webgl_channel,
+    WebGLResult, WebGLSLVersion, WebGLSendResult, WebGLVersion, YAxisTreatment, webgl_channel,
 };
 use dom_struct::dom_struct;
 use euclid::default::{Point2D, Rect, Size2D};
-use ipc_channel::ipc::{self};
 use js::jsapi::{JSContext, JSObject, Type};
 use js::jsval::{BooleanValue, DoubleValue, Int32Value, NullValue, ObjectValue, UInt32Value};
 use js::rust::{CustomAutoRooterGuard, MutableHandleValue};
@@ -33,6 +31,7 @@ use js::typedarray::{
 };
 use pixels::{self, Alpha, PixelFormat, Snapshot, SnapshotPixelFormat};
 use script_bindings::conversions::SafeToJSValConvertible;
+use script_bindings::reflector::AssociatedMemory;
 use serde::{Deserialize, Serialize};
 use servo_config::pref;
 use webrender_api::ImageKey;
@@ -124,7 +123,7 @@ fn has_invalid_blend_constants(arg1: u32, arg2: u32) -> bool {
 
 pub(crate) fn uniform_get<T, F>(triple: (&WebGLRenderingContext, WebGLProgramId, i32), f: F) -> T
 where
-    F: FnOnce(WebGLProgramId, i32, WebGLSender<T>) -> WebGLCommand,
+    F: FnOnce(WebGLProgramId, i32, generic_channel::GenericSender<T>) -> WebGLCommand,
     T: for<'de> Deserialize<'de> + Serialize,
 {
     let (sender, receiver) = webgl_channel().unwrap();
@@ -185,9 +184,9 @@ impl Drop for DroppableWebGLRenderingContext {
     }
 }
 
-#[dom_struct]
+#[dom_struct(associated_memory)]
 pub(crate) struct WebGLRenderingContext {
-    reflector_: Reflector,
+    reflector_: Reflector<AssociatedMemory>,
     #[no_trace]
     webgl_version: WebGLVersion,
     #[no_trace]
@@ -230,7 +229,7 @@ pub(crate) struct WebGLRenderingContext {
 }
 
 impl WebGLRenderingContext {
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     pub(crate) fn new_inherited(
         window: &Window,
         canvas: HTMLCanvasElementOrOffscreenCanvas,
@@ -304,7 +303,7 @@ impl WebGLRenderingContext {
         })
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     pub(crate) fn new(
         window: &Window,
         canvas: &RootedHTMLCanvasElementOrOffscreenCanvas,
@@ -1397,13 +1396,14 @@ impl WebGLRenderingContext {
         if (offset as u64) + data.len() as u64 > bound_buffer.capacity() as u64 {
             return self.webgl_error(InvalidValue);
         }
-        let (sender, receiver) = ipc::bytes_channel().unwrap();
+        let (sender, receiver) = generic_channel::channel().unwrap();
         self.send_command(WebGLCommand::BufferSubData(
             target,
             offset as isize,
             receiver,
         ));
-        sender.send(data).unwrap();
+        let buffer = GenericSharedMemory::from_bytes(data);
+        sender.send(buffer).unwrap();
     }
 
     pub(crate) fn bind_buffer_maybe(
@@ -2008,6 +2008,8 @@ impl CanvasContext for WebGLRenderingContext {
         // FIXME(#21718) The backend is allowed to choose a size smaller than
         // what was requested
         self.size.set(size);
+        self.reflector_
+            .update_memory_size(self, size.cast::<usize>().area() * 4);
 
         if let Err(msg) = receiver.recv().unwrap() {
             error!("Error resizing WebGLContext: {}", msg);
@@ -2073,7 +2075,7 @@ impl CanvasContext for WebGLRenderingContext {
         size.width = cmp::min(size.width, fb_width as u32);
         size.height = cmp::min(size.height, fb_height as u32);
 
-        let (sender, receiver) = ipc::channel().unwrap();
+        let (sender, receiver) = generic_channel::channel().unwrap();
         self.send_command(WebGLCommand::ReadPixels(
             Rect::from_size(size),
             constants::RGBA,
@@ -3983,7 +3985,7 @@ impl WebGLRenderingContextMethods<crate::DomTypeHolder> for WebGLRenderingContex
             dest_offset += -y * row_len;
         }
 
-        let (sender, receiver) = ipc::channel().unwrap();
+        let (sender, receiver) = generic_channel::channel().unwrap();
         self.send_command(WebGLCommand::ReadPixels(
             src_rect, format, pixel_type, sender,
         ));
@@ -5090,12 +5092,12 @@ impl Textures {
     }
 
     fn set_active_unit_enum(&self, index: u32) -> WebGLResult<()> {
-        if index < constants::TEXTURE0 || (index - constants::TEXTURE0) as usize > self.units.len()
-        {
-            return Err(InvalidEnum);
+        if (constants::TEXTURE0..constants::TEXTURE0 + self.units.len() as u32).contains(&index) {
+            self.active_unit.set(index - constants::TEXTURE0);
+            Ok(())
+        } else {
+            Err(InvalidEnum)
         }
-        self.active_unit.set(index - constants::TEXTURE0);
-        Ok(())
     }
 
     pub(crate) fn active_texture_slot(

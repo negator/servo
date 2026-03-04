@@ -8,13 +8,10 @@ use std::borrow::Cow;
 use std::slice;
 use std::sync::{Arc, Mutex};
 
-use base::generic_channel::GenericSharedMemory;
+use base::generic_channel::{GenericReceiver, GenericSender, GenericSharedMemory};
 use base::id::PipelineId;
-use compositing_traits::{
-    CrossProcessPaintApi, WebRenderExternalImageIdManager, WebRenderImageHandlerType,
-};
-use ipc_channel::ipc::{IpcReceiver, IpcSender};
 use log::{info, warn};
+use paint_api::{CrossProcessPaintApi, WebRenderExternalImageIdManager, WebRenderImageHandlerType};
 use rustc_hash::FxHashMap;
 use servo_config::pref;
 use webgpu_traits::{
@@ -95,9 +92,9 @@ impl<P> Pass<P> {
 
 #[expect(clippy::upper_case_acronyms)] // Name of the library
 pub(crate) struct WGPU {
-    receiver: IpcReceiver<WebGPURequest>,
-    sender: IpcSender<WebGPURequest>,
-    pub(crate) script_sender: IpcSender<WebGPUMsg>,
+    receiver: GenericReceiver<WebGPURequest>,
+    sender: GenericSender<WebGPURequest>,
+    pub(crate) script_sender: GenericSender<WebGPUMsg>,
     pub(crate) global: Arc<wgc::global::Global>,
     devices: Arc<Mutex<FxHashMap<DeviceId, DeviceScope>>>,
     // TODO: Remove this (https://github.com/gfx-rs/wgpu/issues/867)
@@ -118,9 +115,9 @@ pub(crate) struct WGPU {
 
 impl WGPU {
     pub(crate) fn new(
-        receiver: IpcReceiver<WebGPURequest>,
-        sender: IpcSender<WebGPURequest>,
-        script_sender: IpcSender<WebGPUMsg>,
+        receiver: GenericReceiver<WebGPURequest>,
+        sender: GenericSender<WebGPURequest>,
+        script_sender: GenericSender<WebGPUMsg>,
         paint_api: CrossProcessPaintApi,
         webrender_external_image_id_manager: WebRenderExternalImageIdManager,
         wgpu_image_map: WebGpuExternalImageMap,
@@ -168,7 +165,7 @@ impl WGPU {
                         image_key,
                     } => self.set_image_key(context_id, image_key),
                     WebGPURequest::BufferMapAsync {
-                        sender,
+                        callback: sender,
                         buffer_id,
                         device_id,
                         host_map,
@@ -469,7 +466,7 @@ impl WGPU {
                         program_id,
                         program,
                         label,
-                        sender,
+                        callback: sender,
                     } => {
                         let global = &self.global;
                         let source =
@@ -1164,7 +1161,10 @@ impl WGPU {
                     WebGPURequest::DispatchError { device_id, error } => {
                         self.dispatch_error(device_id, error);
                     },
-                    WebGPURequest::PopErrorScope { device_id, sender } => {
+                    WebGPURequest::PopErrorScope {
+                        device_id,
+                        callback: sender,
+                    } => {
                         // <https://www.w3.org/TR/webgpu/#dom-gpudevice-poperrorscope>
                         let mut devices = self.devices.lock().unwrap();
                         let device_scope = devices

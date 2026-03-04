@@ -5,6 +5,7 @@
 //! The layout actor informs the DevTools client of the layout properties of the document, such as
 //! grids or flexboxes. It acts as a placeholder for now.
 
+use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -12,18 +13,19 @@ use crate::actor::{Actor, ActorEncode, ActorError, ActorRegistry};
 use crate::protocol::ClientRequest;
 use crate::{ActorMsg, StreamId};
 
-pub struct LayoutInspectorActor {
+#[derive(MallocSizeOf)]
+pub(crate) struct LayoutInspectorActor {
     name: String,
 }
 
 #[derive(Serialize)]
-pub struct GetGridsReply {
+pub(crate) struct GetGridsReply {
     from: String,
     grids: Vec<String>,
 }
 
 #[derive(Serialize)]
-pub struct GetCurrentFlexboxReply {
+pub(crate) struct GetCurrentFlexboxReply {
     from: String,
     flexbox: Option<()>,
 }

@@ -13,7 +13,7 @@ use base::id::WebViewId;
 use dom_struct::dom_struct;
 use encoding_rs::Encoding;
 use html5ever::{LocalName, Prefix, local_name, ns};
-use js::jsval::UndefinedValue;
+use js::context::JSContext;
 use js::rust::{HandleObject, Stencil};
 use net_traits::http_status::HttpStatus;
 use net_traits::request::{
@@ -40,9 +40,7 @@ use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
-use crate::dom::bindings::settings_stack::AutoEntryScript;
 use crate::dom::bindings::str::DOMString;
-use crate::dom::bindings::trace::NoTrace;
 use crate::dom::csp::{CspReporting, GlobalCspReporting, InlineCheckType, Violation};
 use crate::dom::document::Document;
 use crate::dom::element::{
@@ -51,7 +49,8 @@ use crate::dom::element::{
     set_cross_origin_attribute,
 };
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
-use crate::dom::globalscope::{ClassicScript, ErrorReporting, GlobalScope, RethrowErrors};
+use crate::dom::global_scope_script_execution::{ClassicScript, ErrorReporting, RethrowErrors};
+use crate::dom::globalscope::GlobalScope;
 use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::node::{ChildrenMutation, CloneChildrenFlag, Node, NodeTraits};
 use crate::dom::performance::performanceresourcetiming::InitiatorType;
@@ -62,7 +61,7 @@ use crate::dom::window::Window;
 use crate::fetch::{RequestWithGlobalScope, create_a_potential_cors_request};
 use crate::network_listener::{self, FetchResponseListener, ResourceTimingListener};
 use crate::script_module::{
-    ImportMap, ModuleOwner, ModuleTree, ScriptFetchOptions, fetch_external_module_script,
+    ImportMap, ModuleOwner, ModuleTree, ScriptFetchOptions, fetch_an_external_module_script,
     fetch_inline_module_script, parse_an_import_map_string, register_import_map,
 };
 use crate::script_runtime::{CanGc, IntroductionType};
@@ -135,7 +134,6 @@ impl HTMLScriptElement {
         }
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
@@ -265,7 +263,7 @@ fn finish_fetching_a_classic_script(
     script_kind: ExternalScriptKind,
     url: ServoUrl,
     load: ScriptResult,
-    can_gc: CanGc,
+    cx: &mut js::context::JSContext,
 ) {
     // Step 33. The "steps to run when the result is ready" for each type of script in 33.2-33.5.
     // of https://html.spec.whatwg.org/multipage/#prepare-the-script-element
@@ -274,26 +272,26 @@ fn finish_fetching_a_classic_script(
     match script_kind {
         ExternalScriptKind::Asap => {
             document = elem.preparation_time_document.get().unwrap();
-            document.asap_script_loaded(elem, load, can_gc)
+            document.asap_script_loaded(elem, load, CanGc::from_cx(cx))
         },
         ExternalScriptKind::AsapInOrder => {
             document = elem.preparation_time_document.get().unwrap();
-            document.asap_in_order_script_loaded(elem, load, can_gc)
+            document.asap_in_order_script_loaded(elem, load, CanGc::from_cx(cx))
         },
         ExternalScriptKind::Deferred => {
             document = elem.parser_document.as_rooted();
-            document.deferred_script_loaded(elem, load, can_gc);
+            document.deferred_script_loaded(elem, load, CanGc::from_cx(cx));
         },
         ExternalScriptKind::ParsingBlocking => {
             document = elem.parser_document.as_rooted();
-            document.pending_parsing_blocking_script_loaded(elem, load, can_gc);
+            document.pending_parsing_blocking_script_loaded(elem, load, cx);
         },
     }
 
-    document.finish_load(LoadType::Script(url), can_gc);
+    document.finish_load(LoadType::Script(url), cx);
 }
 
-pub(crate) type ScriptResult = Result<Script, NoTrace<NetworkError>>;
+pub(crate) type ScriptResult = Result<Script, ()>;
 
 // TODO merge classic and module scripts
 #[derive(JSTraceable, MallocSizeOf)]
@@ -375,24 +373,25 @@ impl FetchResponseListener for ClassicContext {
     /// step 4-9
     fn process_response_eof(
         mut self,
+        cx: &mut js::context::JSContext,
         _: RequestId,
-        response: Result<ResourceFetchTiming, NetworkError>,
+        response: Result<(), NetworkError>,
+        timing: ResourceFetchTiming,
     ) {
         match (response.as_ref(), self.status.as_ref()) {
             (Err(error), _) | (_, Err(error)) => {
+                error!("Fetching classic script failed {:?}", error);
                 // Step 6, response is an error.
                 finish_fetching_a_classic_script(
                     &self.elem.root(),
                     self.kind,
                     self.url.clone(),
-                    Err(NoTrace(error.clone())),
-                    CanGc::note(),
+                    Err(()),
+                    cx,
                 );
 
                 // Resource timing is expected to be available before "error" or "load" events are fired.
-                if let Ok(response) = &response {
-                    network_listener::submit_timing(&self, response, CanGc::note());
-                }
+                network_listener::submit_timing(&self, &response, &timing, CanGc::from_cx(cx));
                 return;
             },
             _ => {},
@@ -464,27 +463,16 @@ impl FetchResponseListener for ClassicContext {
             }
         } else {*/
         let load = Script::Classic(script);
-        finish_fetching_a_classic_script(
-            &elem,
-            self.kind,
-            self.url.clone(),
-            Ok(load),
-            CanGc::note(),
-        );
+        finish_fetching_a_classic_script(&elem, self.kind, self.url.clone(), Ok(load), cx);
         // }
 
-        if let Ok(response) = response {
-            network_listener::submit_timing(&self, &response, CanGc::note());
-        }
+        network_listener::submit_timing(&self, &response, &timing, CanGc::from_cx(cx));
     }
 
     fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<Violation>) {
         let global = &self.resource_timing_global();
         let elem = self.elem.root();
-        let source_position = elem
-            .upcast::<Element>()
-            .compute_source_position(elem.line_number as u32);
-        global.report_csp_violations(violations, Some(elem.upcast()), Some(source_position));
+        global.report_csp_violations(violations, Some(elem.upcast()), None);
     }
 }
 
@@ -734,7 +722,15 @@ impl HTMLScriptElement {
         };
 
         // Step 24. Let cryptographic nonce be el's [[CryptographicNonce]] internal slot's value.
-        let cryptographic_nonce = self.upcast::<Element>().nonce_value();
+        // If the element has a nonce content attribute but is not nonceable strip the nonce to prevent injection attacks.
+        // Elements without a nonce content attribute (e.g. JS-created with .nonce = "abc")
+        // use the internal slot directly — the nonceable check only applies to parser-created elements.
+        let el = self.upcast::<Element>();
+        let cryptographic_nonce = if el.is_nonceable() || !el.has_attribute(&local_name!("nonce")) {
+            el.nonce_value().trim().to_owned()
+        } else {
+            String::new()
+        };
 
         // Step 25. If el has an integrity attribute, then let integrity metadata be that attribute's value.
         // Otherwise, let integrity metadata be the empty string.
@@ -759,7 +755,7 @@ impl HTMLScriptElement {
         };
 
         // Step 29. Fetch options.
-        let options = ScriptFetchOptions {
+        let mut options = ScriptFetchOptions {
             cryptographic_nonce,
             integrity_metadata: integrity_metadata.to_owned(),
             parser_metadata,
@@ -845,11 +841,18 @@ impl HTMLScriptElement {
                     }
                 },
                 ScriptType::Module => {
+                    // If el does not have an integrity attribute, then set options's integrity metadata to
+                    // the result of resolving a module integrity metadata with url and settings object.
+                    if integrity_val.is_none() {
+                        options.integrity_metadata = global
+                            .import_map()
+                            .resolve_a_module_integrity_metadata(&url);
+                    }
+
                     // Step 31.11. Fetch an external module script graph.
-                    fetch_external_module_script(
-                        ModuleOwner::Window(Trusted::new(self)),
+                    fetch_an_external_module_script(
                         url.clone(),
-                        Destination::Script,
+                        ModuleOwner::Window(Trusted::new(self)),
                         options,
                         can_gc,
                     );
@@ -918,9 +921,8 @@ impl HTMLScriptElement {
                         ModuleOwner::Window(Trusted::new(self)),
                         text_rc,
                         base_url.clone(),
-                        self.id,
                         options,
-                        self.line_number,
+                        self.line_number as u32,
                         can_gc,
                     );
                 },
@@ -931,7 +933,6 @@ impl HTMLScriptElement {
                         ModuleOwner::Window(Trusted::new(self)),
                         Rc::clone(&text_rc),
                         base_url.clone(),
-                        can_gc,
                     );
                     let script = Script::ImportMap(ScriptOrigin::internal(
                         text_rc,
@@ -962,8 +963,7 @@ impl HTMLScriptElement {
         // TODO: Step 3. Unblock rendering on el.
         let script = match result {
             // Step 4. If el's result is null, then fire an event named error at el, and return.
-            Err(e) => {
-                warn!("error loading script {:?}", e);
+            Err(_) => {
                 self.dispatch_error_event(can_gc);
                 return;
             },
@@ -1013,7 +1013,11 @@ impl HTMLScriptElement {
                 document.set_current_script(None);
 
                 // Step 6."module".2. Run the module script given by el's result.
-                self.run_a_module_script(module_tree, false, can_gc);
+                self.owner_window().as_global_scope().run_a_module_script(
+                    module_tree,
+                    false,
+                    can_gc,
+                );
             },
             Script::ImportMap(script) => {
                 // Step 6."importmap".1. Register an import map given el's relevant global object and el's result.
@@ -1030,53 +1034,6 @@ impl HTMLScriptElement {
         // Step 8. If el's from an external file is true, then fire an event named load at el.
         if self.from_an_external_file.get() {
             self.dispatch_load_event(can_gc);
-        }
-    }
-
-    /// <https://html.spec.whatwg.org/multipage/#run-a-module-script>
-    pub(crate) fn run_a_module_script(
-        &self,
-        module_tree: Rc<ModuleTree>,
-        _rethrow_errors: bool,
-        can_gc: CanGc,
-    ) {
-        // TODO use a settings object rather than this element's document/window
-        // Step 2
-        let document = self.owner_document();
-        if !document.is_fully_active() || !document.scripting_enabled() {
-            return;
-        }
-
-        // Step 4
-        let window = self.owner_window();
-        let global = window.as_global_scope();
-        let _aes = AutoEntryScript::new(global);
-
-        // Step 6.
-        {
-            let module_error = module_tree.get_rethrow_error().borrow();
-            let network_error = module_tree.get_network_error().borrow();
-            if module_error.is_some() && network_error.is_none() {
-                module_tree.report_error(global, can_gc);
-                return;
-            }
-        }
-
-        let record = module_tree
-            .get_record()
-            .borrow()
-            .as_ref()
-            .map(|record| record.handle());
-
-        if let Some(record) = record {
-            rooted!(in(*GlobalScope::get_cx()) let mut rval = UndefinedValue());
-            let evaluated =
-                module_tree.execute_module(global, record, rval.handle_mut().into(), can_gc);
-
-            if let Err(exception) = evaluated {
-                module_tree.set_rethrow_error(exception);
-                module_tree.report_error(global, can_gc);
-            }
         }
     }
 
@@ -1236,13 +1193,13 @@ impl VirtualMethods for HTMLScriptElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#script-processing-model:the-script-element-20>
-    fn post_connection_steps(&self, can_gc: CanGc) {
+    fn post_connection_steps(&self, cx: &mut JSContext) {
         if let Some(s) = self.super_type() {
-            s.post_connection_steps(can_gc);
+            s.post_connection_steps(cx);
         }
 
         if self.upcast::<Node>().is_connected() && !self.parser_inserted.get() {
-            self.prepare(Some(IntroductionType::INJECTED_SCRIPT), can_gc);
+            self.prepare(Some(IntroductionType::INJECTED_SCRIPT), CanGc::from_cx(cx));
         }
     }
 
@@ -1347,8 +1304,8 @@ impl HTMLScriptElementMethods<crate::DomTypeHolder> for HTMLScriptElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-script-crossorigin>
-    fn SetCrossOrigin(&self, value: Option<DOMString>, can_gc: CanGc) {
-        set_cross_origin_attribute(self.upcast::<Element>(), value, can_gc);
+    fn SetCrossOrigin(&self, cx: &mut JSContext, value: Option<DOMString>) {
+        set_cross_origin_attribute(cx, self.upcast::<Element>(), value);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-script-referrerpolicy>

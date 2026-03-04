@@ -160,7 +160,18 @@ impl EventSourceContext {
 
         let trusted_event_source = self.event_source.clone();
         let global = event_source.global();
-        let event_source_context = self.clone();
+        let event_source_context = EventSourceContext {
+            incomplete_utf8: None,
+            event_source: self.event_source.clone(),
+            gen_id: self.gen_id,
+            parser_state: ParserState::Eol,
+            field: String::new(),
+            value: String::new(),
+            origin: self.origin.clone(),
+            event_type: String::new(),
+            data: String::new(),
+            last_event_id: String::from(event_source.last_event_id.borrow().clone()),
+        };
         global.task_manager().remote_event_task_source().queue(
             task!(reestablish_the_event_source_onnection: move || {
                 let event_source = trusted_event_source.root();
@@ -441,16 +452,19 @@ impl FetchResponseListener for EventSourceContext {
 
     fn process_response_eof(
         mut self,
+        cx: &mut js::context::JSContext,
         _: RequestId,
-        response: Result<ResourceFetchTiming, NetworkError>,
+        response: Result<(), NetworkError>,
+        timing: ResourceFetchTiming,
     ) {
         if self.incomplete_utf8.take().is_some() {
-            self.parse("\u{FFFD}".chars(), CanGc::note());
+            self.parse("\u{FFFD}".chars(), CanGc::from_cx(cx));
         }
-        if let Ok(response) = response {
+        if response.is_ok() {
             self.reestablish_the_connection();
-            network_listener::submit_timing(&self, &response, CanGc::note());
         }
+
+        network_listener::submit_timing(&self, &response, &timing, CanGc::from_cx(cx));
     }
 
     fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<Violation>) {

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "components/media/examples",
     "components/xpath",
     "ports/servoshell",
     "tests/unit/*",
@@ -23,6 +24,7 @@ publish = false
 rust-version = "1.86.0"
 
 [workspace.dependencies]
+accesskit = { version = "0.24.0", features = ["serde"] }
 accountable-refcell = "0.2.2"
 aes = "0.8.4"
 aes-gcm = "0.10.3"
@@ -31,104 +33,119 @@ app_units = "0.7"
 arboard = "3"
 argon2 = { version = "0.5", features = ["alloc"] }
 arrayvec = "0.7"
-async-tungstenite = { version = "0.32", features = ["tokio-rustls-webpki-roots"] }
+async-tungstenite = { version = "0.33", features = ["tokio-rustls-webpki-roots"] }
 atomic_refcell = "0.1.13"
-aws-lc-rs = { version = "1.15", default-features = false, features = ["aws-lc-sys"] }
-background_hang_monitor_api = { path = "components/shared/background_hang_monitor" }
+aws-lc-rs = { version = "1.16", default-features = false, features = ["aws-lc-sys"] }
+background_hang_monitor_api = { package = "servo-background-hang-monitor-api", path = "components/shared/background_hang_monitor" }
 backtrace = "0.3"
-base = { path = "components/shared/base" }
+base = { package = "servo-base", path = "components/shared/base" }
 base64 = "0.22.1"
 base64ct = { version = "1.8", features = ["alloc"] }
-# bincode 1.3.3 is the last known good version of bincode 1.
-# The crate was declared finished and won't receive further updates by the author.
-# Since the git history was rewritten by the author, any bump of this crate should
-# be reviewed carefully by doing a manual diff based on the crates.io version,
-# before doing **any** bump to this dependency to rule out a supply chain attack.
-bincode = "=1.3.3"
-bitflags = "2.10"
-bluetooth_traits = { path = "components/shared/bluetooth" }
+bitflags = "2.11"
+bluetooth_traits = { package = "servo-bluetooth-traits", path = "components/shared/bluetooth" }
 brotli = "8.0.2"
 bytemuck = "1"
 byteorder = "1.5"
-canvas_traits = { path = "components/shared/canvas" }
+canvas_traits = { package = "servo-canvas-traits", path = "components/shared/canvas" }
 cbc = "0.1.2"
 cfg-if = "1.0.4"
 chacha20poly1305 = "0.10"
 chardetng = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 cipher = { version = "0.4.4", features = ["alloc"] }
-compositing_traits = { path = "components/shared/compositing" }
-constellation_traits = { path = "components/shared/constellation" }
-content-security-policy = { git = "https://github.com/servo/rust-content-security-policy", branch = "servo-csp", features = ["serde"] }
+constellation_traits = { package = "servo-constellation-traits", path = "components/shared/constellation" }
+content-security-policy = { version = "0.6.0", features = ["serde"] }
 cookie = { package = "cookie", version = "0.18" }
 crossbeam-channel = "0.5"
 cssparser = { version = "0.36", features = ["serde"] }
 ctr = "0.9.2"
 data-url = "0.3"
 der = { version = "0.7", features = ["alloc", "derive"] }
-devtools_traits = { path = "components/shared/devtools" }
+devtools_traits = { package = "servo-devtools-traits", path = "components/shared/devtools" }
 digest = "0.10"
 dpi = "0.1"
 dwrote = "0.11.5"
 ecdsa = "0.16"
 elliptic-curve = "0.13"
-embedder_traits = { path = "components/shared/embedder" }
+embedder_traits = { package = "servo-embedder-traits", path = "components/shared/embedder" }
 encoding_rs = { version = "0.8", features = ["serde"] }
 env_logger = "0.11"
 euclid = "0.22"
 flate2 = "1.1"
-fonts_traits = { path = "components/shared/fonts" }
+fonts_traits = { package = "servo-fonts-traits", path = "components/shared/fonts" }
 freetype-sys = "0.20"
+futures = { version = "0.3", default-features = false }
+futures-core = { version = "0.3", default-features = false }
+futures-util = { version = "0.3", default-features = false }
 gleam = "0.15"
+glib = "0.22"
+glib-sys = "0.22"
 glow = "0.16.0"
-gstreamer = { version = "0.24", features = ["v1_18"] }
-gstreamer-base = "0.24"
-gstreamer-gl = "0.24"
-gstreamer-gl-sys = "0.24"
-gstreamer-sys = "0.24"
-gstreamer-video = "0.24"
+gstreamer = { version = "0.25", features = ["v1_18"] }
+gstreamer-app = "0.25"
+gstreamer-audio = "0.25"
+gstreamer-base = "0.25"
+gstreamer-gl = "0.25"
+gstreamer-gl-egl = "0.25"
+gstreamer-gl-sys = "0.25"
+gstreamer-gl-wayland = "0.25"
+gstreamer-gl-x11 = "0.25"
+gstreamer-play = "0.25"
+gstreamer-sdp = "0.25"
+gstreamer-sys = "0.25"
+gstreamer-video = "0.25"
+gstreamer-webrtc = { version = "0.25", features = ["v1_18"] }
 harfbuzz-sys = "0.6.1"
 headers = "0.4"
-hitrace = "0.1.5"
+hitrace = { version = "0.1.6", features = ["api-19", "tracing-rs"] }
 hkdf = "0.12"
-html5ever = "0.36.1"
+html5ever = "0.38"
 http = "1.4"
 http-body-util = "0.1"
 hyper = "1.8"
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "logging", "tls12", "webpki-tokio"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http2", "tokio", "client-proxy"] }
-hyper_serde = { path = "components/hyper_serde" }
+hyper_serde = { package = "servo-hyper-serde", path = "components/hyper_serde" }
 icu_locid = "1.5.0"
+icu_properties = "1.5.0"
 icu_segmenter = "1.5.0"
 image = { version = "0.25", default-features = false, features = ["avif", "rayon", "bmp", "gif", "ico", "jpeg", "png", "webp"] }
 imsz = "0.4"
 indexmap = { version = "2.11.4", features = ["std"] }
-ipc-channel = "0.20.2"
+ipc-channel = "0.21"
 itertools = "0.14"
-js = { package = "mozjs", version = "=0.14.5", default-features = false, features = ["libz-sys", "intl"] }
+js = { package = "mozjs", version = "=0.15.1", default-features = false, features = ["libz-sys", "intl"] }
 keyboard-types = { version = "0.8.3", features = ["serde", "webdriver"] }
 kurbo = { version = "0.12", features = ["euclid"] }
-layout_api = { path = "components/shared/layout" }
+layout_api = { package = "servo-layout-api", path = "components/shared/layout" }
 libc = "0.2"
 log = "0.4.29"
 mach2 = "0.6"
-malloc_size_of = { package = "servo_malloc_size_of", path = "components/malloc_size_of" }
+malloc_size_of = { package = "servo-malloc-size-of", path = "components/malloc_size_of" }
 malloc_size_of_derive = "0.1"
-markup5ever = "0.36.1"
-memmap2 = "0.9.9"
+markup5ever = "0.38"
+memmap2 = "0.9.10"
 mime = "0.3.13"
+mime-multipart-hyper1 = "0.10.0"
 mime_guess = "2.0.5"
 ml-dsa = "0.0.4"
 ml-kem = { version = "0.2", features = ["deterministic"] }
 mozangle = "0.5.3"
-net_traits = { path = "components/shared/net" }
+net_traits = { package = "servo-net-traits", path = "components/shared/net" }
 nix = "0.30"
 nom = "8.0.0"
 nom-rfc8288 = "0.4.0"
 num-bigint-dig = "0.8"
+num-derive = "0.4.2"
 num-traits = "0.2"
 num_cpus = "1.17.0"
+objc2 = "0.6.4"
+objc2-core-foundation = "0.3.2"
+objc2-core-graphics = "0.3.2"
+objc2-core-text = "0.3.2"
+ocb3 = "0.1.0"
 openxr = "0.20"
+paint_api = { package = "servo-paint-api", path = "components/shared/paint" }
 p256 = { version = "0.13", features = ["ecdh"] }
 p384 = { version = "0.13", features = ["ecdh"] }
 p521 = { version = "0.13", features = ["ecdh"] }
@@ -136,8 +153,9 @@ parking_lot = { version = "0.12", features = ["serde"] }
 peniko = "0.5"
 percent-encoding = "2.3"
 pkcs8 = { version = "0.10", features = ["rand_core"] }
+postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
 proc-macro2 = "1"
-profile_traits = { path = "components/shared/profile" }
+profile_traits = { package = "servo-profile-traits", path = "components/shared/profile" }
 quote = "1"
 rand = "0.9"
 raw-window-handle = "0.6"
@@ -148,41 +166,41 @@ resvg = "0.45.0"
 rsa = { version = "0.9.10", features = ["sha1", "sha2"] }
 rustc-hash = "2.1.1"
 rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12"] }
-rustls-pki-types = "1.13"
+rustls-pki-types = "1.14"
 rustls-platform-verifier = "0.6.2"
-script_traits = { path = "components/shared/script" }
-sea-query = { version = "1.0.0-rc.29", default-features = false, features = ["backend-sqlite", "derive"] }
+script_traits = { package = "servo-script-traits", path = "components/shared/script" }
+sea-query = { version = "1.0.0-rc.31", default-features = false, features = ["backend-sqlite", "derive"] }
 sea-query-rusqlite = { version = "0.8.0-rc.15" }
 sec1 = "0.7"
-selectors = { git = "https://github.com/servo/stylo", branch = "2025-12-01" }
+selectors = { git = "https://github.com/servo/stylo", rev = "9b635629e627a611419745198de1b1ba6c8667c2" }
 serde = "1.0.228"
 serde_bytes = "0.11"
 serde_core = "1.0.226"
 serde_json = "1.0"
-servo-media = { git = "https://github.com/servo/media" }
-servo-media-dummy = { git = "https://github.com/servo/media" }
-servo-media-gstreamer = { git = "https://github.com/servo/media" }
+servo-media = { path = "components/media/servo-media" }
+servo-media-dummy = { path = "components/media/backends/dummy" }
+servo-media-gstreamer = { path = "components/media/backends/gstreamer" }
 servo-tracing = { path = "components/servo_tracing" }
-servo_arc = { git = "https://github.com/servo/stylo", branch = "2025-12-01" }
+servo_arc = { git = "https://github.com/servo/stylo", rev = "9b635629e627a611419745198de1b1ba6c8667c2" }
 sha1 = "0.10"
 sha2 = "0.10"
 sha3 = "0.10"
 skrifa = "0.37.0"
 smallvec = { version = "1.15", features = ["serde", "union"] }
-storage_traits = { path = "components/shared/storage" }
+storage_traits = { package = "servo-storage-traits", path = "components/shared/storage" }
 string_cache = "0.9"
 strum = { version = "0.27", features = ["derive"] }
-stylo = { git = "https://github.com/servo/stylo", branch = "2025-12-01" }
-stylo_atoms = { git = "https://github.com/servo/stylo", branch = "2025-12-01" }
-stylo_config = { git = "https://github.com/servo/stylo", branch = "2025-12-01" }
-stylo_dom = { git = "https://github.com/servo/stylo", branch = "2025-12-01" }
-stylo_malloc_size_of = { git = "https://github.com/servo/stylo", branch = "2025-12-01" }
-stylo_traits = { git = "https://github.com/servo/stylo", branch = "2025-12-01" }
+stylo = { git = "https://github.com/servo/stylo", rev = "9b635629e627a611419745198de1b1ba6c8667c2" }
+stylo_atoms = { git = "https://github.com/servo/stylo", rev = "9b635629e627a611419745198de1b1ba6c8667c2" }
+stylo_dom = { git = "https://github.com/servo/stylo", rev = "9b635629e627a611419745198de1b1ba6c8667c2" }
+stylo_malloc_size_of = { git = "https://github.com/servo/stylo", rev = "9b635629e627a611419745198de1b1ba6c8667c2" }
+stylo_static_prefs = { git = "https://github.com/servo/stylo", rev = "9b635629e627a611419745198de1b1ba6c8667c2" }
+stylo_traits = { git = "https://github.com/servo/stylo", rev = "9b635629e627a611419745198de1b1ba6c8667c2" }
 surfman = { version = "0.11.0", features = ["chains"] }
 syn = { version = "2", default-features = false, features = ["clone-impls", "derive", "parsing"] }
 synstructure = "0.13"
 taffy = { version = "0.9.2", default-features = false, features = ["calc", "detailed_layout_info", "grid", "std"] }
-tendril = { version = "0.4.1", features = ["encoding_rs"] }
+tendril = { version = "0.5", features = ["encoding_rs"] }
 tikv-jemalloc-sys = "0.6.1"
 tikv-jemallocator = "0.6.1"
 time = { package = "time", version = "0.3", features = ["large-dates", "local-offset", "serde"] }
@@ -202,26 +220,26 @@ unicode-segmentation = "1.12.0"
 url = "2.5"
 urlpattern = "0.3"
 utf-8 = "0.7"
-uuid = { version = "1.19.0", features = ["v4", "v5"] }
+uuid = { version = "1.21.0", features = ["v4", "v5"] }
 vello = "0.6"
 vello_cpu = "0.0.4"
 webdriver = "0.53.0"
-webgpu_traits = { path = "components/shared/webgpu" }
+webgpu_traits = { package = "servo-webgpu-traits", path = "components/shared/webgpu" }
 webpki-roots = "1.0"
-webrender = { git = "https://github.com/servo/webrender", branch = "0.68", features = ["capture"] }
-webrender_api = { git = "https://github.com/servo/webrender", branch = "0.68" }
-webxr-api = { path = "components/shared/webxr" }
+webrender = { version = "0.68", features = ["capture"] }
+webrender_api = "0.68"
+webxr-api = { package = "servo-webxr-api", path = "components/shared/webxr" }
 wgpu-core = "26"
 wgpu-types = "26"
 winapi = "0.3"
 windows-sys = "0.61"
-winit = "0.30.12"
+winit = "0.30.13"
 wio = "0.2"
-wr_malloc_size_of = { git = "https://github.com/servo/webrender", branch = "0.68" }
+wr_malloc_size_of = "0.2.2"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 xi-unicode = "0.3.0"
-xml5ever = "0.36.1"
-xpath = { path = "components/xpath" }
+xml5ever = "0.38"
+xpath = { package = "servo-xpath", path = "components/xpath" }
 
 # RSA key generation could be very slow without compilation
 # optimizations, in development mode. Without optimizations, WPT might
@@ -289,6 +307,17 @@ codegen-units = 1
 # xml5ever = { path = "../html5ever/xml5ever" }
 # tendril = { path = "../html5ever/tendril" }
 #
+# Or for mozjs:
+#
+# mozjs = { path = "../mozjs/mozjs" }
+# mozjs_sys = { path = "../mozjs/mozjs-sys" }
+#
+# Pending egui bumping their accesskit version: https://github.com/emilk/egui/pull/7850
+# This is only used in servoshell.
+# TODO: When these are no longer needed remove the exception in deny.toml as well.
+egui = { git = "https://github.com/emilk/egui.git", rev = "5d8f393335e051785b4fd3af9ef92eda5b61177f" }
+egui-winit = { git = "https://github.com/emilk/egui.git", rev = "5d8f393335e051785b4fd3af9ef92eda5b61177f" }
+#
 # Or for Stylo:
 #
 # [patch."https://github.com/servo/stylo"]
@@ -296,9 +325,9 @@ codegen-units = 1
 # servo_arc = { path = "../stylo/servo_arc" }
 # stylo = { path = "../stylo/style" }
 # stylo_atoms = { path = "../stylo/stylo_atoms" }
-# stylo_config = { path = "../stylo/stylo_config" }
 # stylo_dom = { path = "../stylo/stylo_dom" }
 # stylo_malloc_size_of = { path = "../stylo/malloc_size_of" }
+# stylo_static_prefs = { path = "../stylo/stylo_static_prefs" }
 # stylo_traits = { path = "../stylo/style_traits" }
 #
 # Or for WebRender:
@@ -315,8 +344,3 @@ codegen-units = 1
 #
 # [patch."https://github.com/servo/rust-content-security-policy"]
 # content-security-policy = { path = "../rust-content-security-policy" }
-#
-# Or for mozjs:
-#
-# mozjs = { path = "../mozjs/mozjs" }
-# mozjs_sys = { path = "../mozjs/mozjs-sys" }

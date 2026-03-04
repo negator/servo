@@ -53,6 +53,7 @@ use crate::dom::html::htmlhtmlelement::HTMLHtmlElement;
 use crate::dom::html::htmlinputelement::{HTMLInputElement, InputType};
 use crate::dom::html::htmllabelelement::HTMLLabelElement;
 use crate::dom::html::htmltextareaelement::HTMLTextAreaElement;
+use crate::dom::medialist::MediaList;
 use crate::dom::node::{
     BindContext, Node, NodeTraits, ShadowIncluding, UnbindContext, from_untrusted_node_address,
 };
@@ -97,7 +98,6 @@ impl HTMLElement {
         }
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
@@ -150,6 +150,26 @@ impl HTMLElement {
 
         // Step 2: Replace all with fragment within element.
         Node::replace_all(Some(fragment.upcast()), self.upcast::<Node>(), can_gc);
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#matches-the-environment>
+    pub(crate) fn media_attribute_matches_media_environment(&self) -> bool {
+        // A string matches the environment of the user if it is the empty string,
+        // a string consisting of only ASCII whitespace, or is a media query list that
+        // matches the user's environment according to the definitions given in Media Queries. [MQ]
+        self.upcast::<Element>()
+            .get_attribute(&ns!(), &local_name!("media"))
+            .is_none_or(|media| {
+                MediaList::matches_environment(&self.owner_document(), &media.value())
+            })
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#editing-host>
+    pub(crate) fn is_editing_host(&self) -> bool {
+        // > An editing host is either an HTML element with its contenteditable attribute in the true state or plaintext-only state,
+        matches!(&*self.ContentEditable().str(), "true" | "plaintext-only")
+        // > or a child HTML element of a Document whose design mode enabled is true.
+        // TODO
     }
 }
 
@@ -457,7 +477,7 @@ impl HTMLElementMethods<crate::DomTypeHolder> for HTMLElement {
 
     /// <https://drafts.csswg.org/cssom-view/#dom-htmlelement-scrollparent>
     #[expect(unsafe_code)]
-    fn GetScrollParent(&self) -> Option<DomRoot<Element>> {
+    fn ScrollParent(&self) -> Option<DomRoot<Element>> {
         self.owner_window()
             .scroll_container_query(
                 Some(self.upcast()),
@@ -610,25 +630,42 @@ impl HTMLElementMethods<crate::DomTypeHolder> for HTMLElement {
         );
     }
 
-    /// <https://html.spec.whatwg.org/multipage/#dom-contenteditable>
-    fn ContentEditable(&self) -> DOMString {
-        // TODO: https://github.com/servo/servo/issues/12776
-        self.as_element()
-            .get_attribute(&ns!(), &local_name!("contenteditable"))
-            .map(|attr| DOMString::from(&**attr.value()))
-            .unwrap_or_else(|| DOMString::from("inherit"))
-    }
+    // https://html.spec.whatwg.org/multipage/#dom-contenteditable
+    make_enumerated_getter!(
+        ContentEditable,
+        "contenteditable",
+        "true" | "false" | "plaintext-only",
+        missing => "inherit",
+        invalid => "inherit",
+        empty => "true"
+    );
 
     /// <https://html.spec.whatwg.org/multipage/#dom-contenteditable>
-    fn SetContentEditable(&self, _: DOMString) {
-        // TODO: https://github.com/servo/servo/issues/12776
-        warn!("The contentEditable attribute is not implemented yet");
+    fn SetContentEditable(&self, value: DOMString, can_gc: CanGc) -> ErrorResult {
+        let lower_value = value.to_ascii_lowercase();
+        let element = self.upcast::<Element>();
+        let attr_name = &local_name!("contenteditable");
+        match lower_value.as_ref() {
+            // > On setting, if the new value is an ASCII case-insensitive match for the string "inherit", then the content attribute must be removed,
+            "inherit" => {
+                element.remove_attribute_by_name(attr_name, can_gc);
+            },
+            // > if the new value is an ASCII case-insensitive match for the string "true", then the content attribute must be set to the string "true",
+            // > if the new value is an ASCII case-insensitive match for the string "plaintext-only", then the content attribute must be set to the string "plaintext-only",
+            // > if the new value is an ASCII case-insensitive match for the string "false", then the content attribute must be set to the string "false",
+            "true" | "false" | "plaintext-only" => {
+                element.set_attribute(attr_name, AttrValue::String(lower_value), can_gc);
+            },
+            // > and otherwise the attribute setter must throw a "SyntaxError" DOMException.
+            _ => return Err(Error::Syntax(None)),
+        };
+        Ok(())
     }
 
-    /// <https://html.spec.whatwg.org/multipage/#dom-contenteditable>
+    /// <https://html.spec.whatwg.org/multipage/#dom-iscontenteditable>
     fn IsContentEditable(&self) -> bool {
-        // TODO: https://github.com/servo/servo/issues/12776
-        false
+        // > The isContentEditable IDL attribute, on getting, must return true if the element is either an editing host or editable, and false otherwise.
+        self.is_editing_host() || self.upcast::<Node>().is_editable()
     }
 
     /// <https://html.spec.whatwg.org/multipage#dom-attachinternals>
@@ -701,6 +738,17 @@ impl HTMLElementMethods<crate::DomTypeHolder> for HTMLElement {
     fn SetAutofocus(&self, autofocus: bool, can_gc: CanGc) {
         self.element
             .set_bool_attribute(&local_name!("autofocus"), autofocus, can_gc);
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-tabindex>
+    fn TabIndex(&self) -> i32 {
+        self.element.tab_index()
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-tabindex>
+    fn SetTabIndex(&self, tab_index: i32, can_gc: CanGc) {
+        self.element
+            .set_int_attribute(&local_name!("tabindex"), tab_index, can_gc);
     }
 }
 
@@ -1006,7 +1054,7 @@ impl HTMLElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#summary-for-its-parent-details>
-    fn is_a_summary_for_its_parent_details(&self) -> bool {
+    pub(crate) fn is_a_summary_for_its_parent_details(&self) -> bool {
         if self.is_implicit_summary_element() {
             return true;
         }

@@ -5,13 +5,13 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 
+use base::generic_channel::SendError;
 use base::id::{BrowsingContextId, HistoryStateId, PipelineId, WebViewId};
-use compositing_traits::{CompositionPipeline, PaintMessage, PaintProxy};
 use constellation_traits::{LoadData, ServiceWorkerManagerFactory};
 use embedder_traits::{AnimationState, FocusSequenceNumber};
-use ipc_channel::Error;
 use layout_api::ScriptThreadFactory;
 use log::{debug, error, warn};
+use paint_api::{CompositionPipeline, PaintMessage, PaintProxy};
 use script_traits::{
     DiscardBrowsingContext, DocumentActivity, NewPipelineInfo, ScriptThreadMessage,
 };
@@ -77,7 +77,7 @@ impl Pipeline {
         event_loop: Rc<EventLoop>,
         constellation: &Constellation<STF, SWF>,
         throttled: bool,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, SendError> {
         if let Err(error) = event_loop.send(ScriptThreadMessage::SpawnPipeline(
             new_pipeline_info.clone(),
         )) {

@@ -4,17 +4,18 @@
 
 #![expect(dead_code)]
 
-use std::cell::RefCell;
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use atomic_refcell::AtomicRefCell;
 use base::cross_process_instant::CrossProcessInstant;
 use base::generic_channel::{self, GenericReceiver, GenericSender};
 use base::id::PipelineId;
 use devtools_traits::DevtoolScriptControlMsg::{DropTimelineMarkers, SetTimelineMarkers};
 use devtools_traits::{DevtoolScriptControlMsg, TimelineMarker, TimelineMarkerType};
+use malloc_size_of_derive::MallocSizeOf;
 use serde::{Serialize, Serializer};
 use serde_json::{Map, Value};
 
@@ -24,16 +25,20 @@ use crate::actors::framerate::FramerateActor;
 use crate::actors::memory::{MemoryActor, TimelineMemoryReply};
 use crate::protocol::{ClientRequest, JsonPacketStream};
 
-pub struct TimelineActor {
+#[derive(MallocSizeOf)]
+pub(crate) struct TimelineActor {
     name: String,
     script_sender: GenericSender<DevtoolScriptControlMsg>,
     marker_types: Vec<TimelineMarkerType>,
     pipeline_id: PipelineId,
+    #[conditional_malloc_size_of]
     is_recording: Arc<Mutex<bool>>,
-    stream: RefCell<Option<TcpStream>>,
-
-    framerate_actor: RefCell<Option<String>>,
-    memory_actor: RefCell<Option<String>>,
+    stream: AtomicRefCell<Option<TcpStream>>,
+    framerate_actor: AtomicRefCell<Option<String>>,
+    memory_actor: AtomicRefCell<Option<String>>,
+    #[conditional_malloc_size_of]
+    registry: Arc<Mutex<ActorRegistry>>,
+    start_stamp: CrossProcessInstant,
 }
 
 struct Emitter {
@@ -106,7 +111,8 @@ struct FramerateEmitterReply {
 /// with accuracy to microsecond that shows how much time has passed since
 /// actor registry inited
 /// analog <https://w3c.github.io/hr-time/#sec-DOMHighResTimeStamp>
-pub struct HighResolutionStamp(f64);
+#[derive(MallocSizeOf)]
+pub(crate) struct HighResolutionStamp(f64);
 
 impl HighResolutionStamp {
     pub fn new(start_stamp: CrossProcessInstant, time: CrossProcessInstant) -> HighResolutionStamp {
@@ -132,6 +138,7 @@ impl TimelineActor {
         name: String,
         pipeline_id: PipelineId,
         script_sender: GenericSender<DevtoolScriptControlMsg>,
+        registry: Arc<Mutex<ActorRegistry>>,
     ) -> TimelineActor {
         let marker_types = vec![TimelineMarkerType::Reflow, TimelineMarkerType::DOMEvent];
 
@@ -141,10 +148,11 @@ impl TimelineActor {
             marker_types,
             script_sender,
             is_recording: Arc::new(Mutex::new(false)),
-            stream: RefCell::new(None),
-
-            framerate_actor: RefCell::new(None),
-            memory_actor: RefCell::new(None),
+            stream: AtomicRefCell::new(None),
+            framerate_actor: AtomicRefCell::new(None),
+            memory_actor: AtomicRefCell::new(None),
+            start_stamp: CrossProcessInstant::now(),
+            registry,
         }
     }
 
@@ -232,8 +240,8 @@ impl Actor for TimelineActor {
 
                 let emitter = Emitter::new(
                     self.name(),
-                    registry.shareable(),
-                    registry.start_stamp(),
+                    self.registry.clone(),
+                    self.start_stamp,
                     request.try_clone_stream().unwrap(),
                     self.memory_actor.borrow().clone(),
                     self.framerate_actor.borrow().clone(),
@@ -243,10 +251,7 @@ impl Actor for TimelineActor {
 
                 let msg = StartReply {
                     from: self.name(),
-                    value: HighResolutionStamp::new(
-                        registry.start_stamp(),
-                        CrossProcessInstant::now(),
-                    ),
+                    value: HighResolutionStamp::new(self.start_stamp, CrossProcessInstant::now()),
                 };
                 request.reply_final(&msg)?
             },
@@ -254,10 +259,7 @@ impl Actor for TimelineActor {
             "stop" => {
                 let msg = StopReply {
                     from: self.name(),
-                    value: HighResolutionStamp::new(
-                        registry.start_stamp(),
-                        CrossProcessInstant::now(),
-                    ),
+                    value: HighResolutionStamp::new(self.start_stamp, CrossProcessInstant::now()),
                 };
 
                 self.script_sender
@@ -269,11 +271,11 @@ impl Actor for TimelineActor {
 
                 // TODO: move this to the cleanup method.
                 if let Some(ref actor_name) = *self.framerate_actor.borrow() {
-                    registry.drop_actor_later(actor_name.clone());
+                    registry.remove(actor_name.clone());
                 }
 
                 if let Some(ref actor_name) = *self.memory_actor.borrow() {
-                    registry.drop_actor_later(actor_name.clone());
+                    registry.remove(actor_name.clone());
                 }
 
                 **self.is_recording.lock().as_mut().unwrap() = false;
@@ -339,7 +341,7 @@ impl Emitter {
         if let Some(ref actor_name) = self.framerate_actor {
             let mut lock = self.registry.lock();
             let registry = lock.as_mut().unwrap();
-            let framerate_actor = registry.find_mut::<FramerateActor>(actor_name);
+            let framerate_actor = registry.find::<FramerateActor>(actor_name);
             let framerate_reply = FramerateEmitterReply {
                 type_: "framerate".to_owned(),
                 from: framerate_actor.name(),

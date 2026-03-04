@@ -2,16 +2,19 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::default::Default;
-use std::ops::Range;
 
-use base::Lines;
-use base::text::{Utf8CodeUnitLength, Utf16CodeUnitLength};
+use base::text::Utf16CodeUnitLength;
 use dom_struct::dom_struct;
 use embedder_traits::{EmbedderControlRequest, InputMethodRequest, InputMethodType};
+use fonts::{ByteIndex, TextByteRange};
 use html5ever::{LocalName, Prefix, local_name, ns};
+use js::context::JSContext;
 use js::rust::HandleObject;
+use layout_api::wrapper_traits::{ScriptSelection, SharedSelection};
+use script_bindings::codegen::GenericBindings::CharacterDataBinding::CharacterDataMethods;
+use script_bindings::root::Dom;
 use style::attr::AttrValue;
 use stylo_dom::ElementState;
 
@@ -41,80 +44,45 @@ use crate::dom::node::{
     BindContext, ChildrenMutation, CloneChildrenFlag, Node, NodeDamage, NodeTraits, UnbindContext,
 };
 use crate::dom::nodelist::NodeList;
+use crate::dom::text::Text;
 use crate::dom::textcontrol::{TextControlElement, TextControlSelection};
-use crate::dom::types::FocusEvent;
+use crate::dom::types::{CharacterData, FocusEvent, MouseEvent};
 use crate::dom::validation::{Validatable, is_barred_by_datalist_ancestor};
 use crate::dom::validitystate::{ValidationFlags, ValidityState};
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::script_runtime::CanGc;
-use crate::textinput::{
-    ClipboardEventFlags, IsComposing, KeyReaction, SelectionDirection, TextInput,
-};
+use crate::textinput::{ClipboardEventFlags, IsComposing, KeyReaction, Lines, TextInput};
 
 #[dom_struct]
 pub(crate) struct HTMLTextAreaElement {
     htmlelement: HTMLElement,
     #[no_trace]
     textinput: DomRefCell<TextInput<EmbedderClipboardProvider>>,
-    placeholder: DomRefCell<String>,
+    placeholder: RefCell<String>,
     // https://html.spec.whatwg.org/multipage/#concept-textarea-dirty
     value_dirty: Cell<bool>,
     form_owner: MutNullableDom<HTMLFormElement>,
     labels_node_list: MutNullableDom<NodeList>,
     validity_state: MutNullableDom<ValidityState>,
+    /// A DOM [`Text`] node that is the stored in the root of this [`HTMLTextArea`]'s
+    /// shadow tree. This how content from the text area is exposed to layout.
+    shadow_node: DomRefCell<Option<Dom<Text>>>,
+    /// A [`SharedSelection`] that is shared with layout. This can be updated dyanmnically
+    /// and layout should reflect the new value after a display list update.
+    #[no_trace]
+    #[conditional_malloc_size_of]
+    shared_selection: SharedSelection,
 }
 
 pub(crate) trait LayoutHTMLTextAreaElementHelpers {
-    fn value_for_layout(self) -> String;
-    fn selection_for_layout(self) -> Option<Range<usize>>;
+    fn selection_for_layout(self) -> SharedSelection;
     fn get_cols(self) -> u32;
     fn get_rows(self) -> u32;
 }
 
-#[expect(unsafe_code)]
-impl<'dom> LayoutDom<'dom, HTMLTextAreaElement> {
-    fn textinput_content(self) -> DOMString {
-        unsafe {
-            self.unsafe_get()
-                .textinput
-                .borrow_for_layout()
-                .get_content()
-        }
-    }
-
-    fn textinput_sorted_selection_offsets_range(self) -> Range<Utf8CodeUnitLength> {
-        unsafe {
-            self.unsafe_get()
-                .textinput
-                .borrow_for_layout()
-                .sorted_selection_offsets_range()
-        }
-    }
-
-    fn placeholder(self) -> &'dom str {
-        unsafe { self.unsafe_get().placeholder.borrow_for_layout() }
-    }
-}
-
 impl LayoutHTMLTextAreaElementHelpers for LayoutDom<'_, HTMLTextAreaElement> {
-    fn value_for_layout(self) -> String {
-        let text = self.textinput_content();
-        if text.is_empty() {
-            // FIXME(nox): Would be cool to not allocate a new string if the
-            // placeholder is single line, but that's an unimportant detail.
-            self.placeholder().replace("\r\n", "\n").replace('\r', "\n")
-        } else {
-            text.into()
-        }
-    }
-
-    fn selection_for_layout(self) -> Option<Range<usize>> {
-        if !self.upcast::<Element>().focus_state() {
-            return None;
-        }
-        Some(Utf8CodeUnitLength::unwrap_range(
-            self.textinput_sorted_selection_offsets_range(),
-        ))
+    fn selection_for_layout(self) -> SharedSelection {
+        self.unsafe_get().shared_selection.clone()
     }
 
     fn get_cols(self) -> u32 {
@@ -157,7 +125,7 @@ impl HTMLTextAreaElement {
                 prefix,
                 document,
             ),
-            placeholder: DomRefCell::new(String::new()),
+            placeholder: Default::default(),
             textinput: DomRefCell::new(TextInput::new(
                 Lines::Multiple,
                 DOMString::new(),
@@ -165,18 +133,16 @@ impl HTMLTextAreaElement {
                     embedder_sender,
                     webview_id: document.webview_id(),
                 },
-                None,
-                None,
-                SelectionDirection::None,
             )),
             value_dirty: Cell::new(false),
             form_owner: Default::default(),
             labels_node_list: Default::default(),
             validity_state: Default::default(),
+            shadow_node: Default::default(),
+            shared_selection: Default::default(),
         }
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
@@ -199,13 +165,6 @@ impl HTMLTextAreaElement {
         HTMLInputElement::directionality_from_value(&value)
     }
 
-    fn update_placeholder_shown_state(&self) {
-        let has_placeholder = !self.placeholder.borrow().is_empty();
-        let has_value = !self.textinput.borrow().is_empty();
-        let el = self.upcast::<Element>();
-        el.set_placeholder_shown_state(has_placeholder && !has_value);
-    }
-
     // https://html.spec.whatwg.org/multipage/#concept-fe-mutable
     pub(crate) fn is_mutable(&self) -> bool {
         // https://html.spec.whatwg.org/multipage/#the-textarea-element%3Aconcept-fe-mutable
@@ -214,11 +173,6 @@ impl HTMLTextAreaElement {
     }
 
     fn handle_focus_event(&self, event: &FocusEvent) {
-        // The focus state can afect the selection (see `selection_for_layout()`),
-        // thus dirty the node so that it is laid out again.
-        // TODO: Selection changes shouldn't require a new layout.
-        self.upcast::<Node>().dirty(NodeDamage::ContentOrHeritage);
-
         let event_type = event.upcast::<Event>().type_();
         if *event_type == *"blur" {
             self.owner_document()
@@ -234,11 +188,86 @@ impl HTMLTextAreaElement {
                         text: self.Value().to_string(),
                         insertion_point: self.GetSelectionEnd(),
                         multiline: false,
+                        // We follow chromium's heuristic to show the virtual keyboard only if user had interacted before.
+                        allow_virtual_keyboard: self.owner_window().has_sticky_activation(),
                     }),
                     None,
                 );
         } else {
             unreachable!("Got unexpected FocusEvent {event_type:?}");
+        }
+
+        // Focus changes can activate or deactivate a selection.
+        self.maybe_update_shared_selection();
+    }
+
+    fn handle_text_content_changed(&self, can_gc: CanGc) {
+        self.validity_state(can_gc)
+            .perform_validation_and_update(ValidationFlags::all(), can_gc);
+
+        let textinput_content = self.textinput.borrow().get_content();
+        let element = self.upcast::<Element>();
+        let placeholder_shown =
+            textinput_content.is_empty() && !self.placeholder.borrow().is_empty();
+        element.set_placeholder_shown_state(placeholder_shown);
+
+        let shadow_root = element
+            .shadow_root()
+            .unwrap_or_else(|| element.attach_ua_shadow_root(true, can_gc));
+        if self.shadow_node.borrow().is_none() {
+            let shadow_node = Text::new(Default::default(), &shadow_root.owner_document(), can_gc);
+            Node::replace_all(Some(shadow_node.upcast()), shadow_root.upcast(), can_gc);
+            self.shadow_node
+                .borrow_mut()
+                .replace(shadow_node.as_traced());
+        }
+
+        let content = if placeholder_shown {
+            // FIXME(nox): Would be cool to not allocate a new string if the
+            // placeholder is single line, but that's an unimportant detail.
+            self.placeholder
+                .borrow()
+                .replace("\r\n", "\n")
+                .replace('\r', "\n")
+                .into()
+        } else if textinput_content.is_empty() {
+            // The addition of zero-width space here forces the text input to have an inline formatting
+            // context that might otherwise be trimmed if there's no text. This is important to ensure
+            // that the input element is at least as tall as the line gap of the caret:
+            // <https://drafts.csswg.org/css-ui/#element-with-default-preferred-size>.
+            "\u{200B}".into()
+        } else {
+            textinput_content
+        };
+
+        let shadow_node = self.shadow_node.borrow_mut();
+        let character_data = shadow_node
+            .as_ref()
+            .expect("Should have always created a node at this point.")
+            .upcast::<CharacterData>();
+        if character_data.Data() != content {
+            character_data.SetData(content);
+            self.maybe_update_shared_selection();
+        }
+    }
+
+    fn handle_mouse_event(&self, mouse_event: &MouseEvent) {
+        if mouse_event.upcast::<Event>().DefaultPrevented() {
+            return;
+        }
+
+        // Only respond to mouse events if we are displayed as text input or a password. If the
+        // placeholder is displayed, also don't do any interactive mouse event handling.
+        if self.textinput.borrow().is_empty() {
+            return;
+        }
+        let node = self.upcast();
+        if self
+            .textinput
+            .borrow_mut()
+            .handle_mouse_event(node, mouse_event)
+        {
+            self.maybe_update_shared_selection();
         }
     }
 }
@@ -252,8 +281,8 @@ impl TextControlElement for HTMLTextAreaElement {
         !self.textinput.borrow().get_content().is_empty()
     }
 
-    fn has_selection(&self) -> bool {
-        self.textinput.borrow().has_selection()
+    fn has_uncollapsed_selection(&self) -> bool {
+        self.textinput.borrow().has_uncollapsed_selection()
     }
 
     fn set_dirty_value_flag(&self, value: bool) {
@@ -262,7 +291,28 @@ impl TextControlElement for HTMLTextAreaElement {
 
     fn select_all(&self) {
         self.textinput.borrow_mut().select_all();
-        self.upcast::<Node>().dirty(NodeDamage::Other);
+        self.maybe_update_shared_selection();
+    }
+
+    fn maybe_update_shared_selection(&self) {
+        let offsets = self.textinput.borrow().sorted_selection_offsets_range();
+        let (start, end) = (offsets.start.0, offsets.end.0);
+        let range = TextByteRange::new(ByteIndex(start), ByteIndex(end));
+        let enabled = self.upcast::<Element>().focus_state();
+
+        let mut shared_selection = self.shared_selection.borrow_mut();
+        if range == shared_selection.range && enabled == shared_selection.enabled {
+            return;
+        }
+        *shared_selection = ScriptSelection {
+            range,
+            character_range: self
+                .textinput
+                .borrow()
+                .sorted_selection_character_offsets_range(),
+            enabled,
+        };
+        self.owner_window().layout().set_needs_new_display_list();
     }
 }
 
@@ -359,7 +409,7 @@ impl HTMLTextAreaElementMethods<crate::DomTypeHolder> for HTMLTextAreaElement {
         // if the element's dirty value flag is false, then the element's
         // raw value must be set to the value of the element's textContent IDL attribute
         if !self.value_dirty.get() {
-            self.reset();
+            self.reset(can_gc);
         }
     }
 
@@ -370,27 +420,23 @@ impl HTMLTextAreaElementMethods<crate::DomTypeHolder> for HTMLTextAreaElement {
 
     /// <https://html.spec.whatwg.org/multipage/#dom-textarea-value>
     fn SetValue(&self, value: DOMString, can_gc: CanGc) {
-        {
-            let mut textinput = self.textinput.borrow_mut();
+        // Step 1: Let oldAPIValue be this element's API value.
+        let old_api_value = self.Value();
 
-            // Step 1
-            let old_value = textinput.get_content();
+        // Step 2:  Set this element's raw value to the new value.
+        self.textinput.borrow_mut().set_content(value);
 
-            // Step 2
-            textinput.set_content(value);
+        // Step 3: Set this element's dirty value flag to true.
+        self.value_dirty.set(true);
 
-            // Step 3
-            self.value_dirty.set(true);
-
-            if old_value != textinput.get_content() {
-                // Step 4
-                textinput.clear_selection_to_end();
-            }
+        // Step 4: If the new API value is different from oldAPIValue, then move
+        // the text entry cursor position to the end of the text control,
+        // unselecting any selected text and resetting the selection direction to
+        // "none".
+        if old_api_value != self.Value() {
+            self.textinput.borrow_mut().clear_selection_to_end();
+            self.handle_text_content_changed(can_gc);
         }
-
-        self.validity_state(can_gc)
-            .perform_validation_and_update(ValidationFlags::all(), can_gc);
-        self.upcast::<Node>().dirty(NodeDamage::Other);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-textarea-textlength>
@@ -480,13 +526,13 @@ impl HTMLTextAreaElementMethods<crate::DomTypeHolder> for HTMLTextAreaElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-cva-checkvalidity>
-    fn CheckValidity(&self, can_gc: CanGc) -> bool {
-        self.check_validity(can_gc)
+    fn CheckValidity(&self, cx: &mut JSContext) -> bool {
+        self.check_validity(cx)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-cva-reportvalidity>
-    fn ReportValidity(&self, can_gc: CanGc) -> bool {
-        self.report_validity(can_gc)
+    fn ReportValidity(&self, cx: &mut JSContext) -> bool {
+        self.report_validity(cx)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-cva-validationmessage>
@@ -508,19 +554,19 @@ impl HTMLTextAreaElement {
         self.textinput.borrow_mut().set_content(DOMString::from(""));
     }
 
-    pub(crate) fn reset(&self) {
+    pub(crate) fn reset(&self, can_gc: CanGc) {
         // https://html.spec.whatwg.org/multipage/#the-textarea-element:concept-form-reset-control
-        let mut textinput = self.textinput.borrow_mut();
-        textinput.set_content(self.DefaultValue());
         self.value_dirty.set(false);
+        self.textinput.borrow_mut().set_content(self.DefaultValue());
+        self.handle_text_content_changed(can_gc);
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     fn selection(&self) -> TextControlSelection<'_, Self> {
         TextControlSelection::new(self, &self.textinput)
     }
 
-    fn handle_key_reaction(&self, action: KeyReaction, event: &Event) {
+    fn handle_key_reaction(&self, action: KeyReaction, event: &Event, can_gc: CanGc) {
         match action {
             KeyReaction::TriggerDefaultAction => (),
             KeyReaction::DispatchInput(text, is_composing, input_type) => {
@@ -533,12 +579,11 @@ impl HTMLTextAreaElement {
                     );
                 }
                 self.value_dirty.set(true);
-                self.update_placeholder_shown_state();
-                self.upcast::<Node>().dirty(NodeDamage::Other);
+                self.handle_text_content_changed(can_gc);
                 event.mark_as_handled();
             },
             KeyReaction::RedrawSelection => {
-                self.upcast::<Node>().dirty(NodeDamage::Other);
+                self.maybe_update_shared_selection();
                 event.mark_as_handled();
             },
             KeyReaction::Nothing => (),
@@ -609,7 +654,7 @@ impl VirtualMethods for HTMLTextAreaElement {
                         placeholder.push_str(attr.value().as_ref());
                     }
                 }
-                self.update_placeholder_shown_state();
+                self.handle_text_content_changed(can_gc);
             },
             local_name!("readonly") => {
                 let el = self.upcast::<Element>();
@@ -640,8 +685,7 @@ impl VirtualMethods for HTMLTextAreaElement {
         self.upcast::<Element>()
             .check_ancestors_disabled_state_for_form_control();
 
-        self.validity_state(can_gc)
-            .perform_validation_and_update(ValidationFlags::all(), can_gc);
+        self.handle_text_content_changed(can_gc);
     }
 
     fn parse_plain_attribute(&self, name: &LocalName, value: DOMString) -> AttrValue {
@@ -706,7 +750,7 @@ impl VirtualMethods for HTMLTextAreaElement {
             s.children_changed(mutation, can_gc);
         }
         if !self.value_dirty.get() {
-            self.reset();
+            self.reset(can_gc);
         }
     }
 
@@ -716,14 +760,14 @@ impl VirtualMethods for HTMLTextAreaElement {
             s.handle_event(event, can_gc);
         }
 
-        if event.type_() == atom!("click") && !event.DefaultPrevented() {
-            // TODO: set the editing position for text inputs
+        if let Some(mouse_event) = event.downcast::<MouseEvent>() {
+            self.handle_mouse_event(mouse_event);
         } else if event.type_() == atom!("keydown") && !event.DefaultPrevented() {
             if let Some(kevent) = event.downcast::<KeyboardEvent>() {
                 // This can't be inlined, as holding on to textinput.borrow_mut()
                 // during self.implicit_submission will cause a panic.
                 let action = self.textinput.borrow_mut().handle_keydown(kevent);
-                self.handle_key_reaction(action, event);
+                self.handle_key_reaction(action, event, can_gc);
             }
         } else if event.type_() == atom!("keypress") && !event.DefaultPrevented() {
             // keypress should be deprecated and replaced by beforeinput.
@@ -739,16 +783,17 @@ impl VirtualMethods for HTMLTextAreaElement {
                         .textinput
                         .borrow_mut()
                         .handle_compositionend(compositionevent);
-                    self.handle_key_reaction(action, event);
+                    self.handle_key_reaction(action, event, can_gc);
                     self.upcast::<Node>().dirty(NodeDamage::Other);
                 } else if event.type_() == atom!("compositionupdate") {
                     let action = self
                         .textinput
                         .borrow_mut()
                         .handle_compositionupdate(compositionevent);
-                    self.handle_key_reaction(action, event);
+                    self.handle_key_reaction(action, event, can_gc);
                     self.upcast::<Node>().dirty(NodeDamage::Other);
                 }
+                self.maybe_update_shared_selection();
                 event.mark_as_handled();
             }
         } else if let Some(clipboard_event) = event.downcast::<ClipboardEvent>() {
@@ -774,7 +819,7 @@ impl VirtualMethods for HTMLTextAreaElement {
                 );
             }
             if !flags.is_empty() {
-                self.upcast::<Node>().dirty(NodeDamage::ContentOrHeritage);
+                self.handle_text_content_changed(can_gc);
             }
         } else if let Some(event) = event.downcast::<FocusEvent>() {
             self.handle_focus_event(event);
@@ -788,7 +833,7 @@ impl VirtualMethods for HTMLTextAreaElement {
         self.super_type().unwrap().pop();
 
         // https://html.spec.whatwg.org/multipage/#the-textarea-element:stack-of-open-elements
-        self.reset();
+        self.reset(CanGc::note());
     }
 }
 

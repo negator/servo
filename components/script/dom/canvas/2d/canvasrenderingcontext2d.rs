@@ -2,12 +2,13 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use base::Epoch;
+use base::{Epoch, generic_channel};
 use canvas_traits::canvas::{Canvas2dMsg, CanvasId};
 use dom_struct::dom_struct;
 use euclid::default::Size2D;
-use ipc_channel::ipc;
+use js::context::JSContext;
 use pixels::Snapshot;
+use script_bindings::reflector::AssociatedMemory;
 use servo_url::ServoUrl;
 use webrender_api::ImageKey;
 
@@ -38,15 +39,15 @@ use crate::dom::textmetrics::TextMetrics;
 use crate::script_runtime::CanGc;
 
 // https://html.spec.whatwg.org/multipage/#canvasrenderingcontext2d
-#[dom_struct]
+#[dom_struct(associated_memory)]
 pub(crate) struct CanvasRenderingContext2D {
-    reflector_: Reflector,
+    reflector_: Reflector<AssociatedMemory>,
     canvas: HTMLCanvasElementOrOffscreenCanvas,
     canvas_state: CanvasState,
 }
 
 impl CanvasRenderingContext2D {
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     pub(crate) fn new_inherited(
         global: &GlobalScope,
         canvas: HTMLCanvasElementOrOffscreenCanvas,
@@ -111,6 +112,8 @@ impl CanvasContext for CanvasRenderingContext2D {
     }
 
     fn resize(&self) {
+        self.reflector_
+            .update_memory_size(self, self.size().cast::<usize>().area());
         self.canvas_state.set_bitmap_dimensions(self.size().cast());
     }
 
@@ -123,7 +126,7 @@ impl CanvasContext for CanvasRenderingContext2D {
             return None;
         }
 
-        let (sender, receiver) = ipc::channel().unwrap();
+        let (sender, receiver) = generic_channel::channel().unwrap();
         self.canvas_state
             .send_canvas_2d_msg(Canvas2dMsg::GetImageData(None, sender));
         Some(receiver.recv().unwrap().to_owned())
@@ -161,7 +164,6 @@ impl CanvasRenderingContext2DMethods<crate::DomTypeHolder> for CanvasRenderingCo
         self.canvas_state.save()
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-restore>
     fn Restore(&self) {
         self.canvas_state.restore()
@@ -193,8 +195,8 @@ impl CanvasRenderingContext2DMethods<crate::DomTypeHolder> for CanvasRenderingCo
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-gettransform>
-    fn GetTransform(&self, can_gc: CanGc) -> DomRoot<DOMMatrix> {
-        self.canvas_state.get_transform(&self.global(), can_gc)
+    fn GetTransform(&self, cx: &mut JSContext) -> DomRoot<DOMMatrix> {
+        self.canvas_state.get_transform(&self.global(), cx)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-settransform>
@@ -334,13 +336,9 @@ impl CanvasRenderingContext2DMethods<crate::DomTypeHolder> for CanvasRenderingCo
     }
 
     /// <https://html.spec.whatwg.org/multipage/#textmetrics>
-    fn MeasureText(&self, text: DOMString, can_gc: CanGc) -> DomRoot<TextMetrics> {
-        self.canvas_state.measure_text(
-            &self.global(),
-            self.canvas.canvas().as_deref(),
-            text,
-            can_gc,
-        )
+    fn MeasureText(&self, cx: &mut JSContext, text: DOMString) -> DomRoot<TextMetrics> {
+        self.canvas_state
+            .measure_text(&self.global(), self.canvas.canvas().as_deref(), text, cx)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-font>
@@ -576,40 +574,40 @@ impl CanvasRenderingContext2DMethods<crate::DomTypeHolder> for CanvasRenderingCo
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-createlineargradient>
     fn CreateLinearGradient(
         &self,
+        cx: &mut JSContext,
         x0: Finite<f64>,
         y0: Finite<f64>,
         x1: Finite<f64>,
         y1: Finite<f64>,
-        can_gc: CanGc,
     ) -> DomRoot<CanvasGradient> {
         self.canvas_state
-            .create_linear_gradient(&self.global(), x0, y0, x1, y1, can_gc)
+            .create_linear_gradient(&self.global(), cx, x0, y0, x1, y1)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-createradialgradient>
     fn CreateRadialGradient(
         &self,
+        cx: &mut JSContext,
         x0: Finite<f64>,
         y0: Finite<f64>,
         r0: Finite<f64>,
         x1: Finite<f64>,
         y1: Finite<f64>,
         r1: Finite<f64>,
-        can_gc: CanGc,
     ) -> Fallible<DomRoot<CanvasGradient>> {
         self.canvas_state
-            .create_radial_gradient(&self.global(), x0, y0, r0, x1, y1, r1, can_gc)
+            .create_radial_gradient(&self.global(), cx, x0, y0, r0, x1, y1, r1)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-createpattern>
     fn CreatePattern(
         &self,
+        cx: &mut JSContext,
         image: CanvasImageSource,
         repetition: DOMString,
-        can_gc: CanGc,
     ) -> Fallible<Option<DomRoot<CanvasPattern>>> {
         self.canvas_state
-            .create_pattern(&self.global(), image, repetition, can_gc)
+            .create_pattern(&self.global(), cx, image, repetition)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-linewidth>

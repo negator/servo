@@ -17,7 +17,7 @@ use crate::PropagatedBoxTreeData;
 use crate::cell::ArcRefCell;
 use crate::construct_modern::{ModernContainerBuilder, ModernItemKind};
 use crate::context::LayoutContext;
-use crate::dom::LayoutBox;
+use crate::dom::{LayoutBox, WeakLayoutBox};
 use crate::dom_traversal::{NodeAndStyleInfo, NonReplacedContents};
 use crate::formatting_contexts::IndependentFormattingContext;
 use crate::fragment_tree::Fragment;
@@ -44,7 +44,7 @@ impl TaffyContainer {
         let children = items
             .into_iter()
             .map(|item| {
-                let box_ = match item.kind {
+                let taffy_item_box = match item.kind {
                     ModernItemKind::InFlow(independent_formatting_context) => {
                         ArcRefCell::new(TaffyItemBox::new(TaffyItemBoxInner::InFlowBox(
                             independent_formatting_context,
@@ -64,11 +64,8 @@ impl TaffyContainer {
                     },
                 };
 
-                if let Some(box_slot) = item.box_slot {
-                    box_slot.set(LayoutBox::TaffyItemBox(box_.clone()));
-                }
-
-                box_
+                item.box_slot.set(LayoutBox::TaffyItemBox(taffy_item_box.clone()));
+                taffy_item_box
             })
             .collect();
 
@@ -172,6 +169,18 @@ impl TaffyItemBox {
         match &self.taffy_level_box {
             TaffyItemBoxInner::InFlowBox(fc) => fc.is_replaced(),
             TaffyItemBoxInner::OutOfFlowAbsolutelyPositionedBox(_) => false,
+        }
+    }
+
+    pub(crate) fn attached_to_tree(&self, layout_box: WeakLayoutBox) {
+        match &self.taffy_level_box {
+            TaffyItemBoxInner::InFlowBox(formatting_context) => {
+                formatting_context.attached_to_tree(layout_box)
+            },
+            TaffyItemBoxInner::OutOfFlowAbsolutelyPositionedBox(positioned_box) => positioned_box
+                .borrow_mut()
+                .context
+                .attached_to_tree(layout_box),
         }
     }
 }

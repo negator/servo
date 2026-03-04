@@ -58,6 +58,15 @@ impl ResponseBody {
     }
 }
 
+/// <https://fetch.spec.whatwg.org/#response-redirect-taint>
+#[derive(Clone, Copy, Debug, Default, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub enum RedirectTaint {
+    #[default]
+    SameOrigin,
+    SameSite,
+    CrossSite,
+}
+
 /// [Cache state](https://fetch.spec.whatwg.org/#concept-response-cache-state)
 #[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub enum CacheState {
@@ -103,12 +112,14 @@ pub struct Response {
     )]
     #[ignore_malloc_size_of = "Defined in hyper"]
     pub headers: HeaderMap,
-    #[ignore_malloc_size_of = "Mutex heap size undefined"]
+    #[conditional_malloc_size_of]
     pub body: Arc<Mutex<ResponseBody>>,
     pub cache_state: CacheState,
     pub https_state: HttpsState,
     pub tls_security_info: Option<TlsSecurityInfo>,
     pub referrer: Option<ServoUrl>,
+    /// <https://fetch.spec.whatwg.org/#response-redirect-taint>
+    pub redirect_taint: RedirectTaint,
     pub referrer_policy: ReferrerPolicy,
     /// [CORS-exposed header-name list](https://fetch.spec.whatwg.org/#concept-response-cors-exposed-header-name-list)
     pub cors_exposed_header_name_list: Vec<String>,
@@ -120,10 +131,10 @@ pub struct Response {
     /// whether or not to try to return the internal_response when asked for actual_response
     pub return_internal: bool,
     /// <https://fetch.spec.whatwg.org/#concept-response-aborted>
-    #[ignore_malloc_size_of = "AtomicBool heap size undefined"]
+    #[conditional_malloc_size_of]
     pub aborted: Arc<AtomicBool>,
     /// track network metrics
-    #[ignore_malloc_size_of = "Mutex heap size undefined"]
+    #[conditional_malloc_size_of]
     pub resource_timing: Arc<Mutex<ResourceFetchTiming>>,
 
     /// <https://fetch.spec.whatwg.org/#concept-response-range-requested-flag>
@@ -152,6 +163,7 @@ impl Response {
             aborted: Arc::new(AtomicBool::new(false)),
             resource_timing: Arc::new(Mutex::new(resource_timing)),
             range_requested: false,
+            redirect_taint: Default::default(),
         }
     }
 
@@ -187,6 +199,7 @@ impl Response {
                 ResourceTimingType::Error,
             ))),
             range_requested: false,
+            redirect_taint: Default::default(),
         }
     }
 
@@ -203,6 +216,10 @@ impl Response {
             ResponseType::Error(ref e) => Some(e),
             _ => None,
         }
+    }
+
+    pub fn set_network_error(&mut self, network_error: NetworkError) {
+        self.response_type = ResponseType::Error(network_error);
     }
 
     pub fn actual_response(&self) -> &Response {

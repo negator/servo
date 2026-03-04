@@ -45,14 +45,15 @@ use crate::dom::event::Event;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::extendableevent::ExtendableEvent;
 use crate::dom::extendablemessageevent::ExtendableMessageEvent;
-use crate::dom::globalscope::{ErrorReporting, GlobalScope, RethrowErrors};
+use crate::dom::global_scope_script_execution::{ErrorReporting, RethrowErrors};
+use crate::dom::globalscope::GlobalScope;
 #[cfg(feature = "webgpu")]
 use crate::dom::webgpu::identityhub::IdentityHub;
 use crate::dom::worker::TrustedWorkerAddress;
 use crate::dom::workerglobalscope::WorkerGlobalScope;
 use crate::fetch::{CspViolationsProcessor, load_whole_resource};
 use crate::messaging::{CommonScriptMsg, ScriptEventLoopSender};
-use crate::realms::{AlreadyInRealm, InRealm, enter_realm};
+use crate::realms::{AlreadyInRealm, InRealm, enter_auto_realm, enter_realm};
 use crate::script_module::ScriptFetchOptions;
 use crate::script_runtime::{
     CanGc, IntroductionType, JSContext as SafeJSContext, Runtime, ThreadSafeJSContext,
@@ -95,18 +96,28 @@ impl QueuedTaskConversion for ServiceWorkerScriptMsg {
             ServiceWorkerScriptMsg::CommonWorker(WorkerScriptMsg::Common(script_msg)) => script_msg,
             _ => return None,
         };
-        let (category, boxed, pipeline_id, task_source) = match script_msg {
+        let (event_category, task, pipeline_id, task_source) = match script_msg {
             CommonScriptMsg::Task(category, boxed, pipeline_id, task_source) => {
                 (category, boxed, pipeline_id, task_source)
             },
             _ => return None,
         };
-        Some((None, category, boxed, pipeline_id, task_source))
+        Some(QueuedTask {
+            worker: None,
+            event_category,
+            task,
+            pipeline_id,
+            task_source,
+        })
     }
 
     fn from_queued_task(queued_task: QueuedTask) -> Self {
-        let (_worker, category, boxed, pipeline_id, task_source) = queued_task;
-        let script_msg = CommonScriptMsg::Task(category, boxed, pipeline_id, task_source);
+        let script_msg = CommonScriptMsg::Task(
+            queued_task.event_category,
+            queued_task.task,
+            queued_task.pipeline_id,
+            queued_task.task_source,
+        );
         ServiceWorkerScriptMsg::CommonWorker(WorkerScriptMsg::Common(script_msg))
     }
 
@@ -170,7 +181,6 @@ pub(crate) struct ServiceWorkerGlobalScope {
 
     /// A receiver of control messages,
     /// currently only used to signal shutdown.
-    #[ignore_malloc_size_of = "Channels are hard"]
     #[no_trace]
     control_receiver: Receiver<ServiceWorkerControlMsg>,
 }
@@ -270,6 +280,7 @@ impl ServiceWorkerGlobalScope {
         control_receiver: Receiver<ServiceWorkerControlMsg>,
         closing: Arc<AtomicBool>,
         font_context: Arc<FontContext>,
+        cx: &mut js::context::JSContext,
     ) -> DomRoot<ServiceWorkerGlobalScope> {
         let scope = Box::new(ServiceWorkerGlobalScope::new_inherited(
             init,
@@ -285,7 +296,7 @@ impl ServiceWorkerGlobalScope {
             closing,
             font_context,
         ));
-        ServiceWorkerGlobalScopeBinding::Wrap::<crate::DomTypeHolder>(GlobalScope::get_cx(), scope)
+        ServiceWorkerGlobalScopeBinding::Wrap::<crate::DomTypeHolder>(cx, scope)
     }
 
     /// <https://w3c.github.io/ServiceWorker/#run-service-worker-algorithm>
@@ -352,6 +363,7 @@ impl ServiceWorkerGlobalScope {
                     control_receiver,
                     closing,
                     font_context,
+                    cx,
                 );
 
                 let worker_scope = global.upcast::<WorkerGlobalScope>();
@@ -378,7 +390,7 @@ impl ServiceWorkerGlobalScope {
                     &resource_threads_sender,
                     global.upcast(),
                     &ServiceWorkerCspProcessor {},
-                    CanGc::from_cx(cx),
+                    cx,
                 ) {
                     Err(_) => {
                         error!("error loading script {}", serialized_worker_url);
@@ -395,12 +407,9 @@ impl ServiceWorkerGlobalScope {
 
                 {
                     // TODO: use AutoWorkerReset as in dedicated worker?
-                    let realm = enter_realm(worker_scope);
-                    define_all_exposed_interfaces(
-                        global_scope,
-                        InRealm::entered(&realm),
-                        CanGc::from_cx(cx),
-                    );
+                    let mut realm = enter_auto_realm(cx, worker_scope);
+                    let mut realm = realm.current_realm();
+                    define_all_exposed_interfaces(&mut realm, global_scope);
 
                     let script = global_scope.create_a_classic_script(
                         String::from_utf8_lossy(&source),
@@ -414,9 +423,13 @@ impl ServiceWorkerGlobalScope {
                     _ = global_scope.run_a_classic_script(
                         script,
                         RethrowErrors::No,
-                        CanGc::from_cx(cx),
+                        CanGc::from_cx(&mut realm),
                     );
-                    global.dispatch_activate(CanGc::from_cx(cx), InRealm::entered(&realm));
+                    let in_realm_proof = (&mut realm).into();
+                    global.dispatch_activate(
+                        CanGc::from_cx(&mut realm),
+                        InRealm::Already(&in_realm_proof),
+                    );
                 }
 
                 let reporter_name = format!("service-worker-reporter-{}", random::<u64>());
@@ -446,10 +459,11 @@ impl ServiceWorkerGlobalScope {
         match msg {
             MixedMessage::Devtools(msg) => match msg {
                 DevtoolScriptControlMsg::EvaluateJS(_pipe_id, string, sender) => {
-                    devtools::handle_evaluate_js(self.upcast(), string, sender, CanGc::from_cx(cx))
+                    devtools::handle_evaluate_js(self.upcast(), string, sender, cx)
                 },
-                DevtoolScriptControlMsg::WantsLiveNotifications(_pipe_id, bool_val) => {
-                    devtools::handle_wants_live_notifications(self.upcast(), bool_val)
+                DevtoolScriptControlMsg::WantsLiveNotifications(_pipe_id, wants_updates) => {
+                    self.upcast::<GlobalScope>()
+                        .set_devtools_wants_updates(wants_updates);
                 },
                 _ => debug!("got an unusable devtools control message inside the worker!"),
             },

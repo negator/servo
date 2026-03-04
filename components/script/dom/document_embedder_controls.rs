@@ -62,7 +62,7 @@ impl ControlElement {
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
-#[cfg_attr(crown, allow(crown::unrooted_must_root))]
+#[cfg_attr(crown, expect(crown::unrooted_must_root))]
 pub(crate) struct DocumentEmbedderControls {
     /// The [`Window`] element for this [`DocumentUserInterfaceElements`].
     window: Dom<Window>,
@@ -236,6 +236,24 @@ impl DocumentEmbedderControls {
     }
 
     pub(crate) fn show_context_menu(&self, hit_test_result: &HitTestResult) {
+        {
+            let mut visible_elements = self.visible_elements.borrow_mut();
+            visible_elements.retain(|index, control_element| {
+                if matches!(control_element, ControlElement::ContextMenu(..)) {
+                    let id = EmbedderControlId {
+                        webview_id: self.window.webview_id(),
+                        pipeline_id: self.window.pipeline_id(),
+                        index: index.0,
+                    };
+                    self.window
+                        .send_to_embedder(EmbedderMsg::HideEmbedderControl(id));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+
         let mut anchor_element = None;
         let mut image_element = None;
         let mut text_input_element = None;
@@ -309,7 +327,7 @@ impl DocumentEmbedderControls {
         }
 
         if let Some(text_input_element) = &text_input_element {
-            let has_selection = text_input_element.has_selection();
+            let has_selection = text_input_element.has_uncollapsed_selection();
 
             info.flags
                 .insert(ContextMenuElementInformationFlags::EditableText);
@@ -516,7 +534,7 @@ impl Node {
     fn as_text_input(&self) -> Option<DomRoot<Element>> {
         if let Some(input_element) = self
             .downcast::<HTMLInputElement>()
-            .filter(|input_element| input_element.is_textual_widget())
+            .filter(|input_element| input_element.renders_as_text_input_widget())
         {
             return Some(DomRoot::from_ref(input_element.upcast::<Element>()));
         }
@@ -527,12 +545,12 @@ impl Node {
 }
 
 impl Element {
-    fn has_selection(&self) -> bool {
+    fn has_uncollapsed_selection(&self) -> bool {
         self.downcast::<HTMLTextAreaElement>()
-            .map(TextControlElement::has_selection)
+            .map(TextControlElement::has_uncollapsed_selection)
             .or(self
                 .downcast::<HTMLInputElement>()
-                .map(TextControlElement::has_selection))
+                .map(TextControlElement::has_uncollapsed_selection))
             .unwrap_or_default()
     }
 

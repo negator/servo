@@ -35,7 +35,7 @@ enum ObserverType {
 #[dom_struct]
 pub(crate) struct PerformanceObserver {
     reflector_: Reflector,
-    #[ignore_malloc_size_of = "can't measure Rc values"]
+    #[conditional_malloc_size_of]
     callback: Rc<PerformanceObserverCallback>,
     entries: DomRefCell<DOMPerformanceEntryList>,
     observer_type: Cell<ObserverType>,
@@ -63,7 +63,7 @@ impl PerformanceObserver {
         Self::new_with_proto(global, None, callback, entries, can_gc)
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     fn new_with_proto(
         global: &GlobalScope,
         proto: Option<HandleObject>,

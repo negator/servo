@@ -4,11 +4,11 @@
 
 use std::str::FromStr;
 
-use compositing_traits::viewport_description::ViewportDescription;
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Prefix, local_name, ns};
 use js::rust::HandleObject;
 use net_traits::ReferrerPolicy;
+use paint_api::viewport_description::ViewportDescription;
 use servo_config::pref;
 use style::str::HTML_SPACE_CHARACTERS;
 
@@ -42,7 +42,6 @@ impl HTMLMetaElement {
         }
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
@@ -164,11 +163,11 @@ impl HTMLMetaElement {
             return;
         }
 
-        // 2
+        // Step 2. Let input be the value of the element's content attribute.
         let content = self.Content();
-        // 1
+        // Step 1. If the meta element has no content attribute, or if that attribute's value is the empty string, then return.
         if !content.is_empty() {
-            // 3
+            // Step 3. Run the shared declarative refresh steps with the meta element's node document, input, and the meta element.
             self.owner_document()
                 .shared_declarative_refresh_steps(&content.as_bytes());
         }

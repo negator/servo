@@ -6,21 +6,21 @@
 //! Mediates interaction between the remote web console and equivalent functionality (object
 //! inspection, JS evaluation, autocompletion) in Servo.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::TcpStream;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use atomic_refcell::AtomicRefCell;
 use base::generic_channel::{self, GenericSender};
 use base::id::TEST_PIPELINE_ID;
-use devtools_traits::EvaluateJSReply::{
+use devtools_traits::EvaluateJSReplyValue::{
     ActorValue, BooleanValue, NullValue, NumberValue, StringValue, VoidValue,
 };
 use devtools_traits::{
-    CachedConsoleMessage, CachedConsoleMessageTypes, ConsoleClearMessage, ConsoleLog,
-    ConsoleMessage, DevtoolScriptControlMsg, PageError,
+    ConsoleArgument, ConsoleMessage, ConsoleMessageFields, DevtoolScriptControlMsg, PageError,
+    StackFrame, get_time_stamp,
 };
-use log::debug;
+use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 use serde_json::{self, Map, Number, Value};
 use uuid::Uuid;
@@ -33,42 +33,181 @@ use crate::protocol::{ClientRequest, JsonPacketStream};
 use crate::resource::{ResourceArrayType, ResourceAvailable};
 use crate::{EmptyReplyMsg, StreamId, UniqueId};
 
-trait EncodableConsoleMessage {
-    fn encode(&self) -> serde_json::Result<String>;
+#[derive(Clone, Serialize, MallocSizeOf)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DevtoolsConsoleMessage {
+    #[serde(flatten)]
+    fields: ConsoleMessageFields,
+    #[ignore_malloc_size_of = "Currently no way to have serde_json::Value"]
+    arguments: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stacktrace: Option<Vec<StackFrame>>,
+    // Not implemented in Servo
+    // inner_window_id
+    // source_id
 }
 
-impl EncodableConsoleMessage for CachedConsoleMessage {
-    fn encode(&self) -> serde_json::Result<String> {
-        match *self {
-            CachedConsoleMessage::PageError(ref a) => serde_json::to_string(a),
-            CachedConsoleMessage::ConsoleLog(ref a) => serde_json::to_string(a),
+impl DevtoolsConsoleMessage {
+    pub(crate) fn new(message: ConsoleMessage, registry: &ActorRegistry) -> Self {
+        Self {
+            fields: message.fields,
+            arguments: message
+                .arguments
+                .into_iter()
+                .map(|argument| console_argument_to_value(argument, registry))
+                .collect(),
+            stacktrace: message.stacktrace,
+        }
+    }
+}
+
+fn console_argument_to_value(argument: ConsoleArgument, registry: &ActorRegistry) -> Value {
+    match argument {
+        ConsoleArgument::String(value) => Value::String(value),
+        ConsoleArgument::Integer(value) => Value::Number(value.into()),
+        ConsoleArgument::Number(value) => {
+            Number::from_f64(value).map(Value::from).unwrap_or_default()
+        },
+        ConsoleArgument::Boolean(value) => Value::Bool(value),
+        ConsoleArgument::Object(object) => {
+            // Create a new actor for the object.
+            // These are currently never cleaned up, and we make no attempt at re-using the same actor
+            // if the same object is logged repeatedly.
+            let actor = ObjectActor::register(registry, None, object.class.clone());
+
+            #[derive(Serialize)]
+            struct PropertyDescriptor {
+                configurable: bool,
+                enumerable: bool,
+                writable: bool,
+                value: Value,
+            }
+
+            #[derive(Serialize)]
+            #[serde(rename_all = "camelCase")]
+            struct DevtoolsConsoleObjectArgument {
+                r#type: String,
+                actor: String,
+                class: String,
+                own_property_length: usize,
+                extensible: bool,
+                frozen: bool,
+                sealed: bool,
+                is_error: bool,
+                preview: DevtoolsConsoleObjectArgumentPreview,
+            }
+
+            #[derive(Serialize)]
+            #[serde(rename_all = "camelCase")]
+            struct DevtoolsConsoleObjectArgumentPreview {
+                kind: String,
+                own_properties: HashMap<String, PropertyDescriptor>,
+                own_properties_length: usize,
+            }
+
+            let own_properties: HashMap<String, PropertyDescriptor> = object
+                .own_properties
+                .into_iter()
+                .map(|property| {
+                    let property_descriptor = PropertyDescriptor {
+                        configurable: property.configurable,
+                        enumerable: property.enumerable,
+                        writable: property.writable,
+                        value: console_argument_to_value(property.value, registry),
+                    };
+
+                    (property.key, property_descriptor)
+                })
+                .collect();
+
+            let argument = DevtoolsConsoleObjectArgument {
+                r#type: "object".to_owned(),
+                actor,
+                class: object.class,
+                own_property_length: own_properties.len(),
+                extensible: true,
+                frozen: false,
+                sealed: false,
+                is_error: false,
+                preview: DevtoolsConsoleObjectArgumentPreview {
+                    kind: "Object".to_string(),
+                    own_properties_length: own_properties.len(),
+                    own_properties,
+                },
+            };
+
+            // to_value can fail if the implementation of Serialize fails or there are non-string map keys.
+            // Neither should be possible here
+            serde_json::to_value(argument).unwrap()
+        },
+    }
+}
+
+#[derive(Clone, Serialize, MallocSizeOf)]
+#[serde(rename_all = "camelCase")]
+struct DevtoolsPageError {
+    #[serde(flatten)]
+    page_error: PageError,
+    category: String,
+    error: bool,
+    warning: bool,
+    info: bool,
+    private: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stacktrace: Option<Vec<StackFrame>>,
+    // Not implemented in Servo
+    // inner_window_id
+    // source_id
+    // has_exception
+    // exception
+}
+
+impl From<PageError> for DevtoolsPageError {
+    fn from(page_error: PageError) -> Self {
+        Self {
+            page_error,
+            category: "script".to_string(),
+            error: true,
+            warning: false,
+            info: false,
+            private: false,
+            stacktrace: None,
+        }
+    }
+}
+#[derive(Clone, Serialize, MallocSizeOf)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PageErrorWrapper {
+    page_error: DevtoolsPageError,
+}
+
+impl From<PageError> for PageErrorWrapper {
+    fn from(page_error: PageError) -> Self {
+        Self {
+            page_error: page_error.into(),
+        }
+    }
+}
+
+#[derive(Clone, Serialize, MallocSizeOf)]
+#[serde(untagged)]
+pub(crate) enum ConsoleResource {
+    ConsoleMessage(DevtoolsConsoleMessage),
+    PageError(PageErrorWrapper),
+}
+
+impl ConsoleResource {
+    pub fn resource_type(&self) -> String {
+        match self {
+            ConsoleResource::ConsoleMessage(_) => "console-message".into(),
+            ConsoleResource::PageError(_) => "error-message".into(),
         }
     }
 }
 
 #[derive(Serialize)]
-struct StartedListenersTraits;
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct StartedListenersReply {
-    from: String,
-    native_console_api: bool,
-    started_listeners: Vec<String>,
-    traits: StartedListenersTraits,
-}
-
-#[derive(Serialize)]
-struct GetCachedMessagesReply {
-    from: String,
-    messages: Vec<Map<String, Value>>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct StopListenersReply {
-    from: String,
-    stopped_listeners: Vec<String>,
+pub struct ConsoleClearMessage {
+    pub level: String,
 }
 
 #[derive(Serialize)]
@@ -88,6 +227,7 @@ struct EvaluateJSReply {
     timestamp: u64,
     exception: Value,
     exception_message: Value,
+    has_exception: bool,
     helper_result: Value,
 }
 
@@ -104,6 +244,7 @@ struct EvaluateJSEvent {
     result_id: String,
     exception: Value,
     exception_message: Value,
+    has_exception: bool,
     helper_result: Value,
 }
 
@@ -120,43 +261,57 @@ struct SetPreferencesReply {
     updated: Vec<String>,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PageErrorWrapper {
-    page_error: PageError,
-}
-
+#[derive(MallocSizeOf)]
 pub(crate) enum Root {
     BrowsingContext(String),
     DedicatedWorker(String),
 }
 
+#[derive(MallocSizeOf)]
 pub(crate) struct ConsoleActor {
-    pub name: String,
-    pub root: Root,
-    pub cached_events: RefCell<HashMap<UniqueId, Vec<CachedConsoleMessage>>>,
+    name: String,
+    root: Root,
+    cached_events: AtomicRefCell<HashMap<UniqueId, Vec<ConsoleResource>>>,
+    /// Used to control whether to send resource array messages from
+    /// `handle_console_resource`. It starts being false, and it only gets
+    /// activated after the client requests `console-message` or `error-message`
+    /// resources for the first time. Otherwise we would be sending messages
+    /// before the client is ready to receive them.
+    client_ready_to_receive_messages: AtomicBool,
 }
 
 impl ConsoleActor {
-    fn script_chan<'a>(
-        &self,
-        registry: &'a ActorRegistry,
-    ) -> &'a GenericSender<DevtoolScriptControlMsg> {
+    pub fn new(name: String, root: Root) -> Self {
+        Self {
+            name,
+            root,
+            cached_events: Default::default(),
+            client_ready_to_receive_messages: false.into(),
+        }
+    }
+
+    fn script_chan(&self, registry: &ActorRegistry) -> GenericSender<DevtoolScriptControlMsg> {
         match &self.root {
-            Root::BrowsingContext(bc) => &registry.find::<BrowsingContextActor>(bc).script_chan,
-            Root::DedicatedWorker(worker) => &registry.find::<WorkerActor>(worker).script_chan,
+            Root::BrowsingContext(browsing_context) => registry
+                .find::<BrowsingContextActor>(browsing_context)
+                .script_chan
+                .clone(),
+            Root::DedicatedWorker(worker) => {
+                registry.find::<WorkerActor>(worker).script_chan.clone()
+            },
         }
     }
 
     fn current_unique_id(&self, registry: &ActorRegistry) -> UniqueId {
         match &self.root {
-            Root::BrowsingContext(bc) => UniqueId::Pipeline(
+            Root::BrowsingContext(browsing_context) => UniqueId::Pipeline(
                 registry
-                    .find::<BrowsingContextActor>(bc)
-                    .active_pipeline_id
-                    .get(),
+                    .find::<BrowsingContextActor>(browsing_context)
+                    .pipeline_id(),
             ),
-            Root::DedicatedWorker(w) => UniqueId::Worker(registry.find::<WorkerActor>(w).worker_id),
+            Root::DedicatedWorker(worker) => {
+                UniqueId::Worker(registry.find::<WorkerActor>(worker).worker_id)
+            },
         }
     }
 
@@ -166,6 +321,10 @@ impl ConsoleActor {
         msg: &Map<String, Value>,
     ) -> Result<EvaluateJSReply, ()> {
         let input = msg.get("text").unwrap().as_str().unwrap().to_owned();
+        let frame_actor_id = msg
+            .get("frameActor")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let (chan, port) = generic_channel::channel().unwrap();
         // FIXME: Redesign messages so we don't have to fake pipeline ids when
         //        communicating with workers.
@@ -174,15 +333,19 @@ impl ConsoleActor {
             UniqueId::Worker(_) => TEST_PIPELINE_ID,
         };
         self.script_chan(registry)
-            .send(DevtoolScriptControlMsg::EvaluateJS(
-                pipeline,
+            .send(DevtoolScriptControlMsg::Eval(
                 input.clone(),
+                pipeline,
+                frame_actor_id,
                 chan,
             ))
             .unwrap();
 
         // TODO: Extract conversion into protocol module or some other useful place
-        let result = match port.recv().map_err(|_| ())? {
+        let eval_result = port.recv().map_err(|_| ())?;
+        let has_exception = eval_result.has_exception;
+
+        let result = match eval_result.value {
             VoidValue => {
                 let mut m = Map::new();
                 m.insert("type".to_owned(), Value::String("undefined".to_owned()));
@@ -216,10 +379,9 @@ impl ConsoleActor {
                 }
             },
             StringValue(s) => Value::String(s),
-            ActorValue { class, uuid } => {
-                // TODO: Make initial ActorValue message include these properties?
+            ActorValue { class, uuid, name } => {
                 let mut m = Map::new();
-                let actor = ObjectActor::register(registry, uuid);
+                let actor = ObjectActor::register(registry, Some(uuid), class.clone());
 
                 m.insert("type".to_owned(), Value::String("object".to_owned()));
                 m.insert("class".to_owned(), Value::String(class));
@@ -227,29 +389,29 @@ impl ConsoleActor {
                 m.insert("extensible".to_owned(), Value::Bool(true));
                 m.insert("frozen".to_owned(), Value::Bool(false));
                 m.insert("sealed".to_owned(), Value::Bool(false));
+                if let Some(name) = name {
+                    m.insert("name".to_owned(), Value::String(name));
+                }
                 Value::Object(m)
             },
         };
 
-        // TODO: Catch and return exception values from JS evaluation
         let reply = EvaluateJSReply {
             from: self.name(),
             input,
             result,
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
+            timestamp: get_time_stamp(),
             exception: Value::Null,
             exception_message: Value::Null,
+            has_exception,
             helper_result: Value::Null,
         };
-        std::result::Result::Ok(reply)
+        Ok(reply)
     }
 
-    pub(crate) fn handle_page_error(
+    pub(crate) fn handle_console_resource(
         &self,
-        page_error: PageError,
+        resource: ConsoleResource,
         id: UniqueId,
         registry: &ActorRegistry,
         stream: &mut TcpStream,
@@ -258,37 +420,19 @@ impl ConsoleActor {
             .borrow_mut()
             .entry(id.clone())
             .or_default()
-            .push(CachedConsoleMessage::PageError(page_error.clone()));
-        if id == self.current_unique_id(registry) {
-            if let Root::BrowsingContext(bc) = &self.root {
-                registry.find::<BrowsingContextActor>(bc).resource_array(
-                    PageErrorWrapper { page_error },
-                    "error-message".into(),
-                    ResourceArrayType::Available,
-                    stream,
-                )
-            };
+            .push(resource.clone());
+        if !self
+            .client_ready_to_receive_messages
+            .load(Ordering::Relaxed)
+        {
+            return;
         }
-    }
-
-    pub(crate) fn handle_console_api(
-        &self,
-        console_message: ConsoleMessage,
-        id: UniqueId,
-        registry: &ActorRegistry,
-        stream: &mut TcpStream,
-    ) {
-        let log_message: ConsoleLog = console_message.into();
-        self.cached_events
-            .borrow_mut()
-            .entry(id.clone())
-            .or_default()
-            .push(CachedConsoleMessage::ConsoleLog(log_message.clone()));
+        let resource_type = resource.resource_type();
         if id == self.current_unique_id(registry) {
             if let Root::BrowsingContext(bc) = &self.root {
                 registry.find::<BrowsingContextActor>(bc).resource_array(
-                    log_message,
-                    "console-message".into(),
+                    resource,
+                    resource_type,
                     ResourceArrayType::Available,
                     stream,
                 )
@@ -315,6 +459,28 @@ impl ConsoleActor {
             };
         }
     }
+
+    pub(crate) fn get_cached_messages(
+        &self,
+        registry: &ActorRegistry,
+        resource: &str,
+    ) -> Vec<ConsoleResource> {
+        let id = self.current_unique_id(registry);
+        let cached_events = self.cached_events.borrow();
+        let Some(events) = cached_events.get(&id) else {
+            return vec![];
+        };
+        events
+            .iter()
+            .filter(|event| event.resource_type() == resource)
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn received_first_message_from_client(&self) {
+        self.client_ready_to_receive_messages
+            .store(true, Ordering::Relaxed);
+    }
 }
 
 impl Actor for ConsoleActor {
@@ -331,95 +497,11 @@ impl Actor for ConsoleActor {
         _id: StreamId,
     ) -> Result<(), ActorError> {
         match msg_type {
-            "clearMessagesCache" => {
+            "clearMessagesCacheAsync" => {
                 self.cached_events
                     .borrow_mut()
                     .remove(&self.current_unique_id(registry));
-                // FIXME: need to send a reply here!
-                return Err(ActorError::UnrecognizedPacketType);
-            },
-
-            "getCachedMessages" => {
-                let str_types = msg
-                    .get("messageTypes")
-                    .unwrap()
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|json_type| json_type.as_str().unwrap());
-                let mut message_types = CachedConsoleMessageTypes::empty();
-                for str_type in str_types {
-                    match str_type {
-                        "PageError" => message_types.insert(CachedConsoleMessageTypes::PAGE_ERROR),
-                        "ConsoleAPI" => {
-                            message_types.insert(CachedConsoleMessageTypes::CONSOLE_API)
-                        },
-                        s => debug!("unrecognized message type requested: \"{}\"", s),
-                    };
-                }
-                let mut messages = vec![];
-                for event in self
-                    .cached_events
-                    .borrow()
-                    .get(&self.current_unique_id(registry))
-                    .unwrap_or(&vec![])
-                    .iter()
-                {
-                    let include = match event {
-                        CachedConsoleMessage::PageError(_)
-                            if message_types.contains(CachedConsoleMessageTypes::PAGE_ERROR) =>
-                        {
-                            true
-                        },
-                        CachedConsoleMessage::ConsoleLog(_)
-                            if message_types.contains(CachedConsoleMessageTypes::CONSOLE_API) =>
-                        {
-                            true
-                        },
-                        _ => false,
-                    };
-                    if include {
-                        let json_string = event.encode().unwrap();
-                        let json = serde_json::from_str::<Value>(&json_string).unwrap();
-                        messages.push(json.as_object().unwrap().to_owned())
-                    }
-                }
-
-                let msg = GetCachedMessagesReply {
-                    from: self.name(),
-                    messages,
-                };
-                request.reply_final(&msg)?
-            },
-
-            "startListeners" => {
-                // TODO: actually implement listener filters that support starting/stopping
-                let listeners = msg.get("listeners").unwrap().as_array().unwrap().to_owned();
-                let msg = StartedListenersReply {
-                    from: self.name(),
-                    native_console_api: true,
-                    started_listeners: listeners
-                        .into_iter()
-                        .map(|s| s.as_str().unwrap().to_owned())
-                        .collect(),
-                    traits: StartedListenersTraits,
-                };
-                request.reply_final(&msg)?
-            },
-
-            "stopListeners" => {
-                // TODO: actually implement listener filters that support starting/stopping
-                let msg = StopListenersReply {
-                    from: self.name(),
-                    stopped_listeners: msg
-                        .get("listeners")
-                        .unwrap()
-                        .as_array()
-                        .unwrap_or(&vec![])
-                        .iter()
-                        .map(|listener| listener.as_str().unwrap().to_owned())
-                        .collect(),
-                };
+                let msg = EmptyReplyMsg { from: self.name() };
                 request.reply_final(&msg)?
             },
 
@@ -465,6 +547,7 @@ impl Actor for ConsoleActor {
                     result_id,
                     exception: reply.exception,
                     exception_message: reply.exception_message,
+                    has_exception: reply.has_exception,
                     helper_result: reply.helper_result,
                 };
                 // Send the data from evaluateJS along with a resultID
@@ -479,14 +562,9 @@ impl Actor for ConsoleActor {
                 request.reply_final(&msg)?
             },
 
-            "clearMessagesCacheAsync" => {
-                self.cached_events
-                    .borrow_mut()
-                    .remove(&self.current_unique_id(registry));
-                let msg = EmptyReplyMsg { from: self.name() };
-                request.reply_final(&msg)?
-            },
-
+            // NOTE: Do not handle `startListeners`, it is a legacy API.
+            // Instead, enable the resource in `WatcherActor::supported_resources`
+            // and handle the messages there.
             _ => return Err(ActorError::UnrecognizedPacketType),
         };
         Ok(())

@@ -12,6 +12,7 @@ use base::generic_channel::GenericSender;
 use base::id::{PipelineId, WebViewId};
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
+use servo_url::ImmutableOrigin;
 use url::Url;
 use uuid::Uuid;
 
@@ -135,6 +136,7 @@ pub struct InputMethodRequest {
     pub text: String,
     pub insertion_point: Option<u32>,
     pub multiline: bool,
+    pub allow_virtual_keyboard: bool,
 }
 
 /// Filter for file selection;
@@ -144,7 +146,7 @@ pub struct FilterPattern(pub String);
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct FilePickerRequest {
-    pub origin: String,
+    pub origin: ImmutableOrigin,
     pub current_paths: Vec<PathBuf>,
     pub filter_patterns: Vec<FilterPattern>,
     pub allow_select_multiple: bool,

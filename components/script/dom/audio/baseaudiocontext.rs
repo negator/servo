@@ -12,11 +12,12 @@ use base::id::PipelineId;
 use dom_struct::dom_struct;
 use js::rust::CustomAutoRooterGuard;
 use js::typedarray::ArrayBuffer;
+use script_bindings::cformat;
 use servo_media::audio::context::{
     AudioContext, AudioContextOptions, OfflineAudioContextOptions, ProcessingState,
     RealTimeAudioContextOptions,
 };
-use servo_media::audio::decoder::AudioDecoderCallbacks;
+use servo_media::audio::decoder::AudioDecoderCallbacksBuilder;
 use servo_media::audio::graph::NodeId;
 use servo_media::{ClientContextId, ServoMedia};
 use uuid::Uuid;
@@ -113,7 +114,6 @@ pub(crate) struct BaseAudioContext {
 }
 
 impl BaseAudioContext {
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub(crate) fn new_inherited(
         options: BaseAudioContextOptions,
         pipeline_id: PipelineId,
@@ -197,9 +197,8 @@ impl BaseAudioContext {
     /// does not take a list of promises to fulfill. Callers cannot just pop
     /// the front list off of `in_flight_resume_promises_queue` and later fulfill
     /// the promises because that would mean putting
-    /// `#[cfg_attr(crown, allow(crown::unrooted_must_root))]` on even more functions, potentially
+    /// `#[cfg_attr(crown, expect(crown::unrooted_must_root))]` on even more functions, potentially
     /// hiding actual safety bugs.
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn fulfill_in_flight_resume_promises<F>(&self, f: F)
     where
         F: FnOnce(),
@@ -233,7 +232,7 @@ impl BaseAudioContext {
         // Set the rendering thread state to 'running' and start
         // rendering the audio graph.
         match self.audio_context_impl.lock().unwrap().resume() {
-            Ok(()) => {
+            Some(()) => {
                 self.take_pending_resume_promises(Ok(()));
                 self.global().task_manager().dom_manipulation_task_source().queue(
                     task!(resume_success: move || {
@@ -250,9 +249,9 @@ impl BaseAudioContext {
                     })
                 );
             },
-            Err(()) => {
+            None => {
                 self.take_pending_resume_promises(Err(Error::Type(
-                    "Something went wrong".to_owned(),
+                    c"Something went wrong".to_owned(),
                 )));
                 self.global()
                     .task_manager()
@@ -509,7 +508,7 @@ impl BaseAudioContextMethods<crate::DomTypeHolder> for BaseAudioContext {
                 .dom_manipulation_task_source()
                 .to_sendable();
             let task_source_clone = task_source.clone();
-            let callbacks = AudioDecoderCallbacks::new()
+            let callbacks = AudioDecoderCallbacksBuilder::default()
                 .ready(move |channel_count| {
                     decoded_audio
                         .lock()
@@ -564,7 +563,7 @@ impl BaseAudioContextMethods<crate::DomTypeHolder> for BaseAudioContext {
                                 &DOMException::new(&this.global(), DOMErrorName::DataCloneError, CanGc::note()),
                                 ExceptionHandling::Report, CanGc::note());
                         }
-                        let error = format!("Audio decode error {:?}", error);
+                        let error = cformat!("Audio decode error {:?}", error);
                         resolver.promise.reject_error(Error::Type(error), CanGc::note());
                     }));
                 })

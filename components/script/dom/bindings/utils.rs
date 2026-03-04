@@ -14,7 +14,6 @@ use js::jsapi::{
 };
 use js::realm::CurrentRealm;
 use js::rust::{HandleObject, MutableHandleValue, get_object_class, is_dom_class};
-use script_bindings::conversions::SafeToJSValConvertible;
 use script_bindings::interfaces::{DomHelpers, Interface};
 use script_bindings::settings_stack::StackEntry;
 
@@ -60,7 +59,12 @@ pub(crate) fn to_frozen_array<T: ToJSValConvertible>(
     mut rval: MutableHandleValue,
     can_gc: CanGc,
 ) {
-    convertibles.safe_to_jsval(cx, rval.reborrow(), can_gc);
+    script_bindings::conversions::SafeToJSValConvertible::safe_to_jsval(
+        convertibles,
+        cx,
+        rval.reborrow(),
+        can_gc,
+    );
 
     rooted!(in(*cx) let obj = rval.to_object());
     unsafe { JS_FreezeObject(*cx, RawHandleObject::from(obj.handle())) };
@@ -133,12 +137,7 @@ pub(crate) const DOM_CALLBACKS: DOMCallbacks = DOMCallbacks {
 
 /// Eagerly define all relevant WebIDL interface constructors on the
 /// provided global object.
-pub(crate) fn define_all_exposed_interfaces(
-    global: &GlobalScope,
-    _in_realm: InRealm,
-    _can_gc: CanGc,
-) {
-    let cx = GlobalScope::get_cx();
+pub(crate) fn define_all_exposed_interfaces(cx: &mut CurrentRealm, global: &GlobalScope) {
     for (_, interface) in &InterfaceObjectMap::MAP {
         (interface.define)(cx, global.reflector().get_jsobject());
     }
@@ -157,14 +156,13 @@ impl DomHelpers<crate::DomTypeHolder> for crate::DomTypeHolder {
     fn call_html_constructor<
         T: DerivedFrom<<crate::DomTypeHolder as DomTypes>::Element> + DomObject,
     >(
-        cx: SafeJSContext,
+        cx: &mut js::context::JSContext,
         args: &CallArgs,
         global: &<crate::DomTypeHolder as DomTypes>::GlobalScope,
         proto_id: PrototypeList::ID,
-        creator: unsafe fn(SafeJSContext, HandleObject, *mut ProtoOrIfaceArray),
-        can_gc: CanGc,
+        creator: unsafe fn(&mut js::context::JSContext, HandleObject, *mut ProtoOrIfaceArray),
     ) -> bool {
-        call_html_constructor::<T>(cx, args, global, proto_id, creator, can_gc)
+        call_html_constructor::<T>(cx, args, global, proto_id, creator)
     }
 
     fn settings_stack() -> &'static LocalKey<RefCell<Vec<StackEntry<crate::DomTypeHolder>>>> {

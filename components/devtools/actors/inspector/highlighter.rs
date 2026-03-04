@@ -8,14 +8,17 @@
 use base::generic_channel::GenericSender;
 use base::id::PipelineId;
 use devtools_traits::DevtoolScriptControlMsg;
+use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 use serde_json::{self, Map, Value};
 
 use crate::actor::{Actor, ActorEncode, ActorError, ActorRegistry};
+use crate::actors::inspector::InspectorActor;
 use crate::protocol::ClientRequest;
 use crate::{ActorMsg, EmptyReplyMsg, StreamId};
 
-pub struct HighlighterActor {
+#[derive(MallocSizeOf)]
+pub(crate) struct HighlighterActor {
     pub name: String,
     pub script_sender: GenericSender<DevtoolScriptControlMsg>,
     pub pipeline: PipelineId,
@@ -55,7 +58,7 @@ impl Actor for HighlighterActor {
                     return Err(ActorError::BadParameterType);
                 };
 
-                if node_actor_name.starts_with("inspector") {
+                if node_actor_name.starts_with(ActorRegistry::base_name::<InspectorActor>()) {
                     // TODO: For some reason, the client initially asks us to highlight
                     // the inspector? Investigate what this is supposed to mean.
                     let msg = ShowReply {

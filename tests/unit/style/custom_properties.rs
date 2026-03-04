@@ -11,6 +11,7 @@ use style::custom_properties::{
     ComputedCustomProperties, CustomPropertiesBuilder, DeferFontRelativeCustomPropertyResolution,
     Name, SpecifiedValue,
 };
+use style::dom::AttributeTracker;
 use style::font_metrics::FontMetrics;
 use style::media_queries::{Device, MediaType};
 use style::properties::style_structs::Font;
@@ -86,15 +87,18 @@ fn cascade(
         ContainerSizeQuery::none(),
     );
     let mut builder = CustomPropertiesBuilder::new(&stylist, &mut context);
+    let priority =
+        CascadePriority::new(CascadeLevel::same_tree_author_normal(), LayerOrder::root());
+    let mut attribute_tracker = AttributeTracker::new_dummy();
 
     for declaration in &declarations {
-        builder.cascade(
-            declaration,
-            CascadePriority::new(CascadeLevel::same_tree_author_normal(), LayerOrder::root()),
-        );
+        builder.cascade(declaration, priority, &mut attribute_tracker);
     }
 
-    builder.build(DeferFontRelativeCustomPropertyResolution::No);
+    builder.build(
+        DeferFontRelativeCustomPropertyResolution::No,
+        &mut attribute_tracker,
+    );
     context.builder.custom_properties
 }
 

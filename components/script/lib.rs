@@ -46,11 +46,11 @@ pub mod layout_dom;
 pub(crate) mod messaging;
 mod microtask;
 pub(crate) mod mime;
+mod module_loading;
 mod navigation;
 mod network_listener;
 mod realms;
 mod routed_promise;
-#[expect(dead_code)]
 mod script_module;
 mod script_mutation_observers;
 pub(crate) mod script_runtime;
@@ -86,5 +86,7 @@ pub(crate) use crate::dom::bindings::codegen::DomTypeHolder::DomTypeHolder;
 // Since they are used in derive macros,
 // it is useful that they are accessible at the root of the crate.
 pub(crate) use crate::dom::bindings::inheritance::HasParent;
-pub(crate) use crate::dom::bindings::reflector::{DomObject, MutDomObject, Reflector};
+pub(crate) use crate::dom::bindings::reflector::{
+    AssociatedMemory, DomObject, MutDomObject, Reflector,
+};
 pub(crate) use crate::dom::bindings::trace::{CustomTraceable, JSTraceable};

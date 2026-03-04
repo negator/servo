@@ -8,7 +8,6 @@ use std::borrow::Cow;
 use std::cell::{Cell, LazyCell, UnsafeCell};
 use std::default::Default;
 use std::f64::consts::PI;
-use std::ops::Range;
 use std::slice::from_ref;
 use std::{cmp, fmt, iter};
 
@@ -18,16 +17,18 @@ use bitflags::bitflags;
 use devtools_traits::NodeInfo;
 use dom_struct::dom_struct;
 use embedder_traits::UntrustedNodeAddress;
-use euclid::Point2D;
-use euclid::default::{Rect, Size2D};
+use euclid::default::Size2D;
+use euclid::{Point2D, Rect};
 use html5ever::serialize::HtmlSerializer;
 use html5ever::{Namespace, Prefix, QualName, ns, serialize as html_serialize};
 use js::jsapi::JSObject;
 use js::rust::HandleObject;
 use keyboard_types::Modifiers;
+use layout_api::wrapper_traits::SharedSelection;
 use layout_api::{
-    BoxAreaType, GenericLayoutData, HTMLCanvasData, HTMLMediaData, LayoutElementType,
-    LayoutNodeType, PhysicalSides, QueryMsg, SVGElementData, StyleData, TrustedNodeAddress,
+    BoxAreaType, CSSPixelRectIterator, GenericLayoutData, HTMLCanvasData, HTMLMediaData,
+    LayoutElementType, LayoutNodeType, PhysicalSides, QueryMsg, SVGElementData, StyleData,
+    TrustedNodeAddress, with_layout_state,
 };
 use libc::{self, c_void, uintptr_t};
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
@@ -35,22 +36,18 @@ use net_traits::image_cache::Image;
 use pixels::ImageMetadata;
 use script_bindings::codegen::InheritTypes::DocumentFragmentTypeId;
 use script_traits::DocumentActivity;
-use selectors::bloom::BloomFilter;
-use selectors::matching::{
-    MatchingContext, MatchingForInvalidation, MatchingMode, NeedsSelectorFlags,
-    matches_selector_list,
-};
-use selectors::parser::SelectorList;
-use servo_arc::Arc;
+use servo_arc::Arc as ServoArc;
 use servo_config::pref;
 use servo_url::ServoUrl;
 use smallvec::SmallVec;
 use style::attr::AttrValue;
 use style::context::QuirksMode;
 use style::dom::OpaqueNode;
+use style::dom_apis::{QueryAll, QueryFirst};
 use style::properties::ComputedValues;
-use style::selector_parser::{PseudoElement, SelectorImpl, SelectorParser};
-use style::stylesheets::{Stylesheet, UrlExtraData};
+use style::selector_parser::PseudoElement;
+use style::stylesheets::Stylesheet;
+use style_traits::CSSPixel;
 use uuid::Uuid;
 use xml5ever::{local_name, serialize as xml_serialize};
 
@@ -65,6 +62,7 @@ use crate::dom::bindings::codegen::Bindings::CharacterDataBinding::CharacterData
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::DocumentMethods;
 use crate::dom::bindings::codegen::Bindings::ElementBinding::ElementMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLCollectionBinding::HTMLCollectionMethods;
+use crate::dom::bindings::codegen::Bindings::HTMLElementBinding::HTMLElementMethods;
 use crate::dom::bindings::codegen::Bindings::NodeBinding::{
     GetRootNodeOptions, NodeConstants, NodeMethods,
 };
@@ -96,7 +94,7 @@ use crate::dom::document::{Document, DocumentSource, HasBrowsingContext, IsHTMLD
 use crate::dom::documentfragment::DocumentFragment;
 use crate::dom::documenttype::DocumentType;
 use crate::dom::element::{
-    AttributeMutationReason, CustomElementCreationMode, Element, ElementCreator, SelectorWrapper,
+    AttributeMutationReason, CustomElementCreationMode, Element, ElementCreator,
 };
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
@@ -106,9 +104,7 @@ use crate::dom::html::htmlcollection::HTMLCollection;
 use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::html::htmliframeelement::{HTMLIFrameElement, HTMLIFrameElementLayoutMethods};
 use crate::dom::html::htmlimageelement::{HTMLImageElement, LayoutHTMLImageElementHelpers};
-use crate::dom::html::htmlinputelement::{
-    HTMLInputElement, InputType, LayoutHTMLInputElementHelpers,
-};
+use crate::dom::html::htmlinputelement::{HTMLInputElement, LayoutHTMLInputElementHelpers};
 use crate::dom::html::htmllinkelement::HTMLLinkElement;
 use crate::dom::html::htmlslotelement::{HTMLSlotElement, Slottable};
 use crate::dom::html::htmlstyleelement::HTMLStyleElement;
@@ -130,6 +126,7 @@ use crate::dom::text::Text;
 use crate::dom::types::KeyboardEvent;
 use crate::dom::virtualmethods::{VirtualMethods, vtable_for};
 use crate::dom::window::Window;
+use crate::layout_dom::ServoLayoutNode;
 use crate::script_runtime::CanGc;
 use crate::script_thread::ScriptThread;
 
@@ -262,6 +259,11 @@ enum SuppressObserver {
     Unsuppressed,
 }
 
+pub(crate) enum ForceSlottableNodeReconciliation {
+    Force,
+    Skip,
+}
+
 impl Node {
     /// Adds a new child to the end of this node's list of children.
     ///
@@ -339,26 +341,35 @@ impl Node {
         target: &Node,
         context_element: &Element,
         html: DOMString,
-        can_gc: CanGc,
+        cx: &mut js::context::JSContext,
     ) {
         // Step 1. Let newChildren be the result of the HTML fragment parsing algorithm.
-        let new_children = ServoParser::parse_html_fragment(context_element, html, true, can_gc);
+        let new_children = ServoParser::parse_html_fragment(context_element, html, true, cx);
 
         // Step 2. Let fragment be a new DocumentFragment whose node document is contextElement's node document.
 
         let context_document = context_element.owner_document();
-        let fragment = DocumentFragment::new(&context_document, can_gc);
+        let fragment = DocumentFragment::new(&context_document, CanGc::from_cx(cx));
 
         // Step 3. For each node in newChildren, append node to fragment.
         for child in new_children {
             fragment
                 .upcast::<Node>()
-                .AppendChild(&child, can_gc)
+                .AppendChild(&child, CanGc::from_cx(cx))
                 .unwrap();
         }
 
         // Step 4. Replace all with fragment within target.
-        Node::replace_all(Some(fragment.upcast()), target, can_gc);
+        Node::replace_all(Some(fragment.upcast()), target, CanGc::from_cx(cx));
+    }
+
+    /// Clear this [`Node`]'s layout data and also clear the layout data of all children.
+    /// Note that clears layout data from all non-flat tree descendants and flat tree
+    /// descendants.
+    pub(crate) fn remove_layout_boxes_from_subtree(&self) {
+        for node in self.traverse_preorder(ShadowIncluding::Yes) {
+            node.layout_data.borrow_mut().take();
+        }
     }
 
     pub(crate) fn clean_up_style_and_layout_data(&self) {
@@ -581,52 +592,6 @@ impl Node {
     }
 }
 
-pub(crate) struct QuerySelectorIterator {
-    selectors: SelectorList<SelectorImpl>,
-    iterator: TreeIterator,
-}
-
-impl QuerySelectorIterator {
-    fn new(iter: TreeIterator, selectors: SelectorList<SelectorImpl>) -> QuerySelectorIterator {
-        QuerySelectorIterator {
-            selectors,
-            iterator: iter,
-        }
-    }
-}
-
-impl Iterator for QuerySelectorIterator {
-    type Item = DomRoot<Node>;
-
-    fn next(&mut self) -> Option<DomRoot<Node>> {
-        let selectors = &self.selectors;
-
-        let (quirks_mode, filter) = match self.iterator.by_ref().peek() {
-            Some(node) => (node.owner_doc().quirks_mode(), BloomFilter::default()),
-            None => return None,
-        };
-
-        self.iterator.by_ref().find_map(|node| {
-            if let Some(element) = DomRoot::downcast(node) {
-                let mut nth_index_cache = Default::default();
-                let mut ctx = MatchingContext::new(
-                    MatchingMode::Normal,
-                    Some(&filter),
-                    &mut nth_index_cache,
-                    quirks_mode,
-                    NeedsSelectorFlags::No,
-                    MatchingForInvalidation::No,
-                );
-                if matches_selector_list(selectors, &SelectorWrapper::Borrowed(&element), &mut ctx)
-                {
-                    return Some(DomRoot::upcast(element));
-                }
-            }
-            None
-        })
-    }
-}
-
 impl Node {
     fn rare_data(&self) -> Ref<'_, Option<Box<NodeRareData>>> {
         self.rare_data.borrow()
@@ -671,7 +636,7 @@ impl Node {
     }
 
     /// Add a new mutation observer for a given node.
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     pub(crate) fn add_mutation_observer(&self, observer: RegisteredObserver) {
         self.ensure_rare_data().mutation_observers.push(observer);
     }
@@ -916,12 +881,16 @@ impl Node {
         })
     }
 
+    /// <https://dom.spec.whatwg.org/#concept-tree-inclusive-ancestor>
     pub(crate) fn is_inclusive_ancestor_of(&self, child: &Node) -> bool {
+        // > An inclusive ancestor is an object or one of its ancestors.
         self == child || self.is_ancestor_of(child)
     }
 
-    pub(crate) fn is_ancestor_of(&self, child: &Node) -> bool {
-        let mut current = &MutNullableDom::new(Some(child));
+    /// <https://dom.spec.whatwg.org/#concept-tree-ancestor>
+    pub(crate) fn is_ancestor_of(&self, possible_descendant: &Node) -> bool {
+        // > An object A is called an ancestor of an object B if and only if B is a descendant of A.
+        let mut current = &possible_descendant.parent_node;
         let mut done = false;
 
         while let Some(node) = current.if_is_some(|node| {
@@ -936,6 +905,19 @@ impl Node {
         done
     }
 
+    /// <https://dom.spec.whatwg.org/#concept-tree-host-including-inclusive-ancestor>
+    fn is_host_including_inclusive_ancestor(&self, child: &Node) -> bool {
+        // An object A is a host-including inclusive ancestor of an object B, if either A is an inclusive ancestor of B,
+        // or if B’s root has a non-null host and A is a host-including inclusive ancestor of B’s root’s host.
+        self.is_inclusive_ancestor_of(child) ||
+            child
+                .GetRootNode(&GetRootNodeOptions::empty())
+                .downcast::<DocumentFragment>()
+                .and_then(|fragment| fragment.host())
+                .is_some_and(|host| self.is_host_including_inclusive_ancestor(host.upcast()))
+    }
+
+    /// <https://dom.spec.whatwg.org/#concept-shadow-including-inclusive-ancestor>
     pub(crate) fn is_shadow_including_inclusive_ancestor_of(&self, node: &Node) -> bool {
         node.inclusive_ancestors(ShadowIncluding::Yes)
             .any(|ancestor| &*ancestor == self)
@@ -993,33 +975,33 @@ impl Node {
         self.owner_window().padding_query_without_reflow(self)
     }
 
-    pub(crate) fn content_box(&self) -> Option<Rect<Au>> {
+    pub(crate) fn content_box(&self) -> Option<Rect<Au, CSSPixel>> {
         self.owner_window()
             .box_area_query(self, BoxAreaType::Content, false)
     }
 
-    pub(crate) fn border_box(&self) -> Option<Rect<Au>> {
+    pub(crate) fn border_box(&self) -> Option<Rect<Au, CSSPixel>> {
         self.owner_window()
             .box_area_query(self, BoxAreaType::Border, false)
     }
 
-    pub(crate) fn padding_box(&self) -> Option<Rect<Au>> {
+    pub(crate) fn padding_box(&self) -> Option<Rect<Au, CSSPixel>> {
         self.owner_window()
             .box_area_query(self, BoxAreaType::Padding, false)
     }
 
-    pub(crate) fn border_boxes(&self) -> Vec<Rect<Au>> {
+    pub(crate) fn border_boxes(&self) -> CSSPixelRectIterator {
         self.owner_window()
             .box_areas_query(self, BoxAreaType::Border)
     }
 
-    pub(crate) fn client_rect(&self) -> Rect<i32> {
+    pub(crate) fn client_rect(&self) -> Rect<i32, CSSPixel> {
         self.owner_window().client_rect_query(self)
     }
 
     /// <https://drafts.csswg.org/cssom-view/#dom-element-scrollwidth>
     /// <https://drafts.csswg.org/cssom-view/#dom-element-scrollheight>
-    pub(crate) fn scroll_area(&self) -> Rect<i32> {
+    pub(crate) fn scroll_area(&self) -> Rect<i32, CSSPixel> {
         // "1. Let document be the element’s node document.""
         let document = self.owner_doc();
 
@@ -1031,7 +1013,7 @@ impl Node {
         // "3. Let viewport width/height be the width of the viewport excluding the width/height of the
         // scroll bar, if any, or zero if there is no viewport."
         let window = document.window();
-        let viewport = Size2D::new(window.InnerWidth(), window.InnerHeight());
+        let viewport = Size2D::new(window.InnerWidth(), window.InnerHeight()).cast_unit();
 
         let in_quirks_mode = document.quirks_mode() == QuirksMode::Quirks;
         let is_root = self.downcast::<Element>().is_some_and(|e| e.is_root());
@@ -1175,71 +1157,56 @@ impl Node {
     }
 
     /// <https://dom.spec.whatwg.org/#dom-parentnode-queryselector>
+    #[allow(unsafe_code)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub(crate) fn query_selector(
         &self,
         selectors: DOMString,
     ) -> Fallible<Option<DomRoot<Element>>> {
-        // Step 1.
-        let doc = self.owner_doc();
-        match SelectorParser::parse_author_origin_no_namespace(
-            &selectors.str(),
-            &UrlExtraData(doc.url().get_arc()),
-        ) {
-            // Step 2.
-            Err(_) => Err(Error::Syntax(None)),
-            // Step 3.
-            Ok(selectors) => {
-                let mut nth_index_cache = Default::default();
-                let filter = BloomFilter::default();
-                let mut ctx = MatchingContext::new(
-                    MatchingMode::Normal,
-                    Some(&filter),
-                    &mut nth_index_cache,
-                    doc.quirks_mode(),
-                    NeedsSelectorFlags::No,
-                    MatchingForInvalidation::No,
-                );
-                let mut descendants = self.traverse_preorder(ShadowIncluding::No);
-                // Skip the root of the tree.
-                assert!(&*descendants.next().unwrap() == self);
-                Ok(descendants.filter_map(DomRoot::downcast).find(|element| {
-                    matches_selector_list(&selectors, &SelectorWrapper::Borrowed(element), &mut ctx)
-                }))
-            },
-        }
-    }
+        // > The querySelector(selectors) method steps are to return the first result of running scope-match
+        // > a selectors string selectors against this, if the result is not an empty list; otherwise null.
+        let document_url = self.owner_document().url().get_arc();
 
-    /// <https://dom.spec.whatwg.org/#scope-match-a-selectors-string>
-    /// Get an iterator over all nodes which match a set of selectors
-    /// Be careful not to do anything which may manipulate the DOM tree
-    /// whilst iterating, otherwise the iterator may be invalidated.
-    pub(crate) fn query_selector_iter(
-        &self,
-        selectors: DOMString,
-    ) -> Fallible<QuerySelectorIterator> {
-        // Step 1.
-        let url = self.owner_doc().url();
-        match SelectorParser::parse_author_origin_no_namespace(
-            &selectors.str(),
-            &UrlExtraData(url.get_arc()),
-        ) {
-            // Step 2.
-            Err(_) => Err(Error::Syntax(None)),
-            // Step 3.
-            Ok(selectors) => {
-                let mut descendants = self.traverse_preorder(ShadowIncluding::No);
-                // Skip the root of the tree.
-                assert!(&*descendants.next().unwrap() == self);
-                Ok(QuerySelectorIterator::new(descendants, selectors))
-            },
-        }
+        // SAFETY: traced_node is unrooted, but we have a reference to "self" so it won't be freed.
+        let traced_node = Dom::from_ref(self);
+
+        let first_matching_element = with_layout_state(|| {
+            let layout_node = unsafe { traced_node.to_layout() };
+            ServoLayoutNode::from_layout_js(layout_node)
+                .scope_match_a_selectors_string::<QueryFirst>(document_url, &selectors.str())
+        })?;
+
+        Ok(first_matching_element
+            .map(|element| DomRoot::from_ref(unsafe { element.to_layout_js().as_ref() })))
     }
 
     /// <https://dom.spec.whatwg.org/#dom-parentnode-queryselectorall>
+    #[allow(unsafe_code)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub(crate) fn query_selector_all(&self, selectors: DOMString) -> Fallible<DomRoot<NodeList>> {
-        let window = self.owner_window();
-        let iter = self.query_selector_iter(selectors)?;
-        Ok(NodeList::new_simple_list(&window, iter, CanGc::note()))
+        // > The querySelectorAll(selectors) method steps are to return the static result of running scope-match
+        // > a selectors string selectors against this.
+        let document_url = self.owner_document().url().get_arc();
+
+        // SAFETY: traced_node is unrooted, but we have a reference to "self" so it won't be freed.
+        let traced_node = Dom::from_ref(self);
+        let matching_elements = with_layout_state(|| {
+            let layout_node = unsafe { traced_node.to_layout() };
+            ServoLayoutNode::from_layout_js(layout_node)
+                .scope_match_a_selectors_string::<QueryAll>(document_url, &selectors.str())
+        })?;
+        let iter = matching_elements
+            .into_iter()
+            .map(|element| DomRoot::from_ref(unsafe { element.to_layout_js().as_ref() }))
+            .map(DomRoot::upcast::<Node>);
+
+        // NodeList::new_simple_list immediately collects the iterator, so we're not leaking LayoutDom
+        // elements here.
+        Ok(NodeList::new_simple_list(
+            &self.owner_window(),
+            iter,
+            CanGc::note(),
+        ))
     }
 
     pub(crate) fn ancestors(&self) -> impl Iterator<Item = DomRoot<Node>> + use<> {
@@ -1319,6 +1286,17 @@ impl Node {
         if let Some(ref parent) = self.GetParentNode() {
             Node::remove(self, parent, SuppressObserver::Unsuppressed, can_gc);
         }
+    }
+
+    /// Returns the node's `unique_id` if it has been computed before and `None` otherwise.
+    pub(crate) fn unique_id_if_already_present(&self) -> Option<String> {
+        Ref::filter_map(self.rare_data(), |rare_data| {
+            rare_data
+                .as_ref()
+                .and_then(|rare_data| rare_data.unique_id.as_ref())
+        })
+        .ok()
+        .map(|unique_id| unique_id.borrow().simple().to_string())
     }
 
     pub(crate) fn unique_id(&self, pipeline: PipelineId) -> String {
@@ -1405,6 +1383,7 @@ impl Node {
                 .map(DocumentType::system_id)
                 .cloned()
                 .map(String::from),
+            has_event_listeners: self.upcast::<EventTarget>().has_handlers(),
         }
     }
 
@@ -1485,7 +1464,7 @@ impl Node {
         Ok(())
     }
 
-    pub(crate) fn get_stylesheet(&self) -> Option<Arc<Stylesheet>> {
+    pub(crate) fn get_stylesheet(&self) -> Option<ServoArc<Stylesheet>> {
         if let Some(node) = self.downcast::<HTMLStyleElement>() {
             node.get_stylesheet()
         } else if let Some(node) = self.downcast::<HTMLLinkElement>() {
@@ -1521,7 +1500,7 @@ impl Node {
         })
     }
 
-    pub(crate) fn style(&self) -> Option<Arc<ComputedValues>> {
+    pub(crate) fn style(&self) -> Option<ServoArc<ComputedValues>> {
         self.owner_window().layout_reflow(QueryMsg::StyleQuery);
         self.style_data
             .borrow()
@@ -1544,14 +1523,20 @@ impl Node {
     }
 
     /// <https://dom.spec.whatwg.org/#assign-slotables-for-a-tree>
-    pub(crate) fn assign_slottables_for_a_tree(&self) {
+    pub(crate) fn assign_slottables_for_a_tree(&self, force: ForceSlottableNodeReconciliation) {
         // NOTE: This method traverses all descendants of the node and is potentially very
         // expensive. If the node is neither a shadowroot nor a slot then assigning slottables
         // for it won't have any effect, so we take a fast path out.
+        // In the case of node removal, we need to force re-assignment of slottables
+        // even if the node is not a shadow root or slot, this allows us to clear assigned
+        // slots from any slottables that were assigned to slots in the removed subtree.
         let is_shadow_root_with_slots = self
             .downcast::<ShadowRoot>()
             .is_some_and(|shadow_root| shadow_root.has_slot_descendants());
-        if !is_shadow_root_with_slots && !self.is::<HTMLSlotElement>() {
+        if !is_shadow_root_with_slots &&
+            !self.is::<HTMLSlotElement>() &&
+            matches!(force, ForceSlottableNodeReconciliation::Skip)
+        {
             return;
         }
 
@@ -1643,6 +1628,57 @@ impl Node {
             .as_ref()
             .and_then(|rare_data| rare_data.implemented_pseudo_element)
     }
+
+    /// <https://w3c.github.io/editing/docs/execCommand/#editing-host-of>
+    pub(crate) fn editing_host_of(&self) -> Option<DomRoot<Node>> {
+        // > The editing host of node is null if node is neither editable nor an editing host;
+        // > node itself, if node is an editing host;
+        // > or the nearest ancestor of node that is an editing host, if node is editable.
+        for ancestor in self.inclusive_ancestors(ShadowIncluding::No) {
+            if ancestor.is_editing_host() {
+                return Some(ancestor);
+            }
+            if ancestor
+                .downcast::<HTMLElement>()
+                .is_some_and(|el| el.ContentEditable().str() == "false")
+            {
+                return None;
+            }
+        }
+        None
+    }
+
+    pub(crate) fn is_editable_or_editing_host(&self) -> bool {
+        self.editing_host_of().is_some()
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#editing-host>
+    pub(crate) fn is_editing_host(&self) -> bool {
+        self.downcast::<HTMLElement>()
+            .is_some_and(HTMLElement::is_editing_host)
+    }
+
+    /// <https://w3c.github.io/editing/docs/execCommand/#editable>
+    pub(crate) fn is_editable(&self) -> bool {
+        // > Something is editable if it is a node; it is not an editing host;
+        if self.is_editing_host() {
+            return false;
+        }
+        // > it does not have a contenteditable attribute set to the false state;
+        let html_element = self.downcast::<HTMLElement>();
+        if html_element.is_some_and(|el| el.ContentEditable().str() == "false") {
+            return false;
+        }
+        // > its parent is an editing host or editable;
+        let Some(parent) = self.GetParentNode() else {
+            return false;
+        };
+        if !parent.is_editable_or_editing_host() {
+            return false;
+        }
+        // > and either it is an HTML element, or it is an svg or math element, or it is not an Element and its parent is an HTML element.
+        html_element.is_some() || parent.downcast::<HTMLElement>().is_some()
+    }
 }
 
 /// Iterate through `nodes` until we find a `Node` that is not in `not_in`
@@ -1716,13 +1752,6 @@ pub(crate) trait LayoutNodeHelpers<'dom> {
     /// attempting to read or modify the opaque layout data of this node.
     unsafe fn clear_style_and_layout_data(self);
 
-    /// Whether this element is a `<input>` rendered as text or a `<textarea>`.
-    /// This is used for the rendering of text control element in the past
-    /// where the necessities is being handled within layout. With the current
-    /// implementation of Shadow DOM, we are able to move and expand this kind
-    /// of behavior in the previous pipelines (i.e. DOM, style traversal).
-    fn is_text_input(&self) -> bool;
-
     /// Whether this element serve as a container of editable text for a text input
     /// that is implemented as an UA widget.
     fn is_single_line_text_inner_editor(&self) -> bool;
@@ -1731,14 +1760,14 @@ pub(crate) trait LayoutNodeHelpers<'dom> {
     /// that is implemented as an UA widget.
     fn is_text_container_of_single_line_input(&self) -> bool;
     fn text_content(self) -> Cow<'dom, str>;
-    fn selection(self) -> Option<Range<usize>>;
+    fn selection(self) -> Option<SharedSelection>;
     fn image_url(self) -> Option<ServoUrl>;
     fn image_density(self) -> Option<f64>;
     fn image_data(self) -> Option<(Option<Image>, Option<ImageMetadata>)>;
     fn showing_broken_image_icon(self) -> bool;
     fn canvas_data(self) -> Option<HTMLCanvasData>;
     fn media_data(self) -> Option<HTMLMediaData>;
-    fn svg_data(self) -> Option<SVGElementData>;
+    fn svg_data(self) -> Option<SVGElementData<'dom>>;
     fn iframe_browsing_context_id(self) -> Option<BrowsingContextId>;
     fn iframe_pipeline_id(self) -> Option<PipelineId>;
     fn opaque(self) -> OpaqueNode;
@@ -1910,37 +1939,16 @@ impl<'dom> LayoutNodeHelpers<'dom> for LayoutDom<'dom, Node> {
         }
     }
 
-    /// Whether this element should layout as a special case input element.
-    // TODO(#38251): With the implementation of Shadow DOM, we could implement the construction properly
-    //               in the DOM, instead of delegating it to layout.
-    fn is_text_input(&self) -> bool {
-        let type_id = self.type_id_for_layout();
-        if type_id ==
-            NodeTypeId::Element(ElementTypeId::HTMLElement(
-                HTMLElementTypeId::HTMLInputElement,
-            ))
-        {
-            let input = self.unsafe_get().downcast::<HTMLInputElement>().unwrap();
-
-            !input.is_textual_widget() && input.input_type() != InputType::Color
-        } else {
-            type_id ==
-                NodeTypeId::Element(ElementTypeId::HTMLElement(
-                    HTMLElementTypeId::HTMLTextAreaElement,
-                ))
-        }
-    }
-
     fn is_single_line_text_inner_editor(&self) -> bool {
         matches!(
-            self.unsafe_get().implemented_pseudo_element(),
+            self.implemented_pseudo_element(),
             Some(PseudoElement::ServoTextControlInnerEditor)
         )
     }
 
     fn is_text_container_of_single_line_input(&self) -> bool {
         let is_single_line_text_inner_placeholder = matches!(
-            self.unsafe_get().implemented_pseudo_element(),
+            self.implemented_pseudo_element(),
             Some(PseudoElement::Placeholder)
         );
         // Currently `::placeholder` is only implemented for single line text input element.
@@ -1956,49 +1964,36 @@ impl<'dom> LayoutNodeHelpers<'dom> for LayoutDom<'dom, Node> {
     }
 
     fn text_content(self) -> Cow<'dom, str> {
-        if let Some(text) = self.downcast::<Text>() {
-            return text.upcast().data_for_layout().into();
-        }
-
-        if let Some(input) = self.downcast::<HTMLInputElement>() {
-            return input.value_for_layout();
-        }
-
-        if let Some(area) = self.downcast::<HTMLTextAreaElement>() {
-            return area.value_for_layout().into();
-        }
-
-        panic!("not text!")
+        self.downcast::<Text>()
+            .expect("Called LayoutDom::text_content on non-Text node!")
+            .upcast()
+            .data_for_layout()
+            .into()
     }
 
-    fn selection(self) -> Option<Range<usize>> {
-        // If this is a inner editor of an UA widget element, we should find
-        // the selection from its shadow host.
-        // FIXME(stevennovaryo): This should account for the multiline text input,
-        //                       but we are yet to support that input with UA widget.
-        if self.is_in_ua_widget() &&
-            self.is_text_node_for_layout() &&
-            self.parent_node_ref()
-                .is_some_and(|parent| parent.is_single_line_text_inner_editor())
-        {
-            let shadow_root = self.containing_shadow_root_for_layout();
-            if let Some(containing_shadow_host) = shadow_root.map(|root| root.get_host_for_layout())
-            {
-                if let Some(input) = containing_shadow_host.downcast::<HTMLInputElement>() {
-                    return input.selection_for_layout();
-                }
-            }
-        }
-
-        if let Some(area) = self.downcast::<HTMLTextAreaElement>() {
-            return area.selection_for_layout();
-        }
-
+    /// Get the selection for the given node. This only works for text nodes that are in
+    /// the shadow DOM of user agent widgets for form controls, specifically for `<input>`
+    /// and `<textarea>`.
+    ///
+    /// As we want to expose the selection on the inner text node of the widget's shadow
+    /// DOM, we must find the shadow root and then access the containing element itself.
+    fn selection(self) -> Option<SharedSelection> {
         if let Some(input) = self.downcast::<HTMLInputElement>() {
             return input.selection_for_layout();
         }
+        if let Some(textarea) = self.downcast::<HTMLTextAreaElement>() {
+            return Some(textarea.selection_for_layout());
+        }
 
-        None
+        let shadow_root = self
+            .containing_shadow_root_for_layout()?
+            .get_host_for_layout();
+        if let Some(input) = shadow_root.downcast::<HTMLInputElement>() {
+            return input.selection_for_layout();
+        }
+        shadow_root
+            .downcast::<HTMLTextAreaElement>()
+            .map(|textarea| textarea.selection_for_layout())
     }
 
     fn image_url(self) -> Option<ServoUrl> {
@@ -2033,7 +2028,7 @@ impl<'dom> LayoutNodeHelpers<'dom> for LayoutDom<'dom, Node> {
             .map(|media| media.data())
     }
 
-    fn svg_data(self) -> Option<SVGElementData> {
+    fn svg_data(self) -> Option<SVGElementData<'dom>> {
         self.downcast::<SVGSVGElement>().map(|svg| svg.data())
     }
 
@@ -2052,8 +2047,15 @@ impl<'dom> LayoutNodeHelpers<'dom> for LayoutDom<'dom, Node> {
         unsafe { OpaqueNode(self.get_jsobject() as usize) }
     }
 
+    #[expect(unsafe_code)]
     fn implemented_pseudo_element(&self) -> Option<PseudoElement> {
-        self.unsafe_get().implemented_pseudo_element()
+        unsafe {
+            self.unsafe_get()
+                .rare_data
+                .borrow_for_layout()
+                .as_ref()
+                .and_then(|rare_data| rare_data.implemented_pseudo_element)
+        }
     }
 
     fn is_in_ua_widget(&self) -> bool {
@@ -2306,7 +2308,6 @@ impl Node {
         Node::new_(NodeFlags::empty(), Some(doc))
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub(crate) fn new_document_node() -> Node {
         Node::new_(
             NodeFlags::IS_IN_A_DOCUMENT_TREE | NodeFlags::IS_CONNECTED,
@@ -2314,7 +2315,6 @@ impl Node {
         )
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn new_(flags: NodeFlags, doc: Option<&Document>) -> Node {
         Node {
             eventtarget: EventTarget::new_inherited(),
@@ -2393,27 +2393,29 @@ impl Node {
         parent: &Node,
         child: Option<&Node>,
     ) -> ErrorResult {
-        // Step 1.
+        // Step 1. If parent is not a Document, DocumentFragment, or Element node, then throw a "HierarchyRequestError" DOMException.
         match parent.type_id() {
             NodeTypeId::Document(_) | NodeTypeId::DocumentFragment(_) | NodeTypeId::Element(..) => {
             },
             _ => return Err(Error::HierarchyRequest(None)),
         }
 
-        // Step 2.
-        if node.is_inclusive_ancestor_of(parent) {
+        // Step 2. If node is a host-including inclusive ancestor of parent, then throw a "HierarchyRequestError" DOMException.
+        if node.is_host_including_inclusive_ancestor(parent) {
             return Err(Error::HierarchyRequest(None));
         }
 
-        // Step 3.
+        // Step 3. If child is non-null and its parent is not parent, then throw a "NotFoundError" DOMException.
         if let Some(child) = child {
             if !parent.is_parent_of(child) {
                 return Err(Error::NotFound(None));
             }
         }
 
-        // Step 4-5.
+        // Step 4. If node is not a DocumentFragment, DocumentType, Element, or CharacterData node, then throw a "HierarchyRequestError" DOMException.
         match node.type_id() {
+            // Step 5. If either node is a Text node and parent is a document,
+            // or node is a doctype and parent is not a document, then throw a "HierarchyRequestError" DOMException.
             NodeTypeId::CharacterData(CharacterDataTypeId::Text(_)) => {
                 if parent.is::<Document>() {
                     return Err(Error::HierarchyRequest(None));
@@ -2433,18 +2435,19 @@ impl Node {
             },
         }
 
-        // Step 6.
+        // Step 6. If parent is a document, and any of the statements below, switched on the interface node implements,
+        // are true, then throw a "HierarchyRequestError" DOMException.
         if parent.is::<Document>() {
             match node.type_id() {
-                // Step 6.1
                 NodeTypeId::DocumentFragment(_) => {
-                    // Step 6.1.1(b)
+                    // Step 6."DocumentFragment". If node has more than one element child or has a Text node child.
                     if node.children().any(|c| c.is::<Text>()) {
                         return Err(Error::HierarchyRequest(None));
                     }
                     match node.child_elements().count() {
                         0 => (),
-                        // Step 6.1.2
+                        // Step 6."DocumentFragment". Otherwise, if node has one element child and either parent has an element child,
+                        // child is a doctype, or child is non-null and a doctype is following child.
                         1 => {
                             if parent.child_elements().next().is_some() {
                                 return Err(Error::HierarchyRequest(None));
@@ -2458,12 +2461,11 @@ impl Node {
                                 }
                             }
                         },
-                        // Step 6.1.1(a)
                         _ => return Err(Error::HierarchyRequest(None)),
                     }
                 },
-                // Step 6.2
                 NodeTypeId::Element(_) => {
+                    // Step 6."Element". parent has an element child, child is a doctype, or child is non-null and a doctype is following child.
                     if parent.child_elements().next().is_some() {
                         return Err(Error::HierarchyRequest(None));
                     }
@@ -2476,8 +2478,9 @@ impl Node {
                         }
                     }
                 },
-                // Step 6.3
                 NodeTypeId::DocumentType => {
+                    // Step 6."DocumentType". parent has a doctype child, child is non-null and an element is preceding child,
+                    // or child is null and parent has an element child.
                     if parent.children().any(|c| c.is_doctype()) {
                         return Err(Error::HierarchyRequest(None));
                     }
@@ -2514,12 +2517,13 @@ impl Node {
         child: Option<&Node>,
         can_gc: CanGc,
     ) -> Fallible<DomRoot<Node>> {
-        // Step 1.
+        // Step 1. Ensure pre-insert validity of node into parent before child.
         Node::ensure_pre_insertion_validity(node, parent, child)?;
 
-        // Steps 2-3.
+        // Step 2. Let referenceChild be child.
         let reference_child_root;
         let reference_child = match child {
+            // Step 3. If referenceChild is node, then set referenceChild to node’s next sibling.
             Some(child) if child == node => {
                 reference_child_root = node.GetNextSibling();
                 reference_child_root.as_deref()
@@ -2527,7 +2531,7 @@ impl Node {
             _ => child,
         };
 
-        // Step 4.
+        // Step 4. Insert node into parent before referenceChild.
         Node::insert(
             node,
             parent,
@@ -2536,7 +2540,7 @@ impl Node {
             can_gc,
         );
 
-        // Step 5.
+        // Step 5. Return node.
         Ok(DomRoot::from_ref(node))
     }
 
@@ -2657,7 +2661,7 @@ impl Node {
 
             // Step 7.6 Run assign slottables for a tree with node’s root.
             kid.GetRootNode(&GetRootNodeOptions::empty())
-                .assign_slottables_for_a_tree();
+                .assign_slottables_for_a_tree(ForceSlottableNodeReconciliation::Skip);
 
             // Step 7.7. For each shadow-including inclusive descendant inclusiveDescendant of node,
             // in shadow-including tree order:
@@ -2723,7 +2727,7 @@ impl Node {
                 // Step 12. For each node of staticNodeList, if node is connected, then run the
                 //          post-connection steps with node.
                 for node in static_node_list {
-                    vtable_for(&node).post_connection_steps(CanGc::from_cx(cx));
+                    vtable_for(&node).post_connection_steps(cx);
                 }
             }),
         );
@@ -2884,10 +2888,10 @@ impl Node {
             // Step 10.1 Run assign slottables for a tree with parent’s root.
             parent
                 .GetRootNode(&GetRootNodeOptions::empty())
-                .assign_slottables_for_a_tree();
+                .assign_slottables_for_a_tree(ForceSlottableNodeReconciliation::Skip);
 
             // Step 10.2 Run assign slottables for a tree with node.
-            node.assign_slottables_for_a_tree();
+            node.assign_slottables_for_a_tree(ForceSlottableNodeReconciliation::Force);
         }
 
         // TODO: Step 15. transient registered observers
@@ -2929,7 +2933,7 @@ impl Node {
                 let new_pdb = pdb.read_with(&shared_lock.read()).clone();
                 return AttrValue::Declaration(
                     (**attr.value()).to_owned(),
-                    Arc::new(shared_lock.wrap(new_pdb)),
+                    ServoArc::new(shared_lock.wrap(new_pdb)),
                 );
             }
         }
@@ -2988,6 +2992,8 @@ impl Node {
                 cdata.clone_with_data(cdata.Data(), &document, can_gc)
             },
             NodeTypeId::Document(_) => {
+                // Step 1. Set copy’s encoding, content type, URL, origin, type, mode,
+                // and allow declarative shadow roots, to those of node.
                 let document = node.downcast::<Document>().unwrap();
                 let is_html_doc = if document.is_html_document() {
                     IsHTMLDocument::HTMLDocument
@@ -3000,6 +3006,7 @@ impl Node {
                     window,
                     HasBrowsingContext::No,
                     Some(document.url()),
+                    None,
                     // https://github.com/whatwg/dom/issues/378
                     document.origin().clone(),
                     is_html_doc,
@@ -3019,6 +3026,9 @@ impl Node {
                     document.creation_sandboxing_flag_set(),
                     can_gc,
                 );
+                // Step 2. If node’s custom element registry’s is scoped is true,
+                // then set copy’s custom element registry to node’s custom element registry.
+                // TODO
                 DomRoot::upcast::<Node>(document)
             },
             // Step 2. If node is an element:
@@ -4032,15 +4042,16 @@ impl NodeMethods<crate::DomTypeHolder> for Node {
                     let child_2 = other_and_ancestors.pop().unwrap();
 
                     if child_1 != child_2 {
-                        let is_before = parent.children().position(|c| c == child_1).unwrap() <
-                            parent.children().position(|c| c == child_2).unwrap();
-                        // If I am before, `other` is following, and the other way
-                        // around.
-                        return if is_before {
-                            NodeConstants::DOCUMENT_POSITION_FOLLOWING
-                        } else {
-                            NodeConstants::DOCUMENT_POSITION_PRECEDING
-                        };
+                        for child in parent.children() {
+                            if child == child_1 {
+                                // `other` is following `self`.
+                                return NodeConstants::DOCUMENT_POSITION_FOLLOWING;
+                            }
+                            if child == child_2 {
+                                // `other` is preceding `self`.
+                                return NodeConstants::DOCUMENT_POSITION_PRECEDING;
+                            }
+                        }
                     }
 
                     parent = child_1;
@@ -4133,7 +4144,6 @@ pub(crate) trait NodeTraits {
     fn containing_shadow_root(&self) -> Option<DomRoot<ShadowRoot>>;
     /// Get the stylesheet owner for this node: either the [`Document`] or the [`ShadowRoot`]
     /// of the node.
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn stylesheet_list_owner(&self) -> StyleSheetListOwner;
 }
 
@@ -4154,7 +4164,7 @@ impl<T: DerivedFrom<Node> + DomObject> NodeTraits for T {
         Node::containing_shadow_root(self.upcast())
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     fn stylesheet_list_owner(&self) -> StyleSheetListOwner {
         self.containing_shadow_root()
             .map(|shadow_root| StyleSheetListOwner::ShadowRoot(Dom::from_ref(&*shadow_root)))
@@ -4197,11 +4207,11 @@ impl VirtualMethods for Node {
         }
     }
 
-    fn handle_event(&self, event: &Event, _: CanGc) {
+    fn handle_event(&self, event: &Event, can_gc: CanGc) {
         if let Some(event) = event.downcast::<KeyboardEvent>() {
             self.owner_document()
                 .event_handler()
-                .run_default_keyboard_event_handler(event);
+                .run_default_keyboard_event_handler(event, can_gc);
         }
     }
 }

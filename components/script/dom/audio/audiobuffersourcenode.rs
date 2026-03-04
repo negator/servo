@@ -44,7 +44,7 @@ pub(crate) struct AudioBufferSourceNode {
 }
 
 impl AudioBufferSourceNode {
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     fn new_inherited(
         window: &Window,
         context: &BaseAudioContext,
@@ -109,7 +109,7 @@ impl AudioBufferSourceNode {
         Self::new_with_proto(window, None, context, options, can_gc)
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     fn new_with_proto(
         window: &Window,
         proto: Option<HandleObject>,
@@ -236,14 +236,16 @@ impl AudioBufferSourceNodeMethods<crate::DomTypeHolder> for AudioBufferSourceNod
     ) -> Fallible<()> {
         if let Some(offset) = offset {
             if *offset < 0. {
-                return Err(Error::Range("'offset' must be a positive value".to_owned()));
+                return Err(Error::Range(
+                    c"'offset' must be a positive value".to_owned(),
+                ));
             }
         }
 
         if let Some(duration) = duration {
             if *duration < 0. {
                 return Err(Error::Range(
-                    "'duration' must be a positive value".to_owned(),
+                    c"'duration' must be a positive value".to_owned(),
                 ));
             }
         }

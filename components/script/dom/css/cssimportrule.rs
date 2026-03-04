@@ -22,7 +22,7 @@ use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct CSSImportRule {
-    cssrule: CSSRule,
+    css_rule: CSSRule,
     #[ignore_malloc_size_of = "Stylo"]
     #[no_trace]
     import_rule: RefCell<Arc<Locked<ImportRule>>>,
@@ -34,12 +34,11 @@ impl CSSImportRule {
         import_rule: Arc<Locked<ImportRule>>,
     ) -> Self {
         CSSImportRule {
-            cssrule: CSSRule::new_inherited(parent_stylesheet),
+            css_rule: CSSRule::new_inherited(parent_stylesheet),
             import_rule: RefCell::new(import_rule),
         }
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub(crate) fn new(
         window: &Window,
         parent_stylesheet: &CSSStyleSheet,
@@ -64,7 +63,7 @@ impl SpecificCSSRule for CSSImportRule {
     }
 
     fn get_css(&self) -> DOMString {
-        let guard = self.cssrule.shared_lock().read();
+        let guard = self.css_rule.shared_lock().read();
         self.import_rule
             .borrow()
             .read_with(&guard)
@@ -76,7 +75,7 @@ impl SpecificCSSRule for CSSImportRule {
 impl CSSImportRuleMethods<crate::DomTypeHolder> for CSSImportRule {
     /// <https://drafts.csswg.org/cssom-1/#dom-cssimportrule-layername>
     fn GetLayerName(&self) -> Option<DOMString> {
-        let guard = self.cssrule.shared_lock().read();
+        let guard = self.css_rule.shared_lock().read();
         match &self.import_rule.borrow().read_with(&guard).layer {
             ImportLayer::None => None,
             ImportLayer::Anonymous => Some(DOMString::new()),

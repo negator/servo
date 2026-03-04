@@ -96,12 +96,12 @@ impl FormDataMethods<crate::DomTypeHolder> for FormData {
                         .map(FormSubmitterElement::Input)
                 })
                 .ok_or(Error::Type(
-                    "submitter is not a form submitter element".to_string(),
+                    c"submitter is not a form submitter element".to_owned(),
                 ))?;
 
             // Step 1.1.1. If submitter is not a submit button, then throw a TypeError.
             if !submit_button.is_submit_button() {
-                return Err(Error::Type("submitter is not a submit button".to_string()));
+                return Err(Error::Type(c"submitter is not a submit button".to_owned()));
             }
 
             // Step 1.1.2. If submitter’s form owner is not form, then throw a "NotFoundError"
@@ -149,7 +149,6 @@ impl FormDataMethods<crate::DomTypeHolder> for FormData {
             .push((NoTrace(LocalName::from(name.0)), datum));
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     /// <https://xhr.spec.whatwg.org/#dom-formdata-append>
     fn Append_(&self, name: USVString, blob: &Blob, filename: Option<USVString>) {
         let datum = FormDatum {
@@ -231,7 +230,6 @@ impl FormDataMethods<crate::DomTypeHolder> for FormData {
         ));
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     /// <https://xhr.spec.whatwg.org/#dom-formdata-set>
     fn Set_(&self, name: USVString, blob: &Blob, filename: Option<USVString>) {
         let file = self.create_an_entry(blob, filename, CanGc::note());

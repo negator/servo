@@ -2,7 +2,6 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,6 +22,7 @@ use net_traits::image_cache::{
 use net_traits::request::{Destination, RequestBuilder, RequestId};
 use net_traits::{FetchMetadata, FetchResponseMsg, NetworkError, ResourceFetchTiming};
 use pixels::RasterImage;
+use rustc_hash::FxHashSet;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use uuid::Uuid;
 
@@ -43,7 +43,7 @@ use crate::dom::bindings::codegen::Bindings::PermissionStatusBinding::{
 use crate::dom::bindings::codegen::UnionTypes::UnsignedLongOrUnsignedLongSequence;
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::reflect_dom_object_with_proto;
+use crate::dom::bindings::reflector::reflect_dom_object_with_proto_and_cx;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::bindings::trace::RootedTraceableBox;
@@ -104,7 +104,7 @@ pub(crate) struct Notification {
     actions: Vec<Action>,
     /// Pending image, icon, badge, action icon resource request's id
     #[no_trace] // RequestId is not traceable
-    pending_request_ids: DomRefCell<HashSet<RequestId>>,
+    pending_request_ids: DomRefCell<FxHashSet<RequestId>>,
     /// <https://notifications.spec.whatwg.org/#image-resource>
     #[ignore_malloc_size_of = "RasterImage"]
     #[no_trace]
@@ -122,6 +122,7 @@ pub(crate) struct Notification {
 impl Notification {
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
+        cx: &mut js::context::JSContext,
         global: &GlobalScope,
         title: DOMString,
         options: RootedTraceableBox<NotificationOptions>,
@@ -129,9 +130,8 @@ impl Notification {
         base_url: ServoUrl,
         fallback_timestamp: u64,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
     ) -> DomRoot<Self> {
-        let notification = reflect_dom_object_with_proto(
+        let notification = reflect_dom_object_with_proto_and_cx(
             Box::new(Notification::new_inherited(
                 global,
                 title,
@@ -142,7 +142,7 @@ impl Notification {
             )),
             global,
             proto,
-            can_gc,
+            cx,
         );
 
         notification.data.set(options.data.get());
@@ -242,7 +242,7 @@ impl Notification {
             tag,
             require_interaction,
             actions,
-            pending_request_ids: DomRefCell::new(HashSet::new()),
+            pending_request_ids: DomRefCell::new(Default::default()),
             image_resource: DomRefCell::new(None),
             icon_resource: DomRefCell::new(None),
             badge_resource: DomRefCell::new(None),
@@ -349,29 +349,29 @@ impl Notification {
 impl NotificationMethods<crate::DomTypeHolder> for Notification {
     /// <https://notifications.spec.whatwg.org/#constructors>
     fn Constructor(
+        cx: &mut js::context::JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
         title: DOMString,
         options: RootedTraceableBox<NotificationOptions>,
     ) -> Fallible<DomRoot<Notification>> {
         // step 1: Check global is a ServiceWorkerGlobalScope
         if global.is::<ServiceWorkerGlobalScope>() {
             return Err(Error::Type(
-                "Notification constructor cannot be used in service worker.".to_string(),
+                c"Notification constructor cannot be used in service worker.".to_owned(),
             ));
         }
 
         // step 2: Check options.actions must be empty
         if !options.actions.is_empty() {
             return Err(Error::Type(
-                "Actions are only supported for persistent notifications.".to_string(),
+                c"Actions are only supported for persistent notifications.".to_owned(),
             ));
         }
 
         // step 3: Create a notification with a settings object
         let notification =
-            create_notification_with_settings_object(global, title, options, proto, can_gc)?;
+            create_notification_with_settings_object(cx, global, title, options, proto)?;
 
         // TODO: Run step 5.1, 5.2 in parallel
         // step 5.1: If the result of getting the notifications permission state is not "granted",
@@ -400,16 +400,16 @@ impl NotificationMethods<crate::DomTypeHolder> for Notification {
 
     /// <https://notifications.spec.whatwg.org/#dom-notification-requestpermission>
     fn RequestPermission(
+        cx: &mut js::context::JSContext,
         global: &GlobalScope,
         permission_callback: Option<Rc<NotificationPermissionCallback>>,
-        can_gc: CanGc,
     ) -> Rc<Promise> {
         // Step 2: Let promise be a new promise in this’s relevant Realm.
-        let promise = Promise::new(global, can_gc);
+        let promise = Promise::new(global, CanGc::from_cx(cx));
 
         // TODO: Step 3: Run these steps in parallel:
         // Step 3.1: Let permissionState be the result of requesting permission to use "notifications".
-        let notification_permission = request_notification_permission(global, can_gc);
+        let notification_permission = request_notification_permission(cx, global);
 
         // Step 3.2: Queue a global task on the DOM manipulation task source given global to run these steps:
         let trusted_promise = TrustedPromise::new(promise.clone());
@@ -572,11 +572,11 @@ struct Action {
 
 /// <https://notifications.spec.whatwg.org/#create-a-notification-with-a-settings-object>
 fn create_notification_with_settings_object(
+    cx: &mut js::context::JSContext,
     global: &GlobalScope,
     title: DOMString,
     options: RootedTraceableBox<NotificationOptions>,
     proto: Option<HandleObject>,
-    can_gc: CanGc,
 ) -> Fallible<DomRoot<Notification>> {
     // step 1: Let origin be settings’s origin.
     let origin = global.origin().immutable().clone();
@@ -591,6 +591,7 @@ fn create_notification_with_settings_object(
     // step 4: Return the result of creating a notification given title, options, origin,
     //         baseURL, and fallbackTimestamp.
     create_notification(
+        cx,
         global,
         title,
         options,
@@ -598,13 +599,13 @@ fn create_notification_with_settings_object(
         base_url,
         fallback_timestamp,
         proto,
-        can_gc,
     )
 }
 
 /// <https://notifications.spec.whatwg.org/#create-a-notification
 #[expect(clippy::too_many_arguments)]
 fn create_notification(
+    cx: &mut js::context::JSContext,
     global: &GlobalScope,
     title: DOMString,
     options: RootedTraceableBox<NotificationOptions>,
@@ -612,22 +613,22 @@ fn create_notification(
     base_url: ServoUrl,
     fallback_timestamp: u64,
     proto: Option<HandleObject>,
-    can_gc: CanGc,
 ) -> Fallible<DomRoot<Notification>> {
     // If options["silent"] is true and options["vibrate"] exists, then throw a TypeError.
     if options.silent.is_some() && options.vibrate.is_some() {
         return Err(Error::Type(
-            "Can't specify vibration patterns when setting notification to silent.".to_string(),
+            c"Can't specify vibration patterns when setting notification to silent.".to_owned(),
         ));
     }
     // If options["renotify"] is true and options["tag"] is the empty string, then throw a TypeError.
     if options.renotify && options.tag.is_empty() {
         return Err(Error::Type(
-            "tag must be set to renotify as an existing notification.".to_string(),
+            c"tag must be set to renotify as an existing notification.".to_owned(),
         ));
     }
 
     Ok(Notification::new(
+        cx,
         global,
         title,
         options,
@@ -635,7 +636,6 @@ fn create_notification(
         base_url,
         fallback_timestamp,
         proto,
-        can_gc,
     ))
 }
 
@@ -685,13 +685,15 @@ fn get_notifications_permission_state(global: &GlobalScope) -> NotificationPermi
     }
 }
 
-fn request_notification_permission(global: &GlobalScope, can_gc: CanGc) -> NotificationPermission {
-    let cx = GlobalScope::get_cx();
-    let promise = &Promise::new(global, can_gc);
+fn request_notification_permission(
+    cx: &mut js::context::JSContext,
+    global: &GlobalScope,
+) -> NotificationPermission {
+    let promise = &Promise::new(global, CanGc::from_cx(cx));
     let descriptor = PermissionDescriptor {
         name: PermissionName::Notifications,
     };
-    let status = PermissionStatus::new(global, &descriptor, can_gc);
+    let status = PermissionStatus::new(global, &descriptor, CanGc::from_cx(cx));
 
     // The implementation of `request_notification_permission` seemed to be synchronous
     Permissions::permission_request(cx, promise, &descriptor, &status);
@@ -776,16 +778,16 @@ impl FetchResponseListener for ResourceFetchListener {
 
     fn process_response_eof(
         self,
+        cx: &mut js::context::JSContext,
         request_id: RequestId,
-        response: Result<ResourceFetchTiming, NetworkError>,
+        response: Result<(), NetworkError>,
+        timing: ResourceFetchTiming,
     ) {
         self.image_cache.notify_pending_response(
             self.pending_image_id,
-            FetchResponseMsg::ProcessResponseEOF(request_id, response.clone()),
+            FetchResponseMsg::ProcessResponseEOF(request_id, response.clone(), timing.clone()),
         );
-        if let Ok(response) = response {
-            network_listener::submit_timing(&self, &response, CanGc::note());
-        }
+        network_listener::submit_timing(&self, &response, &timing, CanGc::from_cx(cx));
     }
 
     fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<Violation>) {

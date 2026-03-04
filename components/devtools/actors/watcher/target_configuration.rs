@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use embedder_traits::Theme;
 use log::warn;
+use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -20,18 +21,19 @@ use crate::{EmptyReplyMsg, RootActor, StreamId};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TargetConfigurationTraits {
+pub(crate) struct TargetConfigurationTraits {
     supported_options: HashMap<&'static str, bool>,
 }
 
 #[derive(Serialize)]
-pub struct TargetConfigurationActorMsg {
+pub(crate) struct TargetConfigurationActorMsg {
     actor: String,
     configuration: HashMap<&'static str, bool>,
     traits: TargetConfigurationTraits,
 }
 
-pub struct TargetConfigurationActor {
+#[derive(MallocSizeOf)]
+pub(crate) struct TargetConfigurationActor {
     name: String,
     configuration: HashMap<&'static str, bool>,
     supported_options: HashMap<&'static str, bool>,

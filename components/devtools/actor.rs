@@ -2,16 +2,18 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::any::Any;
-use std::cell::{Cell, RefCell};
+use std::any::{Any, type_name};
 use std::collections::HashMap;
-use std::mem;
+use std::marker::PhantomData;
 use std::net::TcpStream;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
-use base::cross_process_instant::CrossProcessInstant;
+use atomic_refcell::AtomicRefCell;
 use base::id::PipelineId;
 use log::{debug, warn};
+use malloc_size_of::MallocSizeOf;
+use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
@@ -49,7 +51,7 @@ impl ActorError {
 /// A common trait for all devtools actors that encompasses an immutable name
 /// and the ability to process messages that are directed to particular actors.
 /// TODO: ensure the name is immutable
-pub(crate) trait Actor: Any + ActorAsAny + Send {
+pub(crate) trait Actor: Any + ActorAsAny + Send + Sync + MallocSizeOf {
     fn handle_message(
         &self,
         request: ClientRequest,
@@ -67,14 +69,10 @@ pub(crate) trait Actor: Any + ActorAsAny + Send {
 
 pub(crate) trait ActorAsAny {
     fn actor_as_any(&self) -> &dyn Any;
-    fn actor_as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 impl<T: Actor> ActorAsAny for T {
     fn actor_as_any(&self) -> &dyn Any {
-        self
-    }
-    fn actor_as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
 }
@@ -83,68 +81,46 @@ pub(crate) trait ActorEncode<T: Serialize>: Actor {
     fn encode(&self, registry: &ActorRegistry) -> T;
 }
 
+/// Return value of `ActorRegistry::find` that allows seamless downcasting
+/// from `dyn Actor` to the concrete actor type.
+pub(crate) struct DowncastableActorArc<T> {
+    actor: Arc<dyn Actor>,
+    _phantom: PhantomData<T>,
+}
+
+impl<T: 'static> std::ops::Deref for DowncastableActorArc<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        self.actor.actor_as_any().downcast_ref::<T>().unwrap()
+    }
+}
+
+#[derive(Default)]
+struct ActorRegistryType(AtomicRefCell<HashMap<String, Arc<dyn Actor>>>);
+
+impl MallocSizeOf for ActorRegistryType {
+    fn size_of(&self, ops: &mut malloc_size_of::MallocSizeOfOps) -> usize {
+        self.0.borrow().iter().map(|actor| actor.size_of(ops)).sum()
+    }
+}
+
 /// A list of known, owned actors.
-pub struct ActorRegistry {
-    actors: HashMap<String, Box<dyn Actor>>,
-    new_actors: RefCell<Vec<Box<dyn Actor>>>,
-    old_actors: RefCell<Vec<String>>,
-    script_actors: RefCell<HashMap<String, String>>,
-
+#[derive(Default, MallocSizeOf)]
+pub(crate) struct ActorRegistry {
+    actors: ActorRegistryType,
+    script_actors: AtomicRefCell<HashMap<String, String>>,
     /// Lookup table for SourceActor names associated with a given PipelineId.
-    source_actor_names: RefCell<HashMap<PipelineId, Vec<String>>>,
+    source_actor_names: AtomicRefCell<HashMap<PipelineId, Vec<String>>>,
     /// Lookup table for inline source content associated with a given PipelineId.
-    inline_source_content: RefCell<HashMap<PipelineId, String>>,
-
-    shareable: Option<Arc<Mutex<ActorRegistry>>>,
-    next: Cell<u32>,
-    start_stamp: CrossProcessInstant,
+    inline_source_content: AtomicRefCell<HashMap<PipelineId, String>>,
+    next: AtomicU32,
 }
 
 impl ActorRegistry {
-    /// Create an empty registry.
-    pub fn new() -> ActorRegistry {
-        ActorRegistry {
-            actors: HashMap::new(),
-            new_actors: RefCell::new(vec![]),
-            old_actors: RefCell::new(vec![]),
-            script_actors: RefCell::new(HashMap::new()),
-            source_actor_names: RefCell::new(HashMap::new()),
-            inline_source_content: RefCell::new(HashMap::new()),
-            shareable: None,
-            next: Cell::new(0),
-            start_stamp: CrossProcessInstant::now(),
-        }
-    }
-
     pub(crate) fn cleanup(&self, stream_id: StreamId) {
-        for actor in self.actors.values() {
+        for actor in self.actors.0.borrow().values() {
             actor.cleanup(stream_id);
         }
-    }
-
-    /// Creating shareable registry
-    pub fn create_shareable(self) -> Arc<Mutex<ActorRegistry>> {
-        if let Some(shareable) = self.shareable {
-            return shareable;
-        }
-
-        let shareable = Arc::new(Mutex::new(self));
-        {
-            let mut lock = shareable.lock();
-            let registry = lock.as_mut().unwrap();
-            registry.shareable = Some(shareable.clone());
-        }
-        shareable
-    }
-
-    /// Get shareable registry through threads
-    pub fn shareable(&self) -> Arc<Mutex<ActorRegistry>> {
-        self.shareable.as_ref().unwrap().clone()
-    }
-
-    /// Get start stamp when registry was started
-    pub fn start_stamp(&self) -> CrossProcessInstant {
-        self.start_stamp
     }
 
     pub fn register_script_actor(&self, script_id: String, actor: String) {
@@ -173,35 +149,43 @@ impl ActorRegistry {
         panic!("couldn't find actor named {}", actor)
     }
 
+    /// Create a name prefix for each actor type.
+    /// While not needed for unique ids as each actor already has a different
+    /// suffix, it can be used to visually identify actors in the logs.
+    pub fn base_name<T: Actor>() -> &'static str {
+        let prefix = type_name::<T>();
+        prefix.split("::").last().unwrap_or(prefix)
+    }
+
     /// Create a unique name based on a monotonically increasing suffix
-    pub fn new_name(&self, prefix: &str) -> String {
-        let suffix = self.next.get();
-        self.next.set(suffix + 1);
-        format!("{}{}", prefix, suffix)
+    /// TODO: Merge this with `register/register_later` and don't allow to
+    /// create new names without registering an actor.
+    pub fn new_name<T: Actor>(&self) -> String {
+        let suffix = self.next.fetch_add(1, Ordering::Relaxed);
+        format!("{}{}", Self::base_name::<T>(), suffix)
     }
 
     /// Add an actor to the registry of known actors that can receive messages.
-    pub(crate) fn register<T: Actor>(&mut self, actor: T) {
-        self.actors.insert(actor.name(), Box::new(actor));
-    }
-
-    /// Add an actor to the registry that can receive messages.
-    /// It won't be available until after the next message is processed.
-    pub(crate) fn register_later<T: Actor>(&self, actor: T) {
-        let mut actors = self.new_actors.borrow_mut();
-        actors.push(Box::new(actor));
+    pub(crate) fn register<T: Actor>(&self, actor: T) {
+        self.actors
+            .0
+            .borrow_mut()
+            .insert(actor.name(), Arc::new(actor));
     }
 
     /// Find an actor by registered name
-    pub fn find<'a, T: Any>(&'a self, name: &str) -> &'a T {
-        let actor = self.actors.get(name).unwrap();
-        actor.actor_as_any().downcast_ref::<T>().unwrap()
-    }
-
-    /// Find an actor by registered name
-    pub fn find_mut<'a, T: Any>(&'a mut self, name: &str) -> &'a mut T {
-        let actor = self.actors.get_mut(name).unwrap();
-        actor.actor_as_any_mut().downcast_mut::<T>().unwrap()
+    pub fn find<T: Actor>(&self, name: &str) -> DowncastableActorArc<T> {
+        let actor = self
+            .actors
+            .0
+            .borrow()
+            .get(name)
+            .expect("Should never look for a nonexistent actor")
+            .clone();
+        DowncastableActorArc {
+            actor,
+            _phantom: PhantomData,
+        }
     }
 
     /// Find an actor by registered name and return its serialization
@@ -212,7 +196,7 @@ impl ActorRegistry {
     /// Attempt to process a message as directed by its `to` property. If the actor is not found, does not support the
     /// message, or failed to handle the message, send an error reply instead.
     pub(crate) fn handle_message(
-        &mut self,
+        &self,
         msg: &Map<String, Value>,
         stream: &mut TcpStream,
         stream_id: StreamId,
@@ -225,7 +209,11 @@ impl ActorRegistry {
             },
         };
 
-        match self.actors.get(to) {
+        let actor = {
+            let actors_map = self.actors.0.borrow();
+            actors_map.get(to).cloned()
+        };
+        match actor {
             None => {
                 // <https://firefox-source-docs.mozilla.org/devtools/backend/protocol.html#packets>
                 let msg = json!({ "from": to, "error": "noSuchActor" });
@@ -245,25 +233,11 @@ impl ActorRegistry {
                 }
             },
         }
-        let new_actors = mem::take(&mut *self.new_actors.borrow_mut());
-        for actor in new_actors.into_iter() {
-            self.actors.insert(actor.name().to_owned(), actor);
-        }
-
-        let old_actors = mem::take(&mut *self.old_actors.borrow_mut());
-        for name in old_actors {
-            self.drop_actor(name);
-        }
         Ok(())
     }
 
-    pub fn drop_actor(&mut self, name: String) {
-        self.actors.remove(&name);
-    }
-
-    pub fn drop_actor_later(&self, name: String) {
-        let mut actors = self.old_actors.borrow_mut();
-        actors.push(name);
+    pub fn remove(&self, name: String) {
+        self.actors.0.borrow_mut().remove(&name);
     }
 
     pub fn register_source_actor(&self, pipeline_id: PipelineId, actor_name: &str) {
@@ -274,15 +248,15 @@ impl ActorRegistry {
             .push(actor_name.to_owned());
     }
 
-    pub fn source_actor_names_for_pipeline(&mut self, pipeline_id: PipelineId) -> Vec<String> {
-        if let Some(source_actor_names) = self.source_actor_names.borrow_mut().get(&pipeline_id) {
-            return source_actor_names.clone();
-        }
-
-        vec![]
+    pub fn source_actor_names_for_pipeline(&self, pipeline_id: PipelineId) -> Vec<String> {
+        self.source_actor_names
+            .borrow_mut()
+            .get(&pipeline_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
-    pub fn set_inline_source_content(&mut self, pipeline_id: PipelineId, content: String) {
+    pub fn set_inline_source_content(&self, pipeline_id: PipelineId, content: String) {
         assert!(
             self.inline_source_content
                 .borrow_mut()
@@ -291,7 +265,7 @@ impl ActorRegistry {
         );
     }
 
-    pub fn inline_source_content(&mut self, pipeline_id: PipelineId) -> Option<String> {
+    pub fn inline_source_content(&self, pipeline_id: PipelineId) -> Option<String> {
         self.inline_source_content
             .borrow()
             .get(&pipeline_id)

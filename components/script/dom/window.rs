@@ -15,7 +15,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use app_units::Au;
-use backtrace::Backtrace;
 use base::cross_process_instant::CrossProcessInstant;
 use base::generic_channel::{self, GenericCallback, GenericSender};
 use base::id::{BrowsingContextId, PipelineId, WebViewId};
@@ -23,7 +22,6 @@ use base64::Engine;
 #[cfg(feature = "bluetooth")]
 use bluetooth_traits::BluetoothRequest;
 use canvas_traits::webgl::WebGLChan;
-use compositing_traits::CrossProcessPaintApi;
 use constellation_traits::{
     LoadData, LoadOrigin, NavigationHistoryBehavior, ScreenshotReadinessResponse,
     ScriptToConstellationChan, ScriptToConstellationMessage, StructuredSerializedData,
@@ -35,15 +33,16 @@ use crossbeam_channel::{Sender, unbounded};
 use cssparser::SourceLocation;
 use devtools_traits::{ScriptToDevtoolsControlMsg, TimelineMarker, TimelineMarkerType};
 use dom_struct::dom_struct;
-use embedder_traits::user_contents::{UserContents, UserScript};
+use embedder_traits::user_contents::UserScript;
 use embedder_traits::{
     AlertResponse, ConfirmResponse, EmbedderMsg, JavaScriptEvaluationError, PromptResponse,
     ScriptToEmbedderChan, SimpleDialogRequest, Theme, UntrustedNodeAddress, ViewportDetails,
     WebDriverJSResult, WebDriverLoadStatus,
 };
-use euclid::default::{Point2D as UntypedPoint2D, Rect as UntypedRect};
-use euclid::{Point2D, Scale, Size2D, Vector2D};
-use fonts::{CspViolationHandler, FontContext, WebFontDocumentContext};
+use euclid::default::Rect as UntypedRect;
+use euclid::{Point2D, Rect, Scale, Size2D, Vector2D};
+use fonts::{CspViolationHandler, FontContext, NetworkTimingHandler, WebFontDocumentContext};
+use js::context::JSContext;
 use js::glue::DumpJSStack;
 use js::jsapi::{
     GCReason, Heap, JS_GC, JSAutoRealm, JSContext as RawJSContext, JSObject, JSPROP_ENUMERATE,
@@ -56,20 +55,22 @@ use js::rust::{
     MutableHandleValue,
 };
 use layout_api::{
-    BoxAreaType, ElementsFromPointFlags, ElementsFromPointResult, FragmentType, Layout,
-    LayoutImageDestination, PendingImage, PendingImageState, PendingRasterizationImage,
-    PhysicalSides, QueryMsg, ReflowGoal, ReflowPhasesRun, ReflowRequest, ReflowRequestRestyle,
-    RestyleReason, ScrollContainerQueryFlags, ScrollContainerResponse, TrustedNodeAddress,
-    combine_id_with_fragment_type,
+    BoxAreaType, CSSPixelRectIterator, ElementsFromPointFlags, ElementsFromPointResult,
+    FragmentType, Layout, LayoutImageDestination, PendingImage, PendingImageState,
+    PendingRasterizationImage, PhysicalSides, QueryMsg, ReflowGoal, ReflowPhasesRun, ReflowRequest,
+    ReflowRequestRestyle, ReflowStatistics, RestyleReason, ScrollContainerQueryFlags,
+    ScrollContainerResponse, TrustedNodeAddress, combine_id_with_fragment_type,
 };
 use malloc_size_of::MallocSizeOf;
 use media::WindowGLContext;
-use net_traits::ResourceThreads;
 use net_traits::image_cache::{
     ImageCache, ImageCacheResponseCallback, ImageCacheResponseMessage, ImageLoadListener,
     ImageResponse, PendingImageId, PendingImageResponse, RasterizationCompleteResponse,
 };
+use net_traits::request::Referrer;
+use net_traits::{ResourceFetchTiming, ResourceThreads};
 use num_traits::ToPrimitive;
+use paint_api::{CrossProcessPaintApi, PinchZoomInfos};
 use profile_traits::generic_channel as ProfiledGenericChannel;
 use profile_traits::mem::ProfilerChan as MemProfilerChan;
 use profile_traits::time::ProfilerChan as TimeProfilerChan;
@@ -100,6 +101,7 @@ use webrender_api::units::{DeviceIntSize, DevicePixel, LayoutPixel, LayoutPoint}
 
 use super::bindings::codegen::Bindings::MessagePortBinding::StructuredSerializeOptions;
 use super::bindings::trace::HashMapTracedValues;
+use super::performanceresourcetiming::InitiatorType;
 use super::types::SVGSVGElement;
 use crate::dom::bindings::cell::{DomRefCell, Ref};
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
@@ -143,13 +145,14 @@ use crate::dom::css::cssstyledeclaration::{
     CSSModificationAccess, CSSStyleDeclaration, CSSStyleOwner,
 };
 use crate::dom::customelementregistry::CustomElementRegistry;
-use crate::dom::document::{AnimationFrameCallback, Document};
+use crate::dom::document::{
+    AnimationFrameCallback, Document, SameOriginDescendantNavigablesIterator,
+};
 use crate::dom::element::Element;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::fetchlaterresult::FetchLaterResult;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::hashchangeevent::HashChangeEvent;
 use crate::dom::history::History;
 use crate::dom::html::htmlcollection::{CollectionFilter, HTMLCollection};
 use crate::dom::html::htmliframeelement::HTMLIFrameElement;
@@ -174,8 +177,9 @@ use crate::dom::storage::Storage;
 #[cfg(feature = "bluetooth")]
 use crate::dom::testrunner::TestRunner;
 use crate::dom::trustedtypepolicyfactory::TrustedTypePolicyFactory;
-use crate::dom::types::{ImageBitmap, UIEvent};
-use crate::dom::visualviewport::VisualViewport;
+use crate::dom::types::{ImageBitmap, MouseEvent, UIEvent};
+use crate::dom::useractivation::UserActivationTimestamp;
+use crate::dom::visualviewport::{VisualViewport, VisualViewportChanges};
 use crate::dom::webgl::webglrenderingcontext::WebGLCommandSender;
 #[cfg(feature = "webgpu")]
 use crate::dom::webgpu::identityhub::IdentityHub;
@@ -185,8 +189,9 @@ use crate::dom::workletglobalscope::WorkletGlobalScopeType;
 use crate::layout_image::fetch_image_for_layout;
 use crate::messaging::{MainThreadScriptMsg, ScriptEventLoopReceiver, ScriptEventLoopSender};
 use crate::microtask::{Microtask, UserMicrotask};
+use crate::network_listener::{ResourceTimingListener, submit_timing};
 use crate::realms::{InRealm, enter_realm};
-use crate::script_runtime::{CanGc, JSContext, Runtime};
+use crate::script_runtime::{CanGc, JSContext as SafeJSContext, Runtime};
 use crate::script_thread::ScriptThread;
 use crate::script_window_proxies::ScriptWindowProxies;
 use crate::task_source::SendableTaskSource;
@@ -202,7 +207,8 @@ use crate::{fetch, window_named_properties};
 #[derive(MallocSizeOf)]
 pub struct PendingImageCallback(
     #[ignore_malloc_size_of = "dyn Fn is currently impossible to measure"]
-    Box<dyn Fn(PendingImageResponse) + 'static>,
+    #[expect(clippy::type_complexity)]
+    Box<dyn Fn(PendingImageResponse, &mut js::context::JSContext) + 'static>,
 );
 
 /// Current state of the window object
@@ -292,7 +298,6 @@ pub(crate) struct Window {
     document: MutNullableDom<Document>,
     location: MutNullableDom<Location>,
     history: MutNullableDom<History>,
-    indexeddb: MutNullableDom<IDBFactory>,
     custom_element_registry: MutNullableDom<CustomElementRegistry>,
     performance: MutNullableDom<Performance>,
     #[no_trace]
@@ -417,7 +422,6 @@ pub(crate) struct Window {
     exists_mut_observer: Cell<bool>,
 
     /// Cross-process access to `Paint`.
-    #[ignore_malloc_size_of = "Wraps an IpcSender"]
     #[no_trace]
     paint_api: CrossProcessPaintApi,
 
@@ -428,10 +432,11 @@ pub(crate) struct Window {
     /// Unminify Css.
     unminify_css: bool,
 
-    /// The [`UserContents`] that is potentially shared with other `WebView`s in this `ScriptThread`.
+    /// The [`UserScript`]s added via `UserContentManager`. These are potentially shared with other
+    /// `WebView`s in this `ScriptThread`.
     #[no_trace]
     #[conditional_malloc_size_of]
-    user_contents: Option<Rc<UserContents>>,
+    user_scripts: Rc<Vec<UserScript>>,
 
     /// Window's GL context from application
     #[ignore_malloc_size_of = "defined in script_thread"]
@@ -469,6 +474,13 @@ pub(crate) struct Window {
     /// Visual viewport interface that is associated to this [`Window`].
     /// <https://drafts.csswg.org/cssom-view/#dom-window-visualviewport>
     visual_viewport: MutNullableDom<VisualViewport>,
+
+    /// [`VisualViewport`] dimension changed and we need to process it on the next tick.
+    has_changed_visual_viewport_dimension: Cell<bool>,
+
+    /// <https://html.spec.whatwg.org/multipage/#last-activation-timestamp>
+    #[no_trace]
+    last_activation_timestamp: Cell<UserActivationTimestamp>,
 }
 
 impl Window {
@@ -541,8 +553,8 @@ impl Window {
     }
 
     #[expect(unsafe_code)]
-    pub(crate) fn get_cx(&self) -> JSContext {
-        unsafe { JSContext::from_ptr(js::rust::Runtime::get().unwrap().as_ptr()) }
+    pub(crate) fn get_cx(&self) -> SafeJSContext {
+        unsafe { SafeJSContext::from_ptr(js::rust::Runtime::get().unwrap().as_ptr()) }
     }
 
     pub(crate) fn get_js_runtime(&self) -> Ref<'_, Option<Rc<Runtime>>> {
@@ -636,13 +648,19 @@ impl Window {
         })
     }
 
-    /// Returns the window proxy of the webview, which is the top-level ancestor browsing context.
+    /// Get the active [`Document`] of top-level browsing context, or return [`Window`]'s [`Document`]
+    /// if it's browing context is the top-level browsing context. Returning none if the [`WindowProxy`]
+    /// is discarded or the [`Document`] is in another `ScriptThread`.
     /// <https://html.spec.whatwg.org/multipage/#top-level-browsing-context>
-    pub(crate) fn webview_window_proxy(&self) -> Option<DomRoot<WindowProxy>> {
-        self.undiscarded_window_proxy().and_then(|window_proxy| {
-            self.script_window_proxies
-                .find_window_proxy(window_proxy.webview_id().into())
-        })
+    pub(crate) fn top_level_document_if_local(&self) -> Option<DomRoot<Document>> {
+        if self.is_top_level() {
+            return Some(self.Document());
+        }
+
+        let window_proxy = self.undiscarded_window_proxy()?;
+        self.script_window_proxies
+            .find_window_proxy(window_proxy.webview_id().into())?
+            .document()
     }
 
     #[cfg(feature = "bluetooth")]
@@ -678,7 +696,7 @@ impl Window {
     pub(crate) fn register_image_cache_listener(
         &self,
         id: PendingImageId,
-        callback: impl Fn(PendingImageResponse) + 'static,
+        callback: impl Fn(PendingImageResponse, &mut js::context::JSContext) + 'static,
     ) -> ImageCacheResponseCallback {
         self.pending_image_callbacks
             .borrow_mut()
@@ -739,7 +757,11 @@ impl Window {
         nodes.remove();
     }
 
-    pub(crate) fn pending_image_notification(&self, response: PendingImageResponse) {
+    pub(crate) fn pending_image_notification(
+        &self,
+        response: PendingImageResponse,
+        cx: &mut js::context::JSContext,
+    ) {
         // We take the images here, in order to prevent maintaining a mutable borrow when
         // image callbacks are called. These, in turn, can trigger garbage collection.
         // Normally this shouldn't trigger more pending image notifications, but just in
@@ -751,7 +773,7 @@ impl Window {
         };
 
         for callback in callbacks.get() {
-            callback.0(response.clone());
+            callback.0(response.clone(), cx);
         }
 
         match response.response {
@@ -769,10 +791,7 @@ impl Window {
     }
 
     pub(crate) fn userscripts(&self) -> &[UserScript] {
-        self.user_contents
-            .as_ref()
-            .map(|user_contents| user_contents.scripts.as_slice())
-            .unwrap_or(&[])
+        &self.user_scripts
     }
 
     pub(crate) fn get_player_context(&self) -> WindowGLContext {
@@ -814,7 +833,7 @@ impl Window {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#nav-stop>
-    fn stop_loading(&self, can_gc: CanGc) {
+    fn stop_loading(&self, cx: &mut js::context::JSContext) {
         // 1. Let document be navigable's active document.
         let doc = self.Document();
 
@@ -830,11 +849,11 @@ impl Window {
         self.set_ongoing_navigation();
 
         // 3. Abort a document and its descendants given document.
-        doc.abort(can_gc);
+        doc.abort(cx);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#destroy-a-top-level-traversable>
-    fn destroy_top_level_traversable(&self, can_gc: CanGc) {
+    fn destroy_top_level_traversable(&self, cx: &mut js::context::JSContext) {
         // Step 1. Let browsingContext be traversable's active browsing context.
         // TODO
         // Step 2. For each historyEntry in traversable's session history entries:
@@ -842,27 +861,27 @@ impl Window {
         // Step 2.1. Let document be historyEntry's document.
         let document = self.Document();
         // Step 2.2. If document is not null, then destroy a document and its descendants given document.
-        document.destroy_document_and_its_descendants(can_gc);
+        document.destroy_document_and_its_descendants(cx);
         // Step 3-6.
         self.send_to_constellation(ScriptToConstellationMessage::DiscardTopLevelBrowsingContext);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#definitely-close-a-top-level-traversable>
-    fn definitely_close(&self, can_gc: CanGc) {
+    fn definitely_close(&self, cx: &mut js::context::JSContext) {
         let document = self.Document();
         // Step 1. Let toUnload be traversable's active document's inclusive descendant navigables.
         //
         // Implemented by passing `false` into the method below
         // Step 2. If the result of checking if unloading is canceled for toUnload is not "continue", then return.
-        if !document.check_if_unloading_is_cancelled(false, can_gc) {
+        if !document.check_if_unloading_is_cancelled(false, CanGc::from_cx(cx)) {
             return;
         }
         // Step 3. Append the following session history traversal steps to traversable:
         // TODO
         // Step 3.2. Unload a document and its descendants given traversable's active document, null, and afterAllUnloads.
-        document.unload(false, can_gc);
+        document.unload(false, CanGc::from_cx(cx));
         // Step 3.1. Let afterAllUnloads be an algorithm step which destroys traversable.
-        self.destroy_top_level_traversable(can_gc);
+        self.destroy_top_level_traversable(cx);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#cannot-show-simple-dialogs>
@@ -897,8 +916,8 @@ impl Window {
         false
     }
 
-    pub(crate) fn perform_a_microtask_checkpoint(&self, can_gc: CanGc) {
-        self.script_thread().perform_a_microtask_checkpoint(can_gc);
+    pub(crate) fn perform_a_microtask_checkpoint(&self, cx: &mut js::context::JSContext) {
+        self.script_thread().perform_a_microtask_checkpoint(cx);
     }
 
     pub(crate) fn web_font_context(&self) -> WebFontDocumentContext {
@@ -916,6 +935,20 @@ impl Window {
                     .dom_manipulation_task_source()
                     .to_sendable(),
             }),
+            network_timing_handler: Box::new(FontNetworkTimingHandler {
+                global: Trusted::new(global),
+                task_source: global
+                    .task_manager()
+                    .dom_manipulation_task_source()
+                    .to_sendable(),
+            }),
+        }
+    }
+
+    #[expect(unsafe_code)]
+    pub(crate) fn gc(&self) {
+        unsafe {
+            JS_GC(*self.get_cx(), GCReason::API);
         }
     }
 }
@@ -939,6 +972,52 @@ impl CspViolationHandler for FontCspHandler {
             global: self.global.clone(),
             task_source: self.task_source.clone(),
         })
+    }
+}
+
+#[derive(Debug)]
+struct FontNetworkTimingHandler {
+    global: Trusted<GlobalScope>,
+    task_source: SendableTaskSource,
+}
+
+impl NetworkTimingHandler for FontNetworkTimingHandler {
+    fn submit_timing(&self, url: ServoUrl, response: ResourceFetchTiming) {
+        let global = self.global.clone();
+        self.task_source.queue(task!(network_timing: move || {
+            submit_timing(
+                &FontFetchListener {
+                    url,
+                    global
+                },
+                &Ok(()),
+                &response,
+                CanGc::note(),
+            );
+        }));
+    }
+
+    fn clone(&self) -> Box<dyn NetworkTimingHandler> {
+        Box::new(Self {
+            global: self.global.clone(),
+            task_source: self.task_source.clone(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct FontFetchListener {
+    global: Trusted<GlobalScope>,
+    url: ServoUrl,
+}
+
+impl ResourceTimingListener for FontFetchListener {
+    fn resource_timing_information(&self) -> (InitiatorType, ServoUrl) {
+        (InitiatorType::Css, self.url.clone())
+    }
+
+    fn resource_timing_global(&self) -> DomRoot<GlobalScope> {
+        self.global.root()
     }
 }
 
@@ -1190,12 +1269,12 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-window-stop>
-    fn Stop(&self, can_gc: CanGc) {
+    fn Stop(&self, cx: &mut js::context::JSContext) {
         // 1. If this's navigable is null, then return.
         // Note: Servo doesn't have a concept of navigable yet.
 
         // 2. Stop loading this's navigable.
-        self.stop_loading(can_gc);
+        self.stop_loading(cx);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-window-focus>
@@ -1236,12 +1315,7 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-opener>
-    fn GetOpener(
-        &self,
-        cx: JSContext,
-        in_realm_proof: InRealm,
-        mut retval: MutableHandleValue,
-    ) -> Fallible<()> {
+    fn GetOpener(&self, cx: &mut CurrentRealm, mut retval: MutableHandleValue) -> Fallible<()> {
         // Step 1, Let current be this Window object's browsing context.
         let current = match self.window_proxy.get() {
             Some(proxy) => proxy,
@@ -1260,13 +1334,13 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
             return Ok(());
         }
         // Step 3 to 5.
-        current.opener(*cx, in_realm_proof, retval);
+        current.opener(cx, retval);
         Ok(())
     }
 
     #[expect(unsafe_code)]
     /// <https://html.spec.whatwg.org/multipage/#dom-opener>
-    fn SetOpener(&self, cx: JSContext, value: HandleValue) -> ErrorResult {
+    fn SetOpener(&self, cx: SafeJSContext, value: HandleValue) -> ErrorResult {
         // Step 1.
         if value.is_null() {
             if let Some(proxy) = self.window_proxy.get() {
@@ -1323,9 +1397,9 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
 
                 // Step 6.2. Queue a task on the DOM manipulation task source to definitely close thisTraversable.
                 let this = Trusted::new(self);
-                let task = task!(window_close_browsing_context: move || {
+                let task = task!(window_close_browsing_context: move |cx| {
                     let window = this.root();
-                    window.definitely_close(CanGc::note());
+                    window.definitely_close(cx);
                 });
                 self.as_global_scope()
                     .task_manager()
@@ -1349,10 +1423,7 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
 
     /// <https://w3c.github.io/IndexedDB/#factory-interface>
     fn IndexedDB(&self) -> DomRoot<IDBFactory> {
-        self.indexeddb.or_init(|| {
-            let global_scope = self.upcast::<GlobalScope>();
-            IDBFactory::new(global_scope, CanGc::note())
-        })
+        self.upcast::<GlobalScope>().get_indexeddb()
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-window-customelements>
@@ -1413,7 +1484,7 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-reporterror>
-    fn ReportError(&self, cx: JSContext, error: HandleValue, can_gc: CanGc) {
+    fn ReportError(&self, cx: SafeJSContext, error: HandleValue, can_gc: CanGc) {
         self.as_global_scope()
             .report_an_exception(cx, error, can_gc);
     }
@@ -1432,7 +1503,7 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
     /// <https://html.spec.whatwg.org/multipage/#dom-settimeout>
     fn SetTimeout(
         &self,
-        _cx: JSContext,
+        _cx: SafeJSContext,
         callback: TrustedScriptOrStringOrFunction,
         timeout: i32,
         args: Vec<HandleValue>,
@@ -1464,7 +1535,7 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
     /// <https://html.spec.whatwg.org/multipage/#dom-windowtimers-setinterval>
     fn SetInterval(
         &self,
-        _cx: JSContext,
+        _cx: SafeJSContext,
         callback: TrustedScriptOrStringOrFunction,
         timeout: i32,
         args: Vec<HandleValue>,
@@ -1617,10 +1688,7 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
             return None;
         }
 
-        // TODO(#41341): we are only initializing the visual viewport here, but it is never updated.
-        Some(self.visual_viewport.or_init(|| {
-            VisualViewport::new_from_layout_viewport(self, self.viewport_details().size, can_gc)
-        }))
+        Some(self.get_or_init_visual_viewport(can_gc))
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-windowbase64-btoa>
@@ -1648,7 +1716,7 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
     /// <https://html.spec.whatwg.org/multipage/#dom-window-postmessage>
     fn PostMessage(
         &self,
-        cx: JSContext,
+        cx: &mut JSContext,
         message: HandleValue,
         target_origin: USVString,
         transfer: CustomAutoRooterGuard<Vec<*mut JSObject>>,
@@ -1663,7 +1731,7 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
     /// <https://html.spec.whatwg.org/multipage/#dom-messageport-postmessage>
     fn PostMessage_(
         &self,
-        cx: JSContext,
+        cx: &mut JSContext,
         message: HandleValue,
         options: RootedTraceableBox<WindowPostMessageOptions>,
     ) -> ErrorResult {
@@ -1675,7 +1743,8 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
                 .map(|js: &RootedTraceableBox<Heap<*mut JSObject>>| js.get())
                 .collect(),
         );
-        let transfer = CustomAutoRooterGuard::new(*cx, &mut rooted);
+        #[expect(unsafe_code)]
+        let transfer = unsafe { CustomAutoRooterGuard::new(cx.raw_cx(), &mut rooted) };
 
         let incumbent = GlobalScope::incumbent().expect("no incumbent global?");
         let source = incumbent.as_window();
@@ -1703,47 +1772,23 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
     }
 
     // check-tidy: no specs after this line
-    fn Debug(&self, message: DOMString) {
-        debug!("{}", message);
-    }
-
-    #[expect(unsafe_code)]
-    fn Gc(&self) {
-        unsafe {
-            JS_GC(*self.get_cx(), GCReason::API);
-        }
-    }
-
-    #[expect(unsafe_code)]
-    fn Js_backtrace(&self) {
-        unsafe {
-            println!("Current JS stack:");
-            dump_js_stack(*self.get_cx());
-            let rust_stack = Backtrace::new();
-            println!("Current Rust stack:\n{:?}", rust_stack);
-        }
-    }
-
-    fn WebdriverCallback(&self, cx: JSContext, value: HandleValue, realm: InRealm, can_gc: CanGc) {
+    fn WebdriverCallback(&self, realm: &mut CurrentRealm, value: HandleValue) {
         let webdriver_script_sender = self.webdriver_script_chan.borrow_mut().take();
         if let Some(webdriver_script_sender) = webdriver_script_sender {
-            let result = jsval_to_webdriver(cx, &self.globalscope, value, realm, can_gc);
+            let result = jsval_to_webdriver(realm, &self.globalscope, value);
             let _ = webdriver_script_sender.send(result);
         }
     }
 
-    fn WebdriverException(&self, cx: JSContext, value: HandleValue, can_gc: CanGc) {
+    fn WebdriverException(&self, cx: &mut JSContext, value: HandleValue) {
         let webdriver_script_sender = self.webdriver_script_chan.borrow_mut().take();
         if let Some(webdriver_script_sender) = webdriver_script_sender {
-            let _ =
-                webdriver_script_sender.send(Err(JavaScriptEvaluationError::EvaluationFailure(
-                    Some(javascript_error_info_from_error_info(
-                        cx,
-                        &ErrorInfo::from_value(value, cx, can_gc),
-                        value,
-                        can_gc,
-                    )),
-                )));
+            let error_info = ErrorInfo::from_value(value, cx.into(), CanGc::from_cx(cx));
+            let _ = webdriver_script_sender.send(Err(
+                JavaScriptEvaluationError::EvaluationFailure(Some(
+                    javascript_error_info_from_error_info(cx, &error_info, value),
+                )),
+            ));
         }
     }
 
@@ -1770,8 +1815,10 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
             .window_proxy
             .get()
             .expect("Should always have a WindowProxy when calling WebdriverWindow");
-        // Window must be top level browsing context.
-        assert!(window_proxy.browsing_context_id() == window_proxy.webview_id());
+        assert!(
+            self.is_top_level(),
+            "Window must be top level browsing context."
+        );
         assert!(self.webview_id().to_string() == webview_id);
         DomRoot::from_ref(window_proxy)
     }
@@ -2109,7 +2156,7 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
     }
 
     /// <https://dom.spec.whatwg.org/#dom-window-event>
-    fn Event(&self, cx: JSContext, rval: MutableHandleValue) {
+    fn Event(&self, cx: SafeJSContext, rval: MutableHandleValue) {
         if let Some(ref event) = *self.current_event.borrow() {
             event
                 .reflector()
@@ -2274,7 +2321,7 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
     /// <https://html.spec.whatwg.org/multipage/#dom-structuredclone>
     fn StructuredClone(
         &self,
-        cx: JSContext,
+        cx: SafeJSContext,
         value: HandleValue,
         options: RootedTraceableBox<StructuredSerializeOptions>,
         can_gc: CanGc,
@@ -2298,7 +2345,7 @@ impl Window {
     // https://heycam.github.io/webidl/#named-properties-object
     // https://html.spec.whatwg.org/multipage/#named-access-on-the-window-object
     pub(crate) fn create_named_properties_object(
-        cx: JSContext,
+        cx: SafeJSContext,
         proto: HandleObject,
         object: MutableHandleObject,
     ) {
@@ -2324,12 +2371,12 @@ impl Window {
         target_origin: &USVString,
         source_origin: ImmutableOrigin,
         source: &Window,
-        cx: JSContext,
+        cx: &mut JSContext,
         message: HandleValue,
         transfer: CustomAutoRooterGuard<Vec<*mut JSObject>>,
     ) -> ErrorResult {
         // Step 1-2, 6-8.
-        let data = structuredclone::write(cx, message, Some(transfer))?;
+        let data = structuredclone::write(cx.into(), message, Some(transfer))?;
 
         // Step 3-5.
         let target_origin = match target_origin.0[..].as_ref() {
@@ -2453,7 +2500,7 @@ impl Window {
         // TODO Step 1
         // TODO(mrobinson, #18709): Add smooth scrolling support to WebRender so that we can
         // properly process ScrollBehavior here.
-        let reflow_phases_run =
+        let (reflow_phases_run, _) =
             self.reflow(ReflowGoal::UpdateScrollNode(scroll_id, Vector2D::new(x, y)));
         if reflow_phases_run.needs_frame() {
             self.paint_api()
@@ -2499,12 +2546,12 @@ impl Window {
     ///
     /// NOTE: This method should almost never be called directly! Layout and rendering updates should
     /// happen as part of the HTML event loop via *update the rendering*.
-    pub(crate) fn reflow(&self, reflow_goal: ReflowGoal) -> ReflowPhasesRun {
+    pub(crate) fn reflow(&self, reflow_goal: ReflowGoal) -> (ReflowPhasesRun, ReflowStatistics) {
         let document = self.Document();
 
         // Never reflow inactive Documents.
         if !document.is_fully_active() {
-            return ReflowPhasesRun::empty();
+            return Default::default();
         }
 
         self.Document().ensure_safe_to_run_script_or_layout();
@@ -2517,7 +2564,7 @@ impl Window {
             self.layout_blocker.get().layout_blocked()
         {
             debug!("Suppressing pre-load-event reflow pipeline {pipeline_id}");
-            return ReflowPhasesRun::empty();
+            return Default::default();
         }
 
         debug!("script: performing reflow for goal {reflow_goal:?}");
@@ -2573,7 +2620,7 @@ impl Window {
         };
 
         let Some(reflow_result) = self.layout.borrow_mut().reflow(reflow) else {
-            return ReflowPhasesRun::empty();
+            return Default::default();
         };
 
         debug!("script: layout complete");
@@ -2595,7 +2642,10 @@ impl Window {
 
         document.update_animations_post_reflow();
 
-        reflow_result.reflow_phases_run
+        (
+            reflow_result.reflow_phases_run,
+            reflow_result.reflow_statistics,
+        )
     }
 
     pub(crate) fn request_screenshot_readiness(&self, can_gc: CanGc) {
@@ -2713,7 +2763,7 @@ impl Window {
         // iframe size updates.
         //
         // See <https://github.com/servo/servo/issues/14719>
-        if self.Document().update_the_rendering().needs_frame() {
+        if self.Document().update_the_rendering().0.needs_frame() {
             self.paint_api()
                 .generate_frame(vec![self.webview_id().into()]);
         }
@@ -2763,7 +2813,7 @@ impl Window {
         node: &Node,
         area: BoxAreaType,
         exclude_transform_and_inline: bool,
-    ) -> Option<UntypedRect<Au>> {
+    ) -> Option<Rect<Au, CSSPixel>> {
         let layout = self.layout.borrow();
         layout.ensure_stacking_context_tree(self.viewport_details.get());
         layout.query_box_area(
@@ -2778,19 +2828,19 @@ impl Window {
         node: &Node,
         area: BoxAreaType,
         exclude_transform_and_inline: bool,
-    ) -> Option<UntypedRect<Au>> {
+    ) -> Option<Rect<Au, CSSPixel>> {
         self.layout_reflow(QueryMsg::BoxArea);
         self.box_area_query_without_reflow(node, area, exclude_transform_and_inline)
     }
 
-    pub(crate) fn box_areas_query(&self, node: &Node, area: BoxAreaType) -> Vec<UntypedRect<Au>> {
+    pub(crate) fn box_areas_query(&self, node: &Node, area: BoxAreaType) -> CSSPixelRectIterator {
         self.layout_reflow(QueryMsg::BoxAreas);
         self.layout
             .borrow()
             .query_box_areas(node.to_trusted_node_address(), area)
     }
 
-    pub(crate) fn client_rect_query(&self, node: &Node) -> UntypedRect<i32> {
+    pub(crate) fn client_rect_query(&self, node: &Node) -> Rect<i32, CSSPixel> {
         self.layout_reflow(QueryMsg::ClientRectQuery);
         self.layout
             .borrow()
@@ -2806,7 +2856,7 @@ impl Window {
 
     /// Find the scroll area of the given node, if it is not None. If the node
     /// is None, find the scroll area of the viewport.
-    pub(crate) fn scrolling_area_query(&self, node: Option<&Node>) -> UntypedRect<i32> {
+    pub(crate) fn scrolling_area_query(&self, node: Option<&Node>) -> Rect<i32, CSSPixel> {
         self.layout_reflow(QueryMsg::ScrollingAreaOrOffsetQuery);
         self.layout
             .borrow()
@@ -2900,7 +2950,7 @@ impl Window {
     pub(crate) fn offset_parent_query(
         &self,
         node: &Node,
-    ) -> (Option<DomRoot<Element>>, UntypedRect<Au>) {
+    ) -> (Option<DomRoot<Element>>, Rect<Au, CSSPixel>) {
         self.layout_reflow(QueryMsg::OffsetParentQuery);
         let response = self
             .layout
@@ -2948,15 +2998,20 @@ impl Window {
             .map(|(source, overflow)| ScrollingBox::new(source, overflow))
     }
 
-    pub(crate) fn text_index_query(
+    pub(crate) fn text_index_query_on_node_for_event(
         &self,
         node: &Node,
-        point_in_node: UntypedPoint2D<f32>,
+        mouse_event: &MouseEvent,
     ) -> Option<usize> {
+        // dispatch_key_event (document.rs) triggers a click event when releasing
+        // the space key. There's no nice way to catch this so let's use this for
+        // now.
+        let point_in_viewport = mouse_event.point_in_viewport()?.map(Au::from_f32_px);
+
         self.layout_reflow(QueryMsg::TextIndexQuery);
         self.layout
             .borrow()
-            .query_text_indext(node.to_opaque(), point_in_node)
+            .query_text_index(node.to_trusted_node_address(), point_in_viewport)
     }
 
     pub(crate) fn elements_from_point_query(
@@ -3017,9 +3072,78 @@ impl Window {
         }
     }
 
-    /// Commence a new URL load which will either replace this window or scroll to a fragment.
-    ///
-    /// <https://html.spec.whatwg.org/multipage/#navigating-across-documents>
+    /// <https://html.spec.whatwg.org/multipage/#navigate-fragid>
+    fn navigate_to_fragment(&self, url: &ServoUrl, history_handling: NavigationHistoryBehavior) {
+        let doc = self.Document();
+        // Step 1. Let navigation be navigable's active window's navigation API.
+        // TODO
+        // Step 2. Let destinationNavigationAPIState be navigable's active session history entry's navigation API state.
+        // TODO
+        // Step 3. If navigationAPIState is not null, then set destinationNavigationAPIState to navigationAPIState.
+        // TODO
+
+        // Step 4. Let continue be the result of firing a push/replace/reload navigate event
+        // at navigation with navigationType set to historyHandling, isSameDocument set to true,
+        // userInvolvement set to userInvolvement, sourceElement set to sourceElement,
+        // destinationURL set to url, and navigationAPIState set to destinationNavigationAPIState.
+        // TODO
+        // Step 5. If continue is false, then return.
+        // TODO
+
+        // Step 6. Let historyEntry be a new session history entry, with
+        // Step 7. Let entryToReplace be navigable's active session history entry if historyHandling is "replace", otherwise null.
+        // Step 8. Let history be navigable's active document's history object.
+        // Step 9. Let scriptHistoryIndex be history's index.
+        // Step 10. Let scriptHistoryLength be history's length.
+        // Step 11. If historyHandling is "push", then:
+        // Step 13. Set navigable's active session history entry to historyEntry.
+        self.send_to_constellation(ScriptToConstellationMessage::NavigatedToFragment(
+            url.clone(),
+            history_handling,
+        ));
+        // Step 12. Set navigable's active document's URL to url.
+        let old_url = doc.url();
+        doc.set_url(url.clone());
+        // Step 14. Update document for history step application given navigable's active document,
+        // historyEntry, true, scriptHistoryIndex, scriptHistoryLength, and historyHandling.
+        doc.update_document_for_history_step_application(&old_url, url);
+        // Step 15. Scroll to the fragment given navigable's active document.
+        let Some(fragment) = url.fragment() else {
+            unreachable!("Must always have a fragment");
+        };
+        doc.scroll_to_the_fragment(fragment);
+        // Step 16. Let traversable be navigable's traversable navigable.
+        // TODO
+        // Step 17. Append the following session history synchronous navigation steps involving navigable to traversable:
+        // TODO
+    }
+
+    pub(crate) fn load_data_for_document(
+        &self,
+        url: ServoUrl,
+        pipeline_id: PipelineId,
+    ) -> LoadData {
+        let source_document = self.Document();
+        let secure_context = if self.is_top_level() {
+            None
+        } else {
+            Some(self.IsSecureContext())
+        };
+        LoadData::new(
+            LoadOrigin::Script(self.origin().snapshot()),
+            url,
+            source_document.about_base_url(),
+            Some(pipeline_id),
+            Referrer::ReferrerUrl(source_document.url()),
+            source_document.get_referrer_policy(),
+            secure_context,
+            Some(source_document.insecure_requests_policy()),
+            source_document.has_trustworthy_ancestor_origin(),
+            source_document.creation_sandboxing_flag_set_considering_parent_iframe(),
+        )
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#navigate>
     pub(crate) fn load_url(
         &self,
         history_handling: NavigationHistoryBehavior,
@@ -3034,65 +3158,6 @@ impl Window {
 
         // TODO: Important re security. See https://github.com/servo/servo/issues/23373
         // Step 5. check that the source browsing-context is "allowed to navigate" this window.
-        if !force_reload &&
-            load_data.url.as_url()[..Position::AfterQuery] ==
-                doc.url().as_url()[..Position::AfterQuery]
-        {
-            // Step 6
-            // TODO: Fragment handling appears to have moved to step 13
-            if let Some(fragment) = load_data.url.fragment() {
-                let webdriver_sender = self.webdriver_load_status_sender.borrow().clone();
-                if let Some(ref sender) = webdriver_sender {
-                    let _ = sender.send(WebDriverLoadStatus::NavigationStart);
-                }
-
-                self.send_to_constellation(ScriptToConstellationMessage::NavigatedToFragment(
-                    load_data.url.clone(),
-                    history_handling,
-                ));
-                doc.check_and_scroll_fragment(fragment);
-                let this = Trusted::new(self);
-                let old_url = doc.url().into_string();
-                let new_url = load_data.url.clone().into_string();
-
-                // https://html.spec.whatwg.org/multipage/#update-document-for-history-step-application
-                // Step 6.4.5: If oldURL's fragment is not equal to entry's URL's fragment, then queue a global task on the
-                // DOM manipulation task source given document's relevant global object to fire an event named hashchange at
-                // document's relevant global object, using HashChangeEvent, with the oldURL attribute initialized to the
-                // serialization of oldURL and the newURL attribute initialized to the serialization of entry's URL.
-                let old_fragment = doc.url().fragment().map(ToOwned::to_owned);
-                let new_fragment = load_data.url.fragment().map(ToOwned::to_owned);
-
-                if old_fragment != new_fragment {
-                    let webdriver_sender_for_task = webdriver_sender.clone();
-                    let task = task!(hashchange_event: move || {
-                        let this = this.root();
-                        let event = HashChangeEvent::new(
-                            &this,
-                            atom!("hashchange"),
-                            false,
-                            false,
-                            old_url,
-                            new_url,
-                            CanGc::note(),
-                        );
-                        event.upcast::<Event>().fire(this.upcast::<EventTarget>(), CanGc::note());
-                        if let Some(sender) = webdriver_sender_for_task {
-                            let _ = sender.send(WebDriverLoadStatus::NavigationStop);
-                        }
-                    });
-
-                    self.as_global_scope()
-                        .task_manager()
-                        .dom_manipulation_task_source()
-                        .queue(task);
-                } else if let Some(sender) = webdriver_sender {
-                    let _ = sender.send(WebDriverLoadStatus::NavigationStop);
-                }
-                doc.set_url(load_data.url.clone());
-                return;
-            }
-        }
 
         // Step 4 and 5
         let pipeline_id = self.pipeline_id();
@@ -3106,50 +3171,75 @@ impl Window {
         // Step 23. Let unloadPromptCanceled be the result of checking if unloading
         // is canceled for navigable's active document's inclusive descendant navigables.
         if doc.check_if_unloading_is_cancelled(false, can_gc) {
-            let window_proxy = self.window_proxy();
-            if window_proxy.parent().is_some() {
-                // Step 10
-                // If browsingContext is a nested browsing context,
-                // then put it in the delaying load events mode.
-                window_proxy.start_delaying_load_events_mode();
-            }
-
-            // Step 11. If historyHandling is "auto", then:
-            let resolved_history_handling = if history_handling == NavigationHistoryBehavior::Auto {
-                // Step 11.1. If url equals navigable's active document's URL, and
+            // Step 12. If historyHandling is "auto", then:
+            let history_handling = if history_handling == NavigationHistoryBehavior::Auto {
+                // Step 12.1. If url equals navigable's active document's URL, and
                 // initiatorOriginSnapshot is same origin with targetNavigable's active document's
                 // origin, then set historyHandling to "replace".
+                //
                 // Note: `targetNavigable` is not actually defined in the spec, "active document" is
                 // assumed to be the correct reference based on WPT results
                 if let LoadOrigin::Script(initiator_origin) = initiator_origin_snapshot {
                     if load_data.url == doc.url() && initiator_origin.same_origin(doc.origin()) {
                         NavigationHistoryBehavior::Replace
                     } else {
+                        // Step 12.2. Otherwise, set historyHandling to "push".
                         NavigationHistoryBehavior::Push
                     }
                 } else {
-                    // Step 11.2. Otherwise, set historyHandling to "push".
+                    // Step 12.2. Otherwise, set historyHandling to "push".
                     NavigationHistoryBehavior::Push
                 }
-            // Step 12. If the navigation must be a replace given url and navigable's active
-            // document, then set historyHandling to "replace".
-            } else if load_data.url.scheme() == "javascript" || doc.is_initial_about_blank() {
-                NavigationHistoryBehavior::Replace
             } else {
                 history_handling
             };
+            // Step 13. If the navigation must be a replace given url and navigable's active
+            // document, then set historyHandling to "replace".
+            //
+            // Inlines implementation of https://html.spec.whatwg.org/multipage/#the-navigation-must-be-a-replace
+            let history_handling =
+                if load_data.url.scheme() == "javascript" || doc.is_initial_about_blank() {
+                    NavigationHistoryBehavior::Replace
+                } else {
+                    history_handling
+                };
+
+            // Step 14. If all of the following are true:
+            // > documentResource is null;
+            // > response is null;
+            if !force_reload
+                // > url equals navigable's active session history entry's URL with exclude fragments set to true; and
+                && load_data.url.as_url()[..Position::AfterQuery] ==
+                    doc.url().as_url()[..Position::AfterQuery]
+                // > url's fragment is non-null,
+                && load_data.url.fragment().is_some()
+            {
+                // Step 14.1. Navigate to a fragment given navigable, url, historyHandling,
+                // userInvolvement, sourceElement, navigationAPIState, and navigationId.
+                let webdriver_sender = self.webdriver_load_status_sender.borrow().clone();
+                if let Some(ref sender) = webdriver_sender {
+                    let _ = sender.send(WebDriverLoadStatus::NavigationStart);
+                }
+                self.navigate_to_fragment(&load_data.url, history_handling);
+                // Step 14.2. Return.
+                if let Some(sender) = webdriver_sender {
+                    let _ = sender.send(WebDriverLoadStatus::NavigationStop);
+                }
+                return;
+            }
+
+            // Step 15. If navigable's parent is non-null, then set navigable's is delaying load events to true.
+            let window_proxy = self.window_proxy();
+            if window_proxy.parent().is_some() {
+                window_proxy.start_delaying_load_events_mode();
+            }
 
             if let Some(sender) = self.webdriver_load_status_sender.borrow().as_ref() {
                 let _ = sender.send(WebDriverLoadStatus::NavigationStart);
             }
 
             // Step 13
-            ScriptThread::navigate(
-                self.webview_id,
-                pipeline_id,
-                load_data,
-                resolved_history_handling,
-            );
+            ScriptThread::navigate(self.webview_id, pipeline_id, load_data, history_handling);
         };
     }
 
@@ -3166,6 +3256,35 @@ impl Window {
 
     pub(crate) fn viewport_details(&self) -> ViewportDetails {
         self.viewport_details.get()
+    }
+
+    pub(crate) fn get_or_init_visual_viewport(&self, can_gc: CanGc) -> DomRoot<VisualViewport> {
+        self.visual_viewport.or_init(|| {
+            VisualViewport::new_from_layout_viewport(self, self.viewport_details().size, can_gc)
+        })
+    }
+
+    /// Update the [`VisualViewport`] of this [`Window`] if necessary and note the changes to be processed in the event loop.
+    pub(crate) fn maybe_update_visual_viewport(
+        &self,
+        pinch_zoom_infos: PinchZoomInfos,
+        can_gc: CanGc,
+    ) {
+        // We doesn't need to do anything if the following condition is fulfilled. Since there are no JS listener
+        // to fire and we could reconstruct visual viewport from layout viewport in case JS access it.
+        if pinch_zoom_infos.rect == Rect::from_size(self.viewport_details().size) &&
+            self.visual_viewport.get().is_none()
+        {
+            return;
+        }
+
+        let visual_viewport = self.get_or_init_visual_viewport(can_gc);
+        let changes = visual_viewport.update_from_pinch_zoom_infos(pinch_zoom_infos);
+
+        if changes.intersects(VisualViewportChanges::DimensionChanged) {
+            self.has_changed_visual_viewport_dimension.set(true);
+        }
+        // TODO(stevennovaryo): additionally handle the visual viewport scroll event here
     }
 
     /// Get the theme of this [`Window`].
@@ -3206,20 +3325,20 @@ impl Window {
         self.unhandled_resize_event.borrow().is_some()
     }
 
-    pub(crate) fn suspend(&self, can_gc: CanGc) {
+    pub(crate) fn suspend(&self, cx: &mut js::context::JSContext) {
         // Suspend timer events.
         self.as_global_scope().suspend();
 
         // Set the window proxy to be a cross-origin window.
         if self.window_proxy().currently_active() == Some(self.global().pipeline_id()) {
-            self.window_proxy().unset_currently_active(can_gc);
+            self.window_proxy().unset_currently_active(cx);
         }
 
         // A hint to the JS runtime that now would be a good time to
         // GC any unreachable objects generated by user script,
         // or unattached DOM nodes. Attached DOM nodes can't be GCd yet,
         // as the document might be reactivated later.
-        self.Gc();
+        self.gc();
     }
 
     pub(crate) fn resume(&self, can_gc: CanGc) {
@@ -3284,11 +3403,11 @@ impl Window {
         self.parent_info.is_none()
     }
 
-    /// An implementation of:
+    /// Layout viewport part of:
     /// <https://drafts.csswg.org/cssom-view/#document-run-the-resize-steps>
     ///
-    /// Returns true if there were any pending resize events.
-    pub(crate) fn run_the_resize_steps(&self, can_gc: CanGc) -> bool {
+    /// Handle the pending viewport resize.
+    fn run_resize_steps_for_layout_viewport(&self, can_gc: CanGc) -> bool {
         let Some((new_size, size_type)) = self.take_unhandled_resize_event() else {
             return false;
         };
@@ -3333,6 +3452,36 @@ impl Window {
         }
 
         true
+    }
+
+    /// An implementation of:
+    /// <https://drafts.csswg.org/cssom-view/#document-run-the-resize-steps>
+    ///
+    /// Returns true if there were any pending viewport resize events.
+    pub(crate) fn run_the_resize_steps(&self, can_gc: CanGc) -> bool {
+        let layout_viewport_resized = self.run_resize_steps_for_layout_viewport(can_gc);
+
+        if self.has_changed_visual_viewport_dimension.get() {
+            let visual_viewport = self.get_or_init_visual_viewport(can_gc);
+
+            let uievent = UIEvent::new(
+                self,
+                DOMString::from("resize"),
+                EventBubbles::DoesNotBubble,
+                EventCancelable::NotCancelable,
+                Some(self),
+                0i32,
+                0u32,
+                can_gc,
+            );
+            uievent
+                .upcast::<Event>()
+                .fire(visual_viewport.upcast(), can_gc);
+
+            self.has_changed_visual_viewport_dimension.set(false);
+        }
+
+        layout_viewport_resized
     }
 
     /// Evaluate media query lists and report changes
@@ -3390,6 +3539,10 @@ impl Window {
         self.navigation_start.set(CrossProcessInstant::now());
     }
 
+    pub(crate) fn set_last_activation_timestamp(&self, time: UserActivationTimestamp) {
+        self.last_activation_timestamp.set(time);
+    }
+
     pub(crate) fn send_to_embedder(&self, msg: EmbedderMsg) {
         self.as_global_scope()
             .script_to_embedder_chan()
@@ -3437,7 +3590,7 @@ impl Window {
             let mut images = self.pending_layout_images.borrow_mut();
             if !images.contains_key(&id) {
                 let trusted_node = Trusted::new(&*node);
-                let sender = self.register_image_cache_listener(id, move |response| {
+                let sender = self.register_image_cache_listener(id, move |response, _| {
                     trusted_node
                         .root()
                         .owner_window()
@@ -3487,8 +3640,63 @@ impl Window {
         }
     }
 
+    /// <https://html.spec.whatwg.org/multipage/#sticky-activation>
+    pub(crate) fn has_sticky_activation(&self) -> bool {
+        // > When the current high resolution time given W is greater than or equal to the last activation timestamp in W, W is said to have sticky activation.
+        UserActivationTimestamp::TimeStamp(CrossProcessInstant::now()) >=
+            self.last_activation_timestamp.get()
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#transient-activation>
+    pub(crate) fn has_transient_activation(&self) -> bool {
+        // > When the current high resolution time given W is greater than or equal to the last activation timestamp in W, and less than the last activation
+        // > timestamp in W plus the transient activation duration, then W is said to have transient activation.
+        let current_time = CrossProcessInstant::now();
+        UserActivationTimestamp::TimeStamp(current_time) >= self.last_activation_timestamp.get() &&
+            UserActivationTimestamp::TimeStamp(current_time) <
+                self.last_activation_timestamp.get() +
+                    pref!(dom_transient_activation_duration_ms)
+    }
+
+    pub(crate) fn consume_last_activation_timestamp(&self) {
+        if self.last_activation_timestamp.get() != UserActivationTimestamp::PositiveInfinity {
+            self.set_last_activation_timestamp(UserActivationTimestamp::NegativeInfinity);
+        }
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#consume-user-activation>
+    pub(crate) fn consume_user_activation(&self) {
+        // Step 1.
+        // > If W's navigable is null, then return.
+        if self.undiscarded_window_proxy().is_none() {
+            return;
+        }
+
+        // Step 2.
+        // > Let top be W's navigable's top-level traversable.
+        // TODO: This wouldn't work if top level document is in another ScriptThread.
+        let Some(top_level_document) = self.top_level_document_if_local() else {
+            return;
+        };
+
+        // Step 3.
+        // > Let navigables be the inclusive descendant navigables of top's active document.
+        // Step 4.
+        // > Let windows be the list of Window objects constructed by taking the active window of each item in navigables.
+        // Step 5.
+        // > For each window in windows, if window's last activation timestamp is not positive infinity, then set window's last activation timestamp to negative infinity.
+        // TODO: this would not work for disimilar origin descendant, since we doesn't store the document in this script thread.
+        top_level_document
+            .window()
+            .consume_last_activation_timestamp();
+        for document in SameOriginDescendantNavigablesIterator::new(top_level_document) {
+            document.window().consume_last_activation_timestamp();
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+        cx: &mut js::context::JSContext,
         webview_id: WebViewId,
         runtime: Rc<Runtime>,
         script_chan: Sender<MainThreadScriptMsg>,
@@ -3518,7 +3726,7 @@ impl Window {
         unminify_js: bool,
         unminify_css: bool,
         local_script_source: Option<String>,
-        user_contents: Option<Rc<UserContents>>,
+        user_scripts: Rc<Vec<UserScript>>,
         player_context: WindowGLContext,
         #[cfg(feature = "webgpu")] gpu_id_hub: Arc<IdentityHub>,
         inherited_secure_context: Option<bool>,
@@ -3558,7 +3766,6 @@ impl Window {
             navigator: Default::default(),
             location: Default::default(),
             history: Default::default(),
-            indexeddb: Default::default(),
             custom_element_registry: Default::default(),
             window_proxy: Default::default(),
             document: Default::default(),
@@ -3601,7 +3808,7 @@ impl Window {
             paint_api,
             has_sent_idle_message: Cell::new(false),
             unminify_css,
-            user_contents,
+            user_scripts,
             player_context,
             throttled: Cell::new(false),
             layout_marker: DomRefCell::new(Rc::new(Cell::new(true))),
@@ -3615,9 +3822,11 @@ impl Window {
             has_pending_screenshot_readiness_request: Default::default(),
             visual_viewport: Default::default(),
             weak_script_thread,
+            has_changed_visual_viewport_dimension: Default::default(),
+            last_activation_timestamp: Cell::new(UserActivationTimestamp::PositiveInfinity),
         });
 
-        WindowBinding::Wrap::<crate::DomTypeHolder>(GlobalScope::get_cx(), win)
+        WindowBinding::Wrap::<crate::DomTypeHolder>(cx, win)
     }
 
     pub(crate) fn pipeline_id(&self) -> PipelineId {
@@ -3812,7 +4021,7 @@ unsafe extern "C" fn dump_js_stack(cx: *mut RawJSContext) {
 
 impl WindowHelpers for Window {
     fn create_named_properties_object(
-        cx: JSContext,
+        cx: SafeJSContext,
         proto: HandleObject,
         object: MutableHandleObject,
     ) {

@@ -2,19 +2,50 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
+use serde_json::{Map, Value};
 
-use crate::actor::{Actor, ActorEncode, ActorRegistry};
+use crate::StreamId;
+use crate::actor::{Actor, ActorEncode, ActorError, ActorRegistry};
+use crate::protocol::ClientRequest;
 
 #[derive(Serialize)]
-pub struct ObjectPreview {
+pub(crate) struct ObjectPreview {
     kind: String,
     url: String,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ObjectActorMsg {
+enum EnumIteratorType {
+    PropertyIterator,
+    SymbolIterator,
+}
+
+#[derive(Serialize)]
+struct EnumIterator {
+    actor: String,
+    #[serde(rename = "type")]
+    type_: EnumIteratorType,
+    count: u32,
+}
+
+#[derive(Serialize)]
+struct EnumReply {
+    from: String,
+    iterator: EnumIterator,
+}
+
+#[derive(Serialize)]
+struct PrototypeReply {
+    from: String,
+    prototype: ObjectActorMsg,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ObjectActorMsg {
     actor: String,
     #[serde(rename = "type")]
     type_: String,
@@ -27,9 +58,11 @@ pub struct ObjectActorMsg {
     preview: ObjectPreview,
 }
 
-pub struct ObjectActor {
-    pub name: String,
-    pub _uuid: String,
+#[derive(MallocSizeOf)]
+pub(crate) struct ObjectActor {
+    name: String,
+    _uuid: Option<String>,
+    class: String,
 }
 
 impl Actor for ObjectActor {
@@ -37,21 +70,84 @@ impl Actor for ObjectActor {
         self.name.clone()
     }
 
-    // TODO: Handle messages
     // https://searchfox.org/firefox-main/source/devtools/shared/specs/object.js
+    fn handle_message(
+        &self,
+        request: ClientRequest,
+        registry: &ActorRegistry,
+        msg_type: &str,
+        _msg: &Map<String, Value>,
+        _id: StreamId,
+    ) -> Result<(), ActorError> {
+        match msg_type {
+            "enumProperties" => {
+                let property_iterator = PropertyIteratorActor {
+                    name: registry.new_name::<PropertyIteratorActor>(),
+                };
+                let msg = EnumReply {
+                    from: self.name(),
+                    iterator: EnumIterator {
+                        actor: property_iterator.name(),
+                        type_: EnumIteratorType::PropertyIterator,
+                        count: 0,
+                    },
+                };
+                registry.register(property_iterator);
+                request.reply_final(&msg)?
+            },
+
+            "enumSymbols" => {
+                let symbol_iterator = SymbolIteratorActor {
+                    name: registry.new_name::<SymbolIteratorActor>(),
+                };
+                let msg = EnumReply {
+                    from: self.name(),
+                    iterator: EnumIterator {
+                        actor: symbol_iterator.name(),
+                        type_: EnumIteratorType::SymbolIterator,
+                        count: 0,
+                    },
+                };
+                registry.register(symbol_iterator);
+                request.reply_final(&msg)?
+            },
+
+            "prototype" => {
+                let msg = PrototypeReply {
+                    from: self.name(),
+                    prototype: self.encode(registry),
+                };
+                request.reply_final(&msg)?
+            },
+
+            _ => return Err(ActorError::UnrecognizedPacketType),
+        };
+        Ok(())
+    }
 }
 
 impl ObjectActor {
-    pub fn register(registry: &ActorRegistry, uuid: String) -> String {
-        if !registry.script_actor_registered(uuid.clone()) {
-            let name = registry.new_name("object");
+    pub fn register(registry: &ActorRegistry, uuid: Option<String>, class: String) -> String {
+        let Some(uuid) = uuid else {
+            let name = registry.new_name::<Self>();
             let actor = ObjectActor {
                 name: name.clone(),
-                _uuid: uuid.clone(),
+                _uuid: None,
+                class,
+            };
+            registry.register(actor);
+            return name;
+        };
+        if !registry.script_actor_registered(uuid.clone()) {
+            let name = registry.new_name::<Self>();
+            let actor = ObjectActor {
+                name: name.clone(),
+                _uuid: Some(uuid.clone()),
+                class,
             };
 
             registry.register_script_actor(uuid, name.clone());
-            registry.register_later(actor);
+            registry.register(actor);
 
             name
         } else {
@@ -62,11 +158,10 @@ impl ObjectActor {
 
 impl ActorEncode<ObjectActorMsg> for ObjectActor {
     fn encode(&self, _: &ActorRegistry) -> ObjectActorMsg {
-        // TODO: Review hardcoded values here
         ObjectActorMsg {
             actor: self.name(),
             type_: "object".into(),
-            class: "Window".into(),
+            class: self.class.clone(),
             own_property_length: 0,
             extensible: true,
             frozen: false,
@@ -74,8 +169,31 @@ impl ActorEncode<ObjectActorMsg> for ObjectActor {
             is_error: false,
             preview: ObjectPreview {
                 kind: "ObjectWithURL".into(),
-                url: "".into(),
+                url: "".into(), // TODO: Use the correct url
             },
         }
+    }
+}
+
+// TODO: Implement functionality of property and symbol iterators
+#[derive(MallocSizeOf)]
+struct PropertyIteratorActor {
+    name: String,
+}
+
+impl Actor for PropertyIteratorActor {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+}
+
+#[derive(MallocSizeOf)]
+struct SymbolIteratorActor {
+    name: String,
+}
+
+impl Actor for SymbolIteratorActor {
+    fn name(&self) -> String {
+        self.name.clone()
     }
 }

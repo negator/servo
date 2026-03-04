@@ -10,14 +10,14 @@ use app_units::Au;
 use base::cross_process_instant::CrossProcessInstant;
 use cssparser::{Parser, ParserInput};
 use dom_struct::dom_struct;
-use euclid::default::{Rect, SideOffsets2D, Size2D};
+use euclid::{Rect, SideOffsets2D, Size2D};
 use js::rust::{HandleObject, MutableHandleValue};
 use layout_api::BoxAreaType;
 use style::parser::Parse;
 use style::stylesheets::CssRuleType;
 use style::values::computed::Overflow;
 use style::values::specified::intersection_observer::IntersectionObserverMargin;
-use style_traits::{ParsingMode, ToCss};
+use style_traits::{CSSPixel, ParsingMode, ToCss};
 use url::Url;
 
 use crate::css::parser_context_for_anonymous_content;
@@ -99,6 +99,9 @@ pub(crate) struct IntersectionObserver {
 
     /// <https://w3c.github.io/IntersectionObserver/#dom-intersectionobserver-trackvisibility-slot>
     track_visibility: Cell<bool>,
+
+    /// Whether or not this [`IntersectionObserver`] is connected to its owning [`Document`].
+    connected_to_document: Cell<bool>,
 }
 
 impl IntersectionObserver {
@@ -121,6 +124,7 @@ impl IntersectionObserver {
             thresholds: Default::default(),
             delay: Default::default(),
             track_visibility: Default::default(),
+            connected_to_document: Cell::new(false),
         }
     }
 
@@ -192,7 +196,7 @@ impl IntersectionObserver {
         for num in &thresholds {
             if **num < 0.0 || **num > 1.0 {
                 return Err(Error::Range(
-                    "Value in thresholds should not be less than 0.0 or greater than 1.0"
+                    c"Value in thresholds should not be less than 0.0 or greater than 1.0"
                         .to_owned(),
                 ));
             }
@@ -276,7 +280,7 @@ impl IntersectionObserver {
         target.add_initial_intersection_observer_registration(self);
 
         if self.observation_targets.borrow().is_empty() {
-            self.connect_to_owner_unchecked();
+            self.connect_to_owner();
         }
 
         // Step 4
@@ -310,7 +314,7 @@ impl IntersectionObserver {
 
         // Should disconnect from owner if it is not observing anything.
         if self.observation_targets.borrow().is_empty() {
-            self.disconnect_from_owner_unchecked();
+            self.disconnect_from_owner();
         }
     }
 
@@ -320,16 +324,16 @@ impl IntersectionObserver {
         &self,
         document: &Document,
         time: CrossProcessInstant,
-        root_bounds: Rect<Au>,
-        bounding_client_rect: Rect<Au>,
-        intersection_rect: Rect<Au>,
+        root_bounds: Rect<Au, CSSPixel>,
+        bounding_client_rect: Rect<Au, CSSPixel>,
+        intersection_rect: Rect<Au, CSSPixel>,
         is_intersecting: bool,
         is_visible: bool,
         intersection_ratio: f64,
         target: &Element,
         can_gc: CanGc,
     ) {
-        let rect_to_domrectreadonly = |rect: Rect<Au>| {
+        let rect_to_domrectreadonly = |rect: Rect<Au, CSSPixel>| {
             DOMRectReadOnly::new(
                 self.owner_doc.window().as_global_scope(),
                 None,
@@ -401,22 +405,30 @@ impl IntersectionObserver {
     }
 
     /// Connect the observer itself into owner doc if it is unconnected.
-    /// It would not check whether the observer is already connected or not inside the doc.
-    fn connect_to_owner_unchecked(&self) {
-        self.owner_doc.add_intersection_observer(self);
+    /// If the [`IntersectionObserver`] is already connected, do nothing.
+    fn connect_to_owner(&self) {
+        if !self.connected_to_document.get() {
+            self.owner_doc.add_intersection_observer(self);
+            self.connected_to_document.set(true);
+        }
     }
 
     /// Disconnect the observer itself from owner doc.
-    /// It would not check whether the observer is already disconnected or not inside the doc.
-    fn disconnect_from_owner_unchecked(&self) {
-        self.owner_doc.remove_intersection_observer(self);
+    /// If not connected to a [`Document`], do nothing.
+    fn disconnect_from_owner(&self) {
+        if self.connected_to_document.get() {
+            self.owner_doc.remove_intersection_observer(self);
+        }
     }
 
     /// > The root intersection rectangle for an IntersectionObserver is
     /// > the rectangle we’ll use to check against the targets.
     ///
     /// <https://w3c.github.io/IntersectionObserver/#intersectionobserver-root-intersection-rectangle>
-    pub(crate) fn root_intersection_rectangle(&self, document: &Document) -> Option<Rect<Au>> {
+    pub(crate) fn root_intersection_rectangle(
+        &self,
+        document: &Document,
+    ) -> Option<Rect<Au, CSSPixel>> {
         let window = document.window();
         let intersection_rectangle = match &self.root {
             // Handle if root is an element.
@@ -450,10 +462,8 @@ impl IntersectionObserver {
                     //
                     // There are uncertainties whether the browsing context we should consider is the browsing
                     // context of the target or observer. <https://github.com/w3c/IntersectionObserver/issues/456>
-                    document
-                        .window()
-                        .webview_window_proxy()
-                        .and_then(|window_proxy| window_proxy.document())
+                    // TODO: This wouldn't work if top level document is in another ScriptThread.
+                    document.window().top_level_document_if_local()
                 } else if let Some(ElementOrDocument::Document(document)) = &self.root {
                     Some(document.clone())
                 } else {
@@ -498,7 +508,7 @@ impl IntersectionObserver {
         &self,
         document: &Document,
         target: &Element,
-        maybe_root_bounds: Option<Rect<Au>>,
+        maybe_root_bounds: Option<Rect<Au, CSSPixel>>,
     ) -> IntersectionObservationOutput {
         // Step 5
         // > If the intersection root is not the implicit root, and target is not in
@@ -600,7 +610,7 @@ impl IntersectionObserver {
         &self,
         document: &Document,
         time: CrossProcessInstant,
-        root_bounds: Option<Rect<Au>>,
+        root_bounds: Option<Rect<Au, CSSPixel>>,
         can_gc: CanGc,
     ) {
         for target in &*self.observation_targets.borrow() {
@@ -675,7 +685,10 @@ impl IntersectionObserver {
         }
     }
 
-    fn resolve_percentages_with_basis(&self, containing_block: Rect<Au>) -> SideOffsets2D<Au> {
+    fn resolve_percentages_with_basis(
+        &self,
+        containing_block: Rect<Au, CSSPixel>,
+    ) -> SideOffsets2D<Au, CSSPixel> {
         let inner = &self.root_margin.borrow().0;
         SideOffsets2D::new(
             inner.0.to_used_value(containing_block.height()),
@@ -743,9 +756,6 @@ impl IntersectionObserverMethods<crate::DomTypeHolder> for IntersectionObserver 
     /// <https://w3c.github.io/IntersectionObserver/#dom-intersectionobserver-observe>
     fn Observe(&self, target: &Element) {
         self.observe_target_element(target);
-
-        // Connect to owner doc to be accessed in the event loop.
-        self.connect_to_owner_unchecked();
     }
 
     /// > Run the unobserve a target Element algorithm, providing this and target.
@@ -767,7 +777,7 @@ impl IntersectionObserverMethods<crate::DomTypeHolder> for IntersectionObserver 
         self.observation_targets.borrow_mut().clear();
 
         // We should remove this observer from the event loop.
-        self.disconnect_from_owner_unchecked();
+        self.disconnect_from_owner();
     }
 
     /// <https://w3c.github.io/IntersectionObserver/#dom-intersectionobserver-takerecords>
@@ -849,9 +859,9 @@ fn compute_the_intersection(
     _document: &Document,
     _target: &Element,
     _root: &IntersectionRoot,
-    root_bounds: Rect<Au>,
-    mut intersection_rect: Rect<Au>,
-) -> Rect<Au> {
+    root_bounds: Rect<Au, CSSPixel>,
+    mut intersection_rect: Rect<Au, CSSPixel>,
+) -> Rect<Au, CSSPixel> {
     // > 1. Let intersectionRect be the result of getting the bounding box for target.
     // We had delegated the computation of this to the caller of the function.
 
@@ -902,14 +912,14 @@ fn compute_the_intersection(
 struct IntersectionObservationOutput {
     pub(crate) threshold_index: i32,
     pub(crate) is_intersecting: bool,
-    pub(crate) target_rect: Rect<Au>,
-    pub(crate) intersection_rect: Rect<Au>,
+    pub(crate) target_rect: Rect<Au, CSSPixel>,
+    pub(crate) intersection_rect: Rect<Au, CSSPixel>,
     pub(crate) intersection_ratio: f64,
     pub(crate) is_visible: bool,
 
     /// The root intersection rectangle [`IntersectionObserver::root_intersection_rectangle`].
     /// If the processing is skipped, computation should report the default zero value.
-    pub(crate) root_bounds: Rect<Au>,
+    pub(crate) root_bounds: Rect<Au, CSSPixel>,
 }
 
 impl IntersectionObservationOutput {
@@ -939,11 +949,11 @@ impl IntersectionObservationOutput {
     fn new_computed(
         threshold_index: i32,
         is_intersecting: bool,
-        target_rect: Rect<Au>,
-        intersection_rect: Rect<Au>,
+        target_rect: Rect<Au, CSSPixel>,
+        intersection_rect: Rect<Au, CSSPixel>,
         intersection_ratio: f64,
         is_visible: bool,
-        root_bounds: Rect<Au>,
+        root_bounds: Rect<Au, CSSPixel>,
     ) -> Self {
         Self {
             threshold_index,

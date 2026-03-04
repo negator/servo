@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::sync::Arc;
 use std::vec::IntoIter;
 
 use app_units::Au;
@@ -9,6 +10,7 @@ use fonts::{FontMetrics, FontRef};
 use malloc_size_of_derive::MallocSizeOf;
 use script::layout_dom::ServoThreadSafeLayoutNode;
 use servo_arc::Arc as ServoArc;
+use style::context::SharedStyleContext;
 use style::properties::ComputedValues;
 
 use super::{
@@ -37,10 +39,10 @@ pub(crate) struct InlineBox {
 }
 
 impl InlineBox {
-    pub(crate) fn new(info: &NodeAndStyleInfo) -> Self {
+    pub(crate) fn new(info: &NodeAndStyleInfo, context: &LayoutContext) -> Self {
         Self {
             base: LayoutBoxBase::new(info.into(), info.style.clone()),
-            shared_inline_styles: info.into(),
+            shared_inline_styles: SharedInlineStyles::from_info_and_context(info, context),
             // This will be assigned later, when the box is actually added to the IFC.
             identifier: InlineBoxIdentifier::default(),
             default_font: None,
@@ -54,12 +56,13 @@ impl InlineBox {
 
     pub(crate) fn repair_style(
         &mut self,
+        context: &SharedStyleContext,
         node: &ServoThreadSafeLayoutNode,
         new_style: &ServoArc<ComputedValues>,
     ) {
         self.base.repair_style(new_style);
         *self.shared_inline_styles.style.borrow_mut() = new_style.clone();
-        *self.shared_inline_styles.selected.borrow_mut() = node.selected_style();
+        *self.shared_inline_styles.selected.borrow_mut() = node.selected_style(context);
     }
 }
 
@@ -217,7 +220,7 @@ impl InlineBoxContainerState {
         containing_block: &ContainingBlock,
         layout_context: &LayoutContext,
         parent_container: &InlineContainerState,
-        font_metrics: Option<&FontMetrics>,
+        font_metrics: Option<Arc<FontMetrics>>,
     ) -> Self {
         let style = inline_box.base.style.clone();
         let pbm = inline_box

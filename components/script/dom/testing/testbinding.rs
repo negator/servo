@@ -16,7 +16,7 @@ use js::jsval::JSVal;
 use js::realm::CurrentRealm;
 use js::rust::{CustomAutoRooterGuard, HandleObject, HandleValue, MutableHandleValue};
 use js::typedarray::{self, HeapUint8ClampedArray};
-use script_bindings::codegen::GenericBindings::WindowBinding::WindowMethods;
+use script_bindings::cformat;
 use script_bindings::interfaces::TestBindingHelpers;
 use script_bindings::record::Record;
 use servo_config::prefs;
@@ -41,7 +41,7 @@ use crate::dom::bindings::codegen::UnionTypes::{
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::refcounted::TrustedPromise;
-use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object_with_proto};
+use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object_with_proto_and_cx};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::{ByteString, DOMString, USVString};
 use crate::dom::bindings::trace::RootedTraceableBox;
@@ -71,46 +71,46 @@ impl TestBinding {
     }
 
     fn new(
+        cx: &mut js::context::JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
     ) -> DomRoot<TestBinding> {
-        reflect_dom_object_with_proto(
+        reflect_dom_object_with_proto_and_cx(
             Box::new(TestBinding::new_inherited()),
             global,
             proto,
-            can_gc,
+            cx,
         )
     }
 }
 
 impl TestBindingMethods<crate::DomTypeHolder> for TestBinding {
     fn Constructor(
+        cx: &mut js::context::JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
     ) -> Fallible<DomRoot<TestBinding>> {
-        Ok(TestBinding::new(global, proto, can_gc))
+        Ok(TestBinding::new(cx, global, proto))
     }
 
     #[expect(unused_variables)]
     fn Constructor_(
+        cx: &mut js::context::JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
         nums: Vec<f64>,
     ) -> Fallible<DomRoot<TestBinding>> {
-        Ok(TestBinding::new(global, proto, can_gc))
+        Ok(TestBinding::new(cx, global, proto))
     }
 
     #[expect(unused_variables)]
     fn Constructor__(
+        cx: &mut js::context::JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
         num: f64,
     ) -> Fallible<DomRoot<TestBinding>> {
-        Ok(TestBinding::new(global, proto, can_gc))
+        Ok(TestBinding::new(cx, global, proto))
     }
 
     fn BooleanAttribute(&self) -> bool {
@@ -568,7 +568,7 @@ impl TestBindingMethods<crate::DomTypeHolder> for TestBinding {
         &self,
         _dictionary: RootedTraceableBox<TestDictionaryWithTypedArray>,
     ) {
-        self.global().as_window().Gc();
+        self.global().as_window().gc();
     }
     fn ReceiveTestDictionaryWithSuccessOnKeyword(&self) -> RootedTraceableBox<TestDictionary> {
         RootedTraceableBox::new(TestDictionary {
@@ -980,12 +980,10 @@ impl TestBindingMethods<crate::DomTypeHolder> for TestBinding {
         Record::new()
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn ReturnResolvedPromise(&self, cx: SafeJSContext, v: HandleValue) -> Rc<Promise> {
         Promise::new_resolved(&self.global(), cx, v, CanGc::note())
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn ReturnRejectedPromise(&self, cx: SafeJSContext, v: HandleValue) -> Rc<Promise> {
         Promise::new_rejected(&self.global(), cx, v, CanGc::note())
     }
@@ -999,10 +997,9 @@ impl TestBindingMethods<crate::DomTypeHolder> for TestBinding {
     }
 
     fn PromiseRejectWithTypeError(&self, p: &Promise, s: USVString, can_gc: CanGc) {
-        p.reject_error(Error::Type(s.0), can_gc);
+        p.reject_error(Error::Type(cformat!("{}", s.0)), can_gc);
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn ResolvePromiseDelayed(&self, p: &Promise, value: DOMString, delay: u64) {
         let promise = p.duplicate();
         let cb = TestBindingCallback {
@@ -1073,19 +1070,6 @@ impl TestBindingMethods<crate::DomTypeHolder> for TestBinding {
         }
     }
 
-    #[expect(unsafe_code)]
-    fn CrashHard(&self) {
-        unsafe { std::ptr::null_mut::<i32>().write(42) }
-    }
-
-    fn AdvanceClock(&self, ms: i32) {
-        self.global().as_window().advance_animation_clock(ms);
-    }
-
-    fn Panic(&self) {
-        panic!("explicit panic from script")
-    }
-
     fn EntryGlobal(&self) -> DomRoot<GlobalScope> {
         GlobalScope::entry()
     }
@@ -1115,11 +1099,11 @@ impl TestBindingMethods<crate::DomTypeHolder> for TestBinding {
     }
 
     fn MethodThrowToRejectPromise(&self) -> Fallible<Rc<Promise>> {
-        Err(Error::Type("test".to_string()))
+        Err(Error::Type(c"test".to_owned()))
     }
 
     fn GetGetterThrowToRejectPromise(&self) -> Fallible<Rc<Promise>> {
-        Err(Error::Type("test".to_string()))
+        Err(Error::Type(c"test".to_owned()))
     }
 
     fn MethodInternalThrowToRejectPromise(&self, _arg: u64) -> Rc<Promise> {
@@ -1127,7 +1111,7 @@ impl TestBindingMethods<crate::DomTypeHolder> for TestBinding {
     }
 
     fn StaticThrowToRejectPromise(_: &GlobalScope) -> Fallible<Rc<Promise>> {
-        Err(Error::Type("test".to_string()))
+        Err(Error::Type(c"test".to_owned()))
     }
 
     fn StaticInternalThrowToRejectPromise(_: &GlobalScope, _arg: u64) -> Rc<Promise> {
@@ -1174,7 +1158,6 @@ pub(crate) struct TestBindingCallback {
 }
 
 impl TestBindingCallback {
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub(crate) fn invoke(self) {
         self.promise
             .root()

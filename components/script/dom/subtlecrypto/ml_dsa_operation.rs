@@ -4,6 +4,7 @@
 
 use der::asn1::{BitString, OctetString};
 use der::{AnyRef, Choice, Decode, Encode, Sequence};
+use js::context::JSContext;
 use ml_dsa::{
     B32, EncodedVerifyingKey, KeyGen, MlDsa44, MlDsa65, MlDsa87, Signature, VerifyingKey,
 };
@@ -24,7 +25,6 @@ use crate::dom::subtlecrypto::{
     ALG_ML_DSA_44, ALG_ML_DSA_65, ALG_ML_DSA_87, ExportedKey, JsonWebKeyExt, JwkStringField,
     KeyAlgorithmAndDerivatives, SubtleAlgorithm, SubtleContextParams, SubtleKeyAlgorithm,
 };
-use crate::script_runtime::CanGc;
 
 /// Object Identifier (OID) of ML-DSA-44
 /// Section 2 of <https://datatracker.ietf.org/doc/html/rfc9881>
@@ -284,11 +284,11 @@ pub(crate) fn verify(
 
 /// <https://wicg.github.io/webcrypto-modern-algos/#ml-dsa-operations-generate-key>
 pub(crate) fn generate_key(
+    cx: &mut JSContext,
     global: &GlobalScope,
     normalized_algorithm: &SubtleAlgorithm,
     extractable: bool,
     usages: Vec<KeyUsage>,
-    can_gc: CanGc,
 ) -> Result<CryptoKeyPair, Error> {
     // Step 1. If usages contains a value which is not one of "sign" or "verify", then throw a
     // SyntaxError.
@@ -323,6 +323,7 @@ pub(crate) fn generate_key(
     // Step 10. Set the [[usages]] internal slot of publicKey to be the usage intersection of
     // usages and [ "verify" ].
     let public_key = CryptoKey::new(
+        cx,
         global,
         KeyType::Public,
         true,
@@ -333,7 +334,6 @@ pub(crate) fn generate_key(
             .cloned()
             .collect(),
         public_key_handle,
-        can_gc,
     );
 
     // Step 11. Let privateKey be a new CryptoKey representing the private key of the generated key
@@ -344,6 +344,7 @@ pub(crate) fn generate_key(
     // Step 15. Set the [[usages]] internal slot of privateKey to be the usage intersection of
     // usages and [ "sign" ].
     let private_key = CryptoKey::new(
+        cx,
         global,
         KeyType::Private,
         extractable,
@@ -354,7 +355,6 @@ pub(crate) fn generate_key(
             .cloned()
             .collect(),
         private_key_handle,
-        can_gc,
     );
 
     // Step 16. Let result be a new CryptoKeyPair dictionary.
@@ -371,13 +371,13 @@ pub(crate) fn generate_key(
 
 /// <https://wicg.github.io/webcrypto-modern-algos/#ml-dsa-operations-import-key>
 pub(crate) fn import_key(
+    cx: &mut JSContext,
     global: &GlobalScope,
     normalized_algorithm: &SubtleAlgorithm,
     format: KeyFormat,
     key_data: &[u8],
     extractable: bool,
     usages: Vec<KeyUsage>,
-    can_gc: CanGc,
 ) -> Result<DomRoot<CryptoKey>, Error> {
     // Step 1. Let keyData be the key data to be imported.
 
@@ -457,13 +457,13 @@ pub(crate) fn import_key(
                 name: normalized_algorithm.name.clone(),
             };
             CryptoKey::new(
+                cx,
                 global,
                 KeyType::Public,
                 extractable,
                 KeyAlgorithmAndDerivatives::KeyAlgorithm(algorithm),
                 usages,
                 public_key,
-                can_gc,
             )
         },
         // If format is "pkcs8":
@@ -583,13 +583,13 @@ pub(crate) fn import_key(
                 name: normalized_algorithm.name.clone(),
             };
             CryptoKey::new(
+                cx,
                 global,
                 KeyType::Private,
                 extractable,
                 KeyAlgorithmAndDerivatives::KeyAlgorithm(algorithm),
                 usages,
                 ml_dsa_private_key,
-                can_gc,
             )
         },
         // If format is "raw-public":
@@ -613,13 +613,13 @@ pub(crate) fn import_key(
                 name: normalized_algorithm.name.clone(),
             };
             CryptoKey::new(
+                cx,
                 global,
                 KeyType::Public,
                 extractable,
                 KeyAlgorithmAndDerivatives::KeyAlgorithm(algorithm),
                 usages,
                 public_key_handle,
-                can_gc,
             )
         },
         // If format is "raw-seed":
@@ -652,13 +652,13 @@ pub(crate) fn import_key(
                 name: normalized_algorithm.name.clone(),
             };
             CryptoKey::new(
+                cx,
                 global,
                 KeyType::Private,
                 extractable,
                 KeyAlgorithmAndDerivatives::KeyAlgorithm(algorithm),
                 usages,
                 private_key_handle,
-                can_gc,
             )
         },
         // If format is "jwk":
@@ -668,7 +668,7 @@ pub(crate) fn import_key(
             //     Let jwk equal keyData.
             // Otherwise:
             //     Throw a DataError.
-            let jwk = JsonWebKey::parse(GlobalScope::get_cx(), key_data)?;
+            let jwk = JsonWebKey::parse(cx, key_data)?;
 
             // Step 2.2. If the priv field is present and usages contains a value which is not
             // "sign", or, if the priv field is not present and usages contains a value which is
@@ -757,13 +757,13 @@ pub(crate) fn import_key(
                     name: normalized_algorithm.name.clone(),
                 };
                 CryptoKey::new(
+                    cx,
                     global,
                     KeyType::Private,
                     extractable,
                     KeyAlgorithmAndDerivatives::KeyAlgorithm(algorithm),
                     usages,
                     private_key_handle,
-                    can_gc,
                 )
             }
             // Otherwise:
@@ -782,13 +782,13 @@ pub(crate) fn import_key(
                     name: normalized_algorithm.name.clone(),
                 };
                 CryptoKey::new(
+                    cx,
                     global,
                     KeyType::Public,
                     extractable,
                     KeyAlgorithmAndDerivatives::KeyAlgorithm(algorithm),
                     usages,
                     public_key_handle,
-                    can_gc,
                 )
             }
         },
@@ -806,13 +806,6 @@ pub(crate) fn import_key(
 }
 
 /// <https://wicg.github.io/webcrypto-modern-algos/#ml-dsa-operations-export-key>
-///
-/// The exportKey() method does not involve AlgorithmIdentifier and algorithm normalization, so
-/// there should not be normalizedAlgorithm in the export key operation. It could be a mistake in
-/// the specification (Related issue: <https://github.com/WICG/webcrypto-modern-algos/issues/47>).
-///
-/// In our implementation, we use the name attribute of the [[algorithhm]] internal slot of key to
-/// determine the security category.
 pub(crate) fn export_key(format: KeyFormat, key: &CryptoKey) -> Result<ExportedKey, Error> {
     // Step 1. Let key be the CryptoKey to be exported.
 
@@ -830,22 +823,29 @@ pub(crate) fn export_key(format: KeyFormat, key: &CryptoKey) -> Result<ExportedK
                 )));
             }
 
-            // Step 3.2.
+            // Step 3.2. Let keyAlgorithm be the [[algorithm]] internal slot of key.
+            let KeyAlgorithmAndDerivatives::KeyAlgorithm(key_algorithm) = key.algorithm() else {
+                return Err(Error::Operation(Some(
+                    "[[algorithm]] internal slot of key is not a KeyAlgorithm".to_string(),
+                )));
+            };
+
+            // Step 3.3.
             // Let data be an instance of the SubjectPublicKeyInfo ASN.1 structure defined in
             // [RFC5280] with the following properties:
             //
             //     Set the algorithm field to an AlgorithmIdentifier ASN.1 type with the following
             //     properties:
             //
-            //         If the name member of normalizedAlgorithm is "ML-DSA-44":
+            //         If the name member of keyAlgorithm is "ML-DSA-44":
             //             Set the algorithm object identifier to the id-ml-dsa-44
             //             (2.16.840.1.101.3.4.3.17) OID.
             //
-            //         If the name member of normalizedAlgorithm is "ML-DSA-65":
+            //         If the name member of keyAlgorithm is "ML-DSA-65":
             //             Set the algorithm object identifier to the id-ml-dsa-65
             //             (2.16.840.1.101.3.4.3.18) OID.
             //
-            //         If the name member of normalizedAlgorithm is "ML-DSA-87":
+            //         If the name member of keyAlgorithm is "ML-DSA-87":
             //             Set the algorithm object identifier to the id-ml-dsa-87
             //             (2.16.840.1.101.3.4.3.19) OID.
             //
@@ -853,11 +853,6 @@ pub(crate) fn export_key(format: KeyFormat, key: &CryptoKey) -> Result<ExportedK
             //             throw a NotSupportedError.
             //
             //     Set the subjectPublicKey field to keyData.
-            let KeyAlgorithmAndDerivatives::KeyAlgorithm(key_algorithm) = key.algorithm() else {
-                return Err(Error::Operation(Some(
-                    "[[algorithm]] internal slot of key is not a KeyAlgorithm".to_string(),
-                )));
-            };
             let oid = match key_algorithm.name.as_str() {
                 ALG_ML_DSA_44 => ID_ALG_ML_DSA_44,
                 ALG_ML_DSA_65 => ID_ALG_ML_DSA_65,
@@ -884,7 +879,7 @@ pub(crate) fn export_key(format: KeyFormat, key: &CryptoKey) -> Result<ExportedK
                 subject_public_key,
             };
 
-            // Step 3.3. Let result be the result of DER-encoding data.
+            // Step 3.4. Let result be the result of DER-encoding data.
             ExportedKey::Bytes(data.to_der().map_err(|_| {
                 Error::Operation(Some(
                     "Failed to encode SubjectPublicKeyInfo in DER format".to_string(),
@@ -900,7 +895,14 @@ pub(crate) fn export_key(format: KeyFormat, key: &CryptoKey) -> Result<ExportedK
                 )));
             }
 
-            // Step 3.2.
+            // Step 3.2. Let keyAlgorithm be the [[algorithm]] internal slot of key.
+            let KeyAlgorithmAndDerivatives::KeyAlgorithm(key_algorithm) = key.algorithm() else {
+                return Err(Error::Operation(Some(
+                    "[[algorithm]] internal slot of key is not a KeyAlgorithm".to_string(),
+                )));
+            };
+
+            // Step 3.3.
             // Let data be an instance of the PrivateKeyInfo ASN.1 structure defined in [RFC5208]
             // with the following properties:
             //
@@ -909,15 +911,15 @@ pub(crate) fn export_key(format: KeyFormat, key: &CryptoKey) -> Result<ExportedK
             //     Set the privateKeyAlgorithm field to a PrivateKeyAlgorithmIdentifier ASN.1 type
             //     with the following properties:
             //
-            //         If the name member of normalizedAlgorithm is "ML-DSA-44":
+            //         If the name member of keyAlgorithm is "ML-DSA-44":
             //             Set the algorithm object identifier to the id-ml-dsa-44
             //             (2.16.840.1.101.3.4.3.17) OID.
             //
-            //         If the name member of normalizedAlgorithm is "ML-DSA-65":
+            //         If the name member of keyAlgorithm is "ML-DSA-65":
             //             Set the algorithm object identifier to the id-ml-dsa-65
             //             (2.16.840.1.101.3.4.3.18) OID.
             //
-            //         If the name member of normalizedAlgorithm is "ML-DSA-87":
+            //         If the name member of keyAlgorithm is "ML-DSA-87":
             //             Set the algorithm object identifier to the id-ml-dsa-87
             //             (2.16.840.1.101.3.4.3.19) OID.
             //
@@ -926,21 +928,21 @@ pub(crate) fn export_key(format: KeyFormat, key: &CryptoKey) -> Result<ExportedK
             //
             //     Set the privateKey field as follows:
             //
-            //         If the name member of normalizedAlgorithm is "ML-DSA-44":
+            //         If the name member of keyAlgorithm is "ML-DSA-44":
             //             Set the privateKey field to the result of DER-encoding a
             //             ML-DSA-44-PrivateKey ASN.1 type that represents the ML-DSA private key
             //             seed represented by the [[handle]] internal slot of key using the
             //             seed-only format (using a context-specific [0] primitive tag with an
             //             implicit encoding of OCTET STRING).
             //
-            //         If the name member of normalizedAlgorithm is "ML-DSA-65":
+            //         If the name member of keyAlgorithm is "ML-DSA-65":
             //             Set the privateKey field to the result of DER-encoding a
             //             ML-DSA-65-PrivateKey ASN.1 type that represents the ML-DSA private key
             //             seed represented by the [[handle]] internal slot of key using the
             //             seed-only format (using a context-specific [0] primitive tag with an
             //             implicit encoding of OCTET STRING).
             //
-            //         If the name member of normalizedAlgorithm is "ML-DSA-87":
+            //         If the name member of keyAlgorithm is "ML-DSA-87":
             //             Set the privateKey field to the result of DER-encoding a
             //             ML-DSA-87-PrivateKey ASN.1 type that represents the ML-DSA private key
             //             seed represented by the [[handle]] internal slot of key using the
@@ -949,11 +951,6 @@ pub(crate) fn export_key(format: KeyFormat, key: &CryptoKey) -> Result<ExportedK
             //
             //         Otherwise:
             //             throw a NotSupportedError.
-            let KeyAlgorithmAndDerivatives::KeyAlgorithm(key_algorithm) = key.algorithm() else {
-                return Err(Error::Operation(Some(
-                    "[[algorithm]] internal slot of key is not a KeyAlgorithm".to_string(),
-                )));
-            };
             let oid = match key_algorithm.name.as_str() {
                 ALG_ML_DSA_44 => ID_ALG_ML_DSA_44,
                 ALG_ML_DSA_65 => ID_ALG_ML_DSA_65,
@@ -989,7 +986,7 @@ pub(crate) fn export_key(format: KeyFormat, key: &CryptoKey) -> Result<ExportedK
                 public_key: None,
             };
 
-            // Step 3.3. Let result be the result of DER-encoding data.
+            // Step 3.4. Let result be the result of DER-encoding data.
             ExportedKey::Bytes(private_key_info.to_der().map_err(|_| {
                 Error::Operation(Some(
                     "Failed to encode PrivateKeyInfo in DER format".to_string(),
@@ -1033,22 +1030,24 @@ pub(crate) fn export_key(format: KeyFormat, key: &CryptoKey) -> Result<ExportedK
         // If format is "jwk":
         KeyFormat::Jwk => {
             // Step 3.1. Let jwk be a new JsonWebKey dictionary.
-            // Step 3.2. Set the kty attribute of jwk to "AKP".
-            // Step 3.3. Set the alg attribute of jwk to the name member of normalizedAlgorithm.
+            let mut jwk = JsonWebKey::default();
+
+            // Step 3.2.  Let keyAlgorithm be the [[algorithm]] internal slot of key.
             let KeyAlgorithmAndDerivatives::KeyAlgorithm(key_algorithm) = key.algorithm() else {
                 return Err(Error::Operation(Some(
                     "[[algorithm]] internal slot of key is not a KeyAlgorithm".to_string(),
                 )));
             };
-            let mut jwk = JsonWebKey {
-                kty: Some(DOMString::from("AKP")),
-                alg: Some(DOMString::from(key_algorithm.name.as_str())),
-                ..Default::default()
-            };
 
-            // Step 3.4. Set the pub attribute of jwk to the base64url encoded public key
+            // Step 3.3. Set the kty attribute of jwk to "AKP".
+            jwk.kty = Some(DOMString::from("AKP"));
+
+            // Step 3.4. Set the alg attribute of jwk to the name member of normalizedAlgorithm.
+            jwk.alg = Some(DOMString::from(key_algorithm.name.as_str()));
+
+            // Step 3.5. Set the pub attribute of jwk to the base64url encoded public key
             // corresponding to the [[handle]] internal slot of key.
-            // Step 3.5
+            // Step 3.6.
             // If the [[type]] internal slot of key is "private":
             //     Set the priv attribute of jwk to the base64url encoded seed represented by the
             //     [[handle]] internal slot of key.
@@ -1062,13 +1061,13 @@ pub(crate) fn export_key(format: KeyFormat, key: &CryptoKey) -> Result<ExportedK
                 jwk.encode_string_field(JwkStringField::Pub, &public_key_bytes);
             }
 
-            // Step 3.6. Set the key_ops attribute of jwk to the usages attribute of key.
+            // Step 3.7. Set the key_ops attribute of jwk to the usages attribute of key.
             jwk.set_key_ops(key.usages());
 
-            // Step 3.7. Set the ext attribute of jwk to the [[extractable]] internal slot of key.
+            // Step 3.8. Set the ext attribute of jwk to the [[extractable]] internal slot of key.
             jwk.ext = Some(key.Extractable());
 
-            // Step 3.8. Let result be jwk.
+            // Step 3.9. Let result be jwk.
             ExportedKey::Jwk(Box::new(jwk))
         },
         // Otherwise:

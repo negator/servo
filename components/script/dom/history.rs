@@ -11,12 +11,12 @@ use constellation_traits::{
     ScriptToConstellationMessage, StructuredSerializedData, TraversalDirection,
 };
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use js::jsapi::Heap;
 use js::jsval::{JSVal, NullValue, UndefinedValue};
 use js::rust::{HandleValue, MutableHandleValue};
 use net_traits::CoreResourceMsg;
-use profile_traits::ipc;
-use profile_traits::ipc::channel;
+use profile_traits::{generic_channel, ipc};
 use servo_url::ServoUrl;
 
 use crate::dom::bindings::codegen::Bindings::HistoryBinding::HistoryMethods;
@@ -34,7 +34,7 @@ use crate::dom::globalscope::GlobalScope;
 use crate::dom::hashchangeevent::HashChangeEvent;
 use crate::dom::popstateevent::PopStateEvent;
 use crate::dom::window::Window;
-use crate::script_runtime::{CanGc, JSContext};
+use crate::script_runtime::CanGc;
 
 enum PushOrReplace {
     Push,
@@ -101,7 +101,7 @@ impl History {
 
         // Step 8
         if let Some(fragment) = url.fragment() {
-            document.check_and_scroll_fragment(fragment);
+            document.scroll_to_the_fragment(fragment);
         }
 
         // Step 11
@@ -184,12 +184,11 @@ impl History {
     /// <https://html.spec.whatwg.org/multipage/#dom-history-replacestate>
     fn push_or_replace_state(
         &self,
-        cx: JSContext,
+        cx: &mut JSContext,
         data: HandleValue,
         _title: DOMString,
         url: Option<USVString>,
         push_or_replace: PushOrReplace,
-        can_gc: CanGc,
     ) -> ErrorResult {
         // Step 1
         let document = self.window.Document();
@@ -203,7 +202,7 @@ impl History {
         // https://github.com/servo/servo/issues/19159
 
         // Step 4. Let serializedData be StructuredSerializeForStorage(data). Rethrow any exceptions.
-        let serialized_data = structuredclone::write(cx, data, None)?;
+        let serialized_data = structuredclone::write(cx.into(), data, None)?;
 
         // Step 5. Let newURL be document's URL.
         let new_url: ServoUrl = match url {
@@ -273,12 +272,12 @@ impl History {
         document.set_url(new_url);
 
         // Step 11
-        rooted!(in(*cx) let mut state = UndefinedValue());
+        rooted!(&in(cx) let mut state = UndefinedValue());
         if structuredclone::read(
             self.window.as_global_scope(),
             serialized_data,
             state.handle_mut(),
-            can_gc,
+            CanGc::from_cx(cx),
         )
         .is_err()
         {
@@ -333,7 +332,7 @@ impl History {
 
 impl HistoryMethods<crate::DomTypeHolder> for History {
     /// <https://html.spec.whatwg.org/multipage/#dom-history-state>
-    fn GetState(&self, _cx: JSContext, mut retval: MutableHandleValue) -> Fallible<()> {
+    fn GetState(&self, _cx: &mut JSContext, mut retval: MutableHandleValue) -> Fallible<()> {
         if !self.window.Document().is_fully_active() {
             return Err(Error::Security(None));
         }
@@ -347,8 +346,11 @@ impl HistoryMethods<crate::DomTypeHolder> for History {
             return Err(Error::Security(None));
         }
 
-        let (sender, recv) = channel(self.global().time_profiler_chan().clone())
-            .map_err(|_| Error::InvalidState(None))?;
+        let Some((sender, recv)) =
+            generic_channel::channel(self.global().time_profiler_chan().clone())
+        else {
+            return Err(Error::InvalidState(None));
+        };
 
         let msg = ScriptToConstellationMessage::JointSessionHistoryLength(sender);
 
@@ -362,11 +364,11 @@ impl HistoryMethods<crate::DomTypeHolder> for History {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-history-go>
-    fn Go(&self, delta: i32, can_gc: CanGc) -> ErrorResult {
+    fn Go(&self, cx: &mut JSContext, delta: i32) -> ErrorResult {
         let direction = match delta.cmp(&0) {
             Ordering::Greater => TraversalDirection::Forward(delta as usize),
             Ordering::Less => TraversalDirection::Back(-delta as usize),
-            Ordering::Equal => return self.window.Location().Reload(can_gc),
+            Ordering::Equal => return self.window.Location().Reload(CanGc::from_cx(cx)),
         };
 
         self.traverse_history(direction)
@@ -385,24 +387,22 @@ impl HistoryMethods<crate::DomTypeHolder> for History {
     /// <https://html.spec.whatwg.org/multipage/#dom-history-pushstate>
     fn PushState(
         &self,
-        cx: JSContext,
+        cx: &mut JSContext,
         data: HandleValue,
         title: DOMString,
         url: Option<USVString>,
-        can_gc: CanGc,
     ) -> ErrorResult {
-        self.push_or_replace_state(cx, data, title, url, PushOrReplace::Push, can_gc)
+        self.push_or_replace_state(cx, data, title, url, PushOrReplace::Push)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-history-replacestate>
     fn ReplaceState(
         &self,
-        cx: JSContext,
+        cx: &mut JSContext,
         data: HandleValue,
         title: DOMString,
         url: Option<USVString>,
-        can_gc: CanGc,
     ) -> ErrorResult {
-        self.push_or_replace_state(cx, data, title, url, PushOrReplace::Replace, can_gc)
+        self.push_or_replace_state(cx, data, title, url, PushOrReplace::Replace)
     }
 }

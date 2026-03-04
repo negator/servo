@@ -19,7 +19,6 @@ use std::ffi::c_void;
 use std::fmt::{Debug, Display, Error, Formatter};
 use std::hash::Hash;
 use std::ops::Range;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use base::generic_channel::{GenericCallback, GenericSender, GenericSharedMemory, SendResult};
@@ -27,7 +26,6 @@ use base::id::{PipelineId, WebViewId};
 use crossbeam_channel::Sender;
 use euclid::{Box2D, Point2D, Scale, Size2D, Vector2D};
 use http::{HeaderMap, Method, StatusCode};
-use ipc_channel::ipc::IpcSender;
 use log::warn;
 use malloc_size_of::malloc_size_of_is_0;
 use malloc_size_of_derive::MallocSizeOf;
@@ -218,7 +216,7 @@ pub enum Cursor {
     ZoomOut,
 }
 
-pub trait EventLoopWaker: 'static + Send {
+pub trait EventLoopWaker: 'static + Send + Sync {
     fn clone_box(&self) -> Box<dyn EventLoopWaker>;
     fn wake(&self) {}
 }
@@ -228,14 +226,15 @@ impl Clone for Box<dyn EventLoopWaker> {
         self.clone_box()
     }
 }
+
 /// Sends messages to the embedder.
-pub struct EmbedderProxy {
-    pub sender: Sender<EmbedderMsg>,
+pub struct GenericEmbedderProxy<T> {
+    pub sender: Sender<T>,
     pub event_loop_waker: Box<dyn EventLoopWaker>,
 }
 
-impl EmbedderProxy {
-    pub fn send(&self, message: EmbedderMsg) {
+impl<T> GenericEmbedderProxy<T> {
+    pub fn send(&self, message: T) {
         // Send a message and kick the OS event loop awake.
         if let Err(err) = self.sender.send(message) {
             warn!("Failed to send response ({:?}).", err);
@@ -244,14 +243,16 @@ impl EmbedderProxy {
     }
 }
 
-impl Clone for EmbedderProxy {
-    fn clone(&self) -> EmbedderProxy {
-        EmbedderProxy {
+impl<T> Clone for GenericEmbedderProxy<T> {
+    fn clone(&self) -> Self {
+        Self {
             sender: self.sender.clone(),
             event_loop_waker: self.event_loop_waker.clone(),
         }
     }
 }
+
+pub type EmbedderProxy = GenericEmbedderProxy<EmbedderMsg>;
 
 /// A [`RefreshDriver`] is a trait that can be implemented by Servo embedders in
 /// order to drive let Servo know when to start preparing the next frame. For example,
@@ -338,7 +339,7 @@ impl TraversalId {
     }
 }
 
-#[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize, MallocSizeOf)]
 pub enum PixelFormat {
     /// Luminance channel only
     K8,
@@ -353,12 +354,13 @@ pub enum PixelFormat {
 }
 
 /// A raster image buffer.
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, MallocSizeOf)]
 pub struct Image {
     pub width: u32,
     pub height: u32,
     pub format: PixelFormat,
     /// A shared memory block containing the data of one or more image frames.
+    #[conditional_malloc_size_of]
     data: Arc<GenericSharedMemory>,
     range: Range<usize>,
 }
@@ -386,7 +388,8 @@ impl Image {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, MallocSizeOf)]
+#[serde(rename_all = "lowercase")]
 pub enum ConsoleLogLevel {
     Log,
     Debug,
@@ -424,13 +427,6 @@ pub enum EmbedderMsg {
     /// or `prompt()`). Since their messages are controlled by web content, they should be presented to the user in a
     /// way that makes them impossible to mistake for browser UI.
     ShowSimpleDialog(WebViewId, SimpleDialogRequest),
-    /// Request authentication for a load or navigation from the embedder.
-    RequestAuthentication(
-        WebViewId,
-        ServoUrl,
-        bool, /* for proxy */
-        GenericSender<Option<AuthenticationResponse>>,
-    ),
     /// Whether or not to allow a pipeline to load a url.
     AllowNavigationRequest(WebViewId, PipelineId, ServoUrl),
     /// Request to (un)register protocol handler by page content.
@@ -453,7 +449,7 @@ pub enum EmbedderMsg {
     /// Inform embedder to clear the clipboard
     ClearClipboard(WebViewId),
     /// Gets system clipboard contents
-    GetClipboardText(WebViewId, IpcSender<Result<String, String>>),
+    GetClipboardText(WebViewId, GenericCallback<Result<String, String>>),
     /// Sets system clipboard contents
     SetClipboardText(WebViewId, String),
     /// Changes the cursor.
@@ -472,21 +468,10 @@ pub enum EmbedderMsg {
     NotifyFullscreenStateChanged(WebViewId, bool),
     /// The [`LoadStatus`] of the Given `WebView` has changed.
     NotifyLoadStatusChanged(WebViewId, LoadStatus),
-    WebResourceRequested(
-        Option<WebViewId>,
-        WebResourceRequest,
-        GenericSender<WebResourceResponseMsg>,
-    ),
     /// A pipeline panicked. First string is the reason, second one is the backtrace.
     Panic(WebViewId, String, Option<String>),
     /// Open dialog to select bluetooth device.
     GetSelectedBluetoothDevice(WebViewId, Vec<String>, GenericSender<Option<String>>),
-    /// Open file dialog to select files. Set boolean flag to true allows to select multiple files.
-    SelectFiles(
-        EmbedderControlId,
-        FilePickerRequest,
-        GenericSender<Option<Vec<PathBuf>>>,
-    ),
     /// Open interface to request permission specified by prompt.
     PromptPermission(WebViewId, PermissionFeature, GenericSender<AllowOrDeny>),
     /// Report a complete sampled profile
@@ -531,6 +516,8 @@ pub enum EmbedderMsg {
     /// Inform the embedding layer that a particular `InputEvent` was handled by Servo
     /// and the embedder can continue processing it, if necessary.
     InputEventHandled(WebViewId, InputEventId, InputEventResult),
+    /// Send the embedder an accessibility tree update.
+    AccessibilityTreeUpdate(WebViewId, accesskit::TreeUpdate),
 }
 
 impl Debug for EmbedderMsg {

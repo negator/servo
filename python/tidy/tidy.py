@@ -432,6 +432,17 @@ def check_ruff_lints() -> Iterator[tuple[str, int, str]]:
             )
 
 
+def check_flake8_lints() -> Iterator[tuple[str, int, str]]:
+    try:
+        args = ["uv", "run", "flake8", "--append-config=flake8.ini"]
+        subprocess.check_output(args, universal_newlines=True, cwd="tests/wpt/tests/tools")
+    except subprocess.CalledProcessError as e:
+        output = e.output
+        for error in output.splitlines():
+            filename, line_num, _, message = error.split(":", 3)
+            yield filename, line_num, message.strip()
+
+
 @dataclass
 class PyreflyDiagnostic:
     """
@@ -506,6 +517,16 @@ def run_cargo_deny_lints() -> Iterator[tuple[str, int, str]]:
         elif error_severity in ["warning", "error"]:
             errors.append((CARGO_DENY_CONFIG_FILE, line, f"{message}: {span}"))
 
+    # If there are no known errors but cargo-deny still failed, ensure test-tidy also fails.
+    if len(errors) == 0 and result.returncode != 0:
+        errors.append(
+            (
+                CARGO_DENY_CONFIG_FILE,
+                1,
+                f"Unknown error when running `cargo-deny`. See the full output:\n f{result.stderr}",
+            )
+        )
+
     for error in errors:
         yield error
 
@@ -571,8 +592,15 @@ def check_shell(file_name: str, lines: list[bytes]) -> Iterator[tuple[int, str]]
             next_idx = dollar.end()
             if next_idx < len(stripped):
                 next_char = stripped[next_idx]
-                if not (next_char == "{" or next_char == "("):
-                    yield (idx + 1, 'variable substitutions should use the full "${VAR}" form')
+                # Variable substitutions should use the full "${VAR}" form, except for special parameters.
+                # See https://www.gnu.org/software/bash/manual/html_node/Special-Parameters.html
+                if next_char not in ["{", "(", "*", "@", "#", "?", "-", "$", "!"]:
+                    # Additionally, $0 - $9 are fine, but $10 needs braces.
+                    if next_char.isdigit():
+                        if next_idx + 1 < len(stripped) and stripped[next_idx + 1].isdigit():
+                            yield idx + 1, 'variable substitutions should use the full "${VAR}" form'
+                    else:
+                        yield idx + 1, 'variable substitutions should use the full "${VAR}" form'
 
 
 def check_rust(file_name: str, lines: list[bytes]) -> Iterator[tuple[int, str]]:
@@ -714,6 +742,7 @@ def run_wpt_lints(only_changed_files: bool) -> Iterator[tuple[str, int, str]]:
 
     yield from check_that_manifests_are_clean()
     yield from lint_wpt_test_files()
+    yield from check_flake8_lints()
 
 
 def check_spec(file_name: str, lines: list[bytes]) -> Iterator[tuple[int, str]]:

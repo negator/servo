@@ -133,6 +133,14 @@ impl Gui {
             .memory(|memory| memory.focused().is_some())
     }
 
+    pub(crate) fn surrender_focus(&self) {
+        self.context.egui_ctx.memory_mut(|memory| {
+            if let Some(focused) = memory.focused() {
+                memory.surrender_focus(focused);
+            }
+        });
+    }
+
     pub(crate) fn on_window_event(
         &mut self,
         winit_window: &Window,
@@ -607,6 +615,10 @@ impl Gui {
 
     pub(crate) fn set_zoom_factor(&self, factor: f32) {
         self.context.egui_ctx.set_zoom_factor(factor);
+    }
+
+    pub(crate) fn notify_accessibility_tree_update(&mut self, _tree_update: accesskit::TreeUpdate) {
+        // TODO(#41930): Forward this update to `self.context.egui_winit.accesskit`
     }
 }
 

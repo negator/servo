@@ -19,7 +19,7 @@ use crate::PropagatedBoxTreeData;
 use crate::cell::ArcRefCell;
 use crate::construct_modern::{ModernContainerBuilder, ModernItemKind};
 use crate::context::LayoutContext;
-use crate::dom::LayoutBox;
+use crate::dom::{LayoutBox, WeakLayoutBox};
 use crate::dom_traversal::{NodeAndStyleInfo, NonReplacedContents};
 use crate::formatting_contexts::IndependentFormattingContext;
 use crate::fragment_tree::BaseFragmentInfo;
@@ -113,7 +113,7 @@ impl FlexContainer {
         let children = items
             .into_iter()
             .map(|item| {
-                let box_ = match item.kind {
+                let flex_item_box = match item.kind {
                     ModernItemKind::InFlow(independent_formatting_context) => ArcRefCell::new(
                         FlexLevelBox::FlexItem(FlexItemBox::new(independent_formatting_context)),
                     ),
@@ -131,11 +131,9 @@ impl FlexContainer {
                     },
                 };
 
-                if let Some(box_slot) = item.box_slot {
-                    box_slot.set(LayoutBox::FlexLevel(box_.clone()));
-                }
-
-                box_
+                item.box_slot
+                    .set(LayoutBox::FlexLevel(flex_item_box.clone()));
+                flex_item_box
             })
             .collect();
 
@@ -198,11 +196,23 @@ impl FlexLevelBox {
             },
         }
     }
+
+    pub(crate) fn attached_to_tree(&self, layout_box: WeakLayoutBox) {
+        match self {
+            Self::FlexItem(flex_item_box) => flex_item_box
+                .independent_formatting_context
+                .attached_to_tree(layout_box),
+            Self::OutOfFlowAbsolutelyPositionedBox(positioned_box) => positioned_box
+                .borrow_mut()
+                .context
+                .attached_to_tree(layout_box),
+        }
+    }
 }
 
 #[derive(MallocSizeOf)]
 pub(crate) struct FlexItemBox {
-    independent_formatting_context: IndependentFormattingContext,
+    pub(crate) independent_formatting_context: IndependentFormattingContext,
 }
 
 impl std::fmt::Debug for FlexItemBox {
@@ -218,7 +228,7 @@ impl FlexItemBox {
         }
     }
 
-    fn style(&self) -> &ServoArc<ComputedValues> {
+    pub(crate) fn style(&self) -> &ServoArc<ComputedValues> {
         self.independent_formatting_context.style()
     }
 

@@ -12,6 +12,7 @@ mod layout_damage;
 pub mod wrapper_traits;
 
 use std::any::Any;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
 use std::thread::JoinHandle;
@@ -24,16 +25,15 @@ use base::Epoch;
 use base::generic_channel::GenericSender;
 use base::id::{BrowsingContextId, PipelineId, WebViewId};
 use bitflags::bitflags;
-use compositing_traits::CrossProcessPaintApi;
 use embedder_traits::{Cursor, Theme, UntrustedNodeAddress, ViewportDetails};
-use euclid::Point2D;
-use euclid::default::{Point2D as UntypedPoint2D, Rect};
+use euclid::{Point2D, Rect};
 use fonts::{FontContext, WebFontDocumentContext};
 pub use layout_damage::LayoutDamage;
 use libc::c_void;
 use malloc_size_of::{MallocSizeOf as MallocSizeOfTrait, MallocSizeOfOps, malloc_size_of_is_0};
 use malloc_size_of_derive::MallocSizeOf;
 use net_traits::image_cache::{ImageCache, ImageCacheFactory, PendingImageId};
+use paint_api::CrossProcessPaintApi;
 use parking_lot::RwLock;
 use pixels::RasterImage;
 use profile_traits::mem::Report;
@@ -45,6 +45,7 @@ use servo_arc::Arc as ServoArc;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use style::Atom;
 use style::animation::DocumentAnimationSet;
+use style::attr::{AttrValue, parse_integer, parse_unsigned_integer};
 use style::context::QuirksMode;
 use style::data::ElementData;
 use style::dom::OpaqueNode;
@@ -53,7 +54,9 @@ use style::media_queries::Device;
 use style::properties::style_structs::Font;
 use style::properties::{ComputedValues, PropertyId};
 use style::selector_parser::{PseudoElement, RestyleDamage, Snapshot};
-use style::stylesheets::{Stylesheet, UrlExtraData};
+use style::str::char_is_whitespace;
+use style::stylesheets::{DocumentStyleSheet, Stylesheet, UrlExtraData};
+use style::thread_state::{self, ThreadState};
 use style::values::computed::Overflow;
 use style_traits::CSSPixel;
 use webrender_api::units::{DeviceIntSize, LayoutPoint, LayoutVector2D};
@@ -132,12 +135,34 @@ pub struct HTMLCanvasData {
     pub height: u32,
 }
 
-pub struct SVGElementData {
+pub struct SVGElementData<'dom> {
     /// The SVG's XML source represented as a base64 encoded `data:` url.
     pub source: Option<Result<ServoUrl, ()>>,
-    pub width: Option<i32>,
-    pub height: Option<i32>,
-    pub ratio: Option<f32>,
+    pub width: Option<&'dom AttrValue>,
+    pub height: Option<&'dom AttrValue>,
+    pub svg_id: String,
+    pub view_box: Option<&'dom AttrValue>,
+}
+
+impl SVGElementData<'_> {
+    pub fn ratio_from_view_box(&self) -> Option<f32> {
+        let mut iter = self.view_box?.chars();
+        let _min_x = parse_integer(&mut iter).ok()?;
+        let _min_y = parse_integer(&mut iter).ok()?;
+
+        let width = parse_unsigned_integer(&mut iter).ok()?;
+        if width == 0 {
+            return None;
+        }
+
+        let height = parse_unsigned_integer(&mut iter).ok()?;
+        if height == 0 {
+            return None;
+        }
+
+        let mut iter = iter.skip_while(|c| char_is_whitespace(*c));
+        iter.next().is_none().then(|| width as f32 / height as f32)
+    }
 }
 
 /// The address of a node known to be valid. These are sent from script to layout.
@@ -211,7 +236,9 @@ pub struct LayoutConfig {
     pub time_profiler_chan: time::ProfilerChan,
     pub paint_api: CrossProcessPaintApi,
     pub viewport_details: ViewportDetails,
+    pub user_stylesheets: Rc<Vec<DocumentStyleSheet>>,
     pub theme: Theme,
+    pub accessibility_active: bool,
 }
 
 pub struct PropertyRegistration {
@@ -282,6 +309,9 @@ pub trait Layout {
     /// Removes a stylesheet from the Layout.
     fn remove_stylesheet(&mut self, stylesheet: ServoArc<Stylesheet>);
 
+    /// Removes an image from the Layout image resolver cache.
+    fn remove_cached_image(&mut self, image_url: &ServoUrl);
+
     /// Requests a reflow.
     fn reflow(&mut self, reflow_request: ReflowRequest) -> Option<ReflowResult>;
 
@@ -319,9 +349,9 @@ pub trait Layout {
         node: TrustedNodeAddress,
         area: BoxAreaType,
         exclude_transform_and_inline: bool,
-    ) -> Option<Rect<Au>>;
-    fn query_box_areas(&self, node: TrustedNodeAddress, area: BoxAreaType) -> Vec<Rect<Au>>;
-    fn query_client_rect(&self, node: TrustedNodeAddress) -> Rect<i32>;
+    ) -> Option<Rect<Au, CSSPixel>>;
+    fn query_box_areas(&self, node: TrustedNodeAddress, area: BoxAreaType) -> CSSPixelRectIterator;
+    fn query_client_rect(&self, node: TrustedNodeAddress) -> Rect<i32, CSSPixel>;
     fn query_current_css_zoom(&self, node: TrustedNodeAddress) -> f32;
     fn query_element_inner_outer_text(&self, node: TrustedNodeAddress) -> String;
     fn query_offset_parent(&self, node: TrustedNodeAddress) -> OffsetParentResponse;
@@ -347,8 +377,13 @@ pub trait Layout {
         animations: DocumentAnimationSet,
         animation_timeline_value: f64,
     ) -> Option<ServoArc<Font>>;
-    fn query_scrolling_area(&self, node: Option<TrustedNodeAddress>) -> Rect<i32>;
-    fn query_text_indext(&self, node: OpaqueNode, point: UntypedPoint2D<f32>) -> Option<usize>;
+    fn query_scrolling_area(&self, node: Option<TrustedNodeAddress>) -> Rect<i32, CSSPixel>;
+    /// Find the character offset of the point in the given node, if it has text content.
+    fn query_text_index(
+        &self,
+        node: TrustedNodeAddress,
+        point: Point2D<Au, CSSPixel>,
+    ) -> Option<usize>;
     fn query_elements_from_point(
         &self,
         point: LayoutPoint,
@@ -358,6 +393,8 @@ pub trait Layout {
         &mut self,
         property_registration: PropertyRegistration,
     ) -> Result<(), RegisterPropertyError>;
+
+    fn set_accessibility_active(&self, active: bool);
 }
 
 /// This trait is part of `layout_api` because it depends on both `script_traits`
@@ -382,6 +419,8 @@ pub enum BoxAreaType {
     Border,
 }
 
+pub type CSSPixelRectIterator = Box<dyn Iterator<Item = Rect<Au, CSSPixel>>>;
+
 #[derive(Default)]
 pub struct PhysicalSides {
     pub left: Au,
@@ -393,7 +432,7 @@ pub struct PhysicalSides {
 #[derive(Clone, Default)]
 pub struct OffsetParentResponse {
     pub node_address: Option<UntrustedNodeAddress>,
-    pub rect: Rect<Au>,
+    pub rect: Rect<Au, CSSPixel>,
 }
 
 bitflags! {
@@ -523,6 +562,7 @@ impl RestyleReason {
 pub struct ReflowResult {
     /// The phases that were run during this reflow.
     pub reflow_phases_run: ReflowPhasesRun,
+    pub reflow_statistics: ReflowStatistics,
     /// The list of images that were encountered that are in progress.
     pub pending_images: Vec<PendingImage>,
     /// The list of vector images that were encountered that still need to be rasterized.
@@ -561,6 +601,12 @@ impl ReflowPhasesRun {
             Self::BuiltDisplayList | Self::UpdatedScrollNodeOffset | Self::UpdatedImageData,
         )
     }
+}
+
+#[derive(Debug, Default)]
+pub struct ReflowStatistics {
+    pub rebuilt_fragment_count: u32,
+    pub restyle_fragment_count: u32,
 }
 
 /// Information needed for a script-initiated reflow that requires a restyle
@@ -823,6 +869,39 @@ impl AnimatingImages {
     pub fn is_empty(&self) -> bool {
         self.node_to_state_map.is_empty()
     }
+}
+
+struct ThreadStateRestorer;
+
+impl ThreadStateRestorer {
+    fn new() -> Self {
+        #[cfg(debug_assertions)]
+        {
+            thread_state::exit(ThreadState::SCRIPT);
+            thread_state::enter(ThreadState::LAYOUT);
+        }
+        Self
+    }
+}
+
+impl Drop for ThreadStateRestorer {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            thread_state::exit(ThreadState::LAYOUT);
+            thread_state::enter(ThreadState::SCRIPT);
+        }
+    }
+}
+
+/// Set up the thread-local state to reflect that layout code is about to run,
+/// then call the provided function.
+/// This must be used when running code that will interact with the DOM tree
+/// through types like `ServoLayoutNode`, `ServoLayoutElement`, and `LayoutDom`,
+/// which have rules about how they must be used from layout worker threads.
+pub fn with_layout_state<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = ThreadStateRestorer::new();
+    f()
 }
 
 #[cfg(test)]

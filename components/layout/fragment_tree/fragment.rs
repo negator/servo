@@ -8,12 +8,13 @@ use app_units::Au;
 use atomic_refcell::{AtomicRef, AtomicRefMut};
 use base::id::PipelineId;
 use base::print_tree::PrintTree;
-use euclid::{Point2D, Rect, Size2D, UnknownUnit};
-use fonts::{ByteIndex, FontMetrics, GlyphStore};
+use euclid::{Point2D, Rect, Size2D};
+use fonts::{FontMetrics, GlyphStore};
 use layout_api::BoxAreaType;
 use malloc_size_of_derive::MallocSizeOf;
-use range::Range as ServoRange;
+use servo_url::ServoUrl;
 use style::Zero;
+use style_traits::CSSPixel;
 use webrender_api::{FontInstanceKey, ImageKey};
 
 use super::{
@@ -22,6 +23,7 @@ use super::{
 };
 use crate::SharedStyle;
 use crate::cell::ArcRefCell;
+use crate::flow::inline::line::TextRunOffsets;
 use crate::geom::{LogicalSides, PhysicalPoint, PhysicalRect};
 use crate::style_ext::ComputedValuesExt;
 
@@ -65,14 +67,16 @@ pub(crate) struct CollapsedMargin {
 pub(crate) struct TextFragment {
     pub base: BaseFragment,
     pub selected_style: SharedStyle,
-    pub font_metrics: FontMetrics,
+    #[conditional_malloc_size_of]
+    pub font_metrics: Arc<FontMetrics>,
     pub font_key: FontInstanceKey,
     #[conditional_malloc_size_of]
     pub glyphs: Vec<Arc<GlyphStore>>,
-
     /// Extra space to add for each justification opportunity.
     pub justification_adjustment: Au,
-    pub selection_range: Option<ServoRange<ByteIndex>>,
+    /// When necessary, this field store the [`TextRunOffsets`] for a particular
+    /// [`TextRunLineItem`]. This is currently only used inside of text inputs.
+    pub offsets: Option<Box<TextRunOffsets>>,
 }
 
 #[derive(MallocSizeOf)]
@@ -81,6 +85,7 @@ pub(crate) struct ImageFragment {
     pub clip: PhysicalRect<Au>,
     pub image_key: Option<ImageKey>,
     pub showing_broken_image_icon: bool,
+    pub url: Option<ServoUrl>,
 }
 
 #[derive(MallocSizeOf)]
@@ -238,7 +243,7 @@ impl Fragment {
         }
     }
 
-    pub(crate) fn client_rect(&self) -> Rect<i32, UnknownUnit> {
+    pub(crate) fn client_rect(&self) -> Rect<i32, CSSPixel> {
         let rect = match self {
             Fragment::Box(fragment) | Fragment::Float(fragment) => {
                 // https://drafts.csswg.org/cssom-view/#dom-element-clienttop
@@ -264,14 +269,27 @@ impl Fragment {
                 }
             },
             _ => return Rect::zero(),
-        }
-        .to_untyped();
+        };
 
         let rect = Rect::new(
             Point2D::new(rect.origin.x.to_f32_px(), rect.origin.y.to_f32_px()),
             Size2D::new(rect.size.width.to_f32_px(), rect.size.height.to_f32_px()),
         );
         rect.round().to_i32()
+    }
+
+    pub(crate) fn children<'a>(&'a self) -> Option<AtomicRef<'a, Vec<Fragment>>> {
+        match self {
+            Fragment::Box(fragment) | Fragment::Float(fragment) => {
+                let fragment = fragment.borrow();
+                Some(AtomicRef::map(fragment, |fragment| &fragment.children))
+            },
+            Fragment::Positioning(fragment) => {
+                let fragment = fragment.borrow();
+                Some(AtomicRef::map(fragment, |fragment| &fragment.children))
+            },
+            _ => None,
+        }
     }
 
     pub(crate) fn find<T>(
@@ -342,14 +360,56 @@ impl TextFragment {
             "Text num_glyphs={} box={:?}",
             self.glyphs
                 .iter()
-                .map(|glyph_store| glyph_store.len().0)
-                .sum::<isize>(),
-            self.base.rect,
+                .map(|glyph_store| glyph_store.len())
+                .sum::<usize>(),
+            self.base.rect
         ));
     }
 
-    pub fn has_selection(&self) -> bool {
-        self.selection_range.is_some()
+    /// Find the distance between for point relative to a [`TextFragment`] for the
+    /// purposes of finding a glyph offset. This is used to identify the most relevant
+    /// fragment for glyph offset queries during click handling.
+    pub(crate) fn distance_to_point_for_glyph_offset(
+        &self,
+        point_in_fragment: Point2D<Au, CSSPixel>,
+    ) -> Option<Au> {
+        // Accept any `TextFragment` that is within the vertical range of the point, as one
+        // can click past the end of a line to move the cursor to its end.
+        let rect = &self.base.rect;
+        if point_in_fragment.y < Au::zero() || point_in_fragment.y > rect.height() {
+            return None;
+        }
+        // Only consider clicks that are to the right of the fragment's origin.
+        if point_in_fragment.x < Au::zero() {
+            return None;
+        }
+        Some(point_in_fragment.x - rect.width().max(Au::zero()))
+    }
+
+    /// Given a point relative to this [`TextFragment`], find the most appropriate character
+    /// offset. Note that the given point may be outside the [`TextFragment`]'s content rect.
+    pub(crate) fn character_offset(&self, point_in_fragment: Point2D<Au, CSSPixel>) -> usize {
+        let Some(offsets) = self.offsets.as_ref() else {
+            return 0;
+        };
+
+        let mut current_character = offsets.character_range.start;
+        let mut current_offset = Au::zero();
+        for glyph_store in &self.glyphs {
+            for glyph in glyph_store.glyphs() {
+                let mut advance = glyph.advance();
+                if glyph.char_is_word_separator() {
+                    advance += self.justification_adjustment;
+                }
+                if current_offset + advance.scale_by(0.5) >= point_in_fragment.x {
+                    return current_character;
+                }
+                current_offset += advance;
+                current_character += glyph.character_count();
+            }
+        }
+
+        current_character
     }
 }
 

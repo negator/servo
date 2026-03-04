@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-#![cfg_attr(crown, allow(crown::unrooted_must_root))]
+#![cfg_attr(crown, expect(crown::unrooted_must_root))]
 
 use std::cell::Cell;
 
@@ -54,6 +54,9 @@ impl Tokenizer {
                     if let Some(script) = handle.downcast::<HTMLScriptElement>() {
                         return TokenizerResult::Script(DomRoot::from_ref(script));
                     }
+                },
+                TokenizerResult::EncodingIndicator(encoding) => {
+                    return TokenizerResult::EncodingIndicator(encoding);
                 },
             }
         }

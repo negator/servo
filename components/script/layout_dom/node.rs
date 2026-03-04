@@ -9,9 +9,9 @@ use std::fmt;
 use std::iter::FusedIterator;
 
 use base::id::{BrowsingContextId, PipelineId};
-use fonts_traits::ByteIndex;
 use layout_api::wrapper_traits::{
-    LayoutDataTrait, LayoutNode, PseudoElementChain, ThreadSafeLayoutElement, ThreadSafeLayoutNode,
+    LayoutDataTrait, LayoutNode, PseudoElementChain, SharedSelection, ThreadSafeLayoutElement,
+    ThreadSafeLayoutNode,
 };
 use layout_api::{
     GenericLayoutData, HTMLCanvasData, HTMLMediaData, LayoutElementType, LayoutNodeType,
@@ -19,18 +19,23 @@ use layout_api::{
 };
 use net_traits::image_cache::Image;
 use pixels::ImageMetadata;
-use range::Range;
+use script_bindings::error::Fallible;
 use selectors::Element as _;
 use servo_arc::Arc;
 use servo_url::ServoUrl;
 use style;
+use style::context::SharedStyleContext;
 use style::dom::{NodeInfo, TElement, TNode, TShadowRoot};
+use style::dom_apis::{MayUseInvalidation, SelectorQuery, query_selector};
 use style::properties::ComputedValues;
-use style::selector_parser::PseudoElement;
+use style::selector_parser::{PseudoElement, SelectorParser};
+use style::stylesheets::UrlExtraData;
+use url::Url;
 
 use super::{
     ServoLayoutDocument, ServoLayoutElement, ServoShadowRoot, ServoThreadSafeLayoutElement,
 };
+use crate::dom::bindings::error::Error;
 use crate::dom::bindings::inheritance::NodeTypeId;
 use crate::dom::bindings::root::LayoutDom;
 use crate::dom::element::{Element, LayoutElementHelpers};
@@ -70,7 +75,7 @@ impl fmt::Debug for ServoLayoutNode<'_> {
 }
 
 impl<'dom> ServoLayoutNode<'dom> {
-    pub(super) fn from_layout_js(n: LayoutDom<'dom, Node>) -> Self {
+    pub(crate) fn from_layout_js(n: LayoutDom<'dom, Node>) -> Self {
         ServoLayoutNode { node: n }
     }
 
@@ -99,6 +104,39 @@ impl<'dom> ServoLayoutNode<'dom> {
             .as_ref()
             .map(LayoutDom::upcast)
             .map(ServoLayoutElement::from_layout_js)
+    }
+
+    /// <https://dom.spec.whatwg.org/#scope-match-a-selectors-string>
+    pub(crate) fn scope_match_a_selectors_string<Query>(
+        self,
+        document_url: Arc<Url>,
+        selector: &str,
+    ) -> Fallible<Query::Output>
+    where
+        Query: SelectorQuery<ServoLayoutElement<'dom>>,
+        Query::Output: Default,
+    {
+        let mut result = Query::Output::default();
+
+        // Step 1. Let selector be the result of parse a selector selectors.
+        let selector_or_error =
+            SelectorParser::parse_author_origin_no_namespace(selector, &UrlExtraData(document_url));
+
+        // Step 2. If selector is failure, then throw a "SyntaxError" DOMException.
+        let Ok(selector_list) = selector_or_error else {
+            return Err(Error::Syntax(None));
+        };
+
+        // Step 3. Return the result of match a selector against a tree with selector
+        // and node’s root using scoping root node.
+        query_selector::<ServoLayoutElement<'dom>, Query>(
+            self,
+            &selector_list,
+            &mut result,
+            MayUseInvalidation::No,
+        );
+
+        Ok(result)
     }
 }
 
@@ -273,15 +311,11 @@ impl<'dom> ServoThreadSafeLayoutNode<'dom> {
                 self.node.node.is_text_container_of_single_line_input())
     }
 
-    pub fn is_text_input(&self) -> bool {
-        self.node.node.is_text_input()
-    }
-
-    pub fn selected_style(&self) -> Arc<ComputedValues> {
+    pub fn selected_style(&self, context: &SharedStyleContext) -> Arc<ComputedValues> {
         let Some(element) = self.as_element() else {
             // TODO(stshine): What should the selected style be for text?
             debug_assert!(self.is_text_node());
-            return self.parent_style();
+            return self.parent_style(context);
         };
 
         let style_data = &element.style_data().styles;
@@ -290,7 +324,12 @@ impl<'dom> ServoThreadSafeLayoutNode<'dom> {
             // propagate to the children and Shadow DOM elements. For this case, UA widget
             // inner elements should follow the originating element in terms of selection.
             if self.node.node.is_in_ua_widget() {
-                return Some(element.containing_shadow_host()?.as_node().selected_style());
+                return Some(
+                    element
+                        .containing_shadow_host()?
+                        .as_node()
+                        .selected_style(context),
+                );
             }
             style_data.pseudos.get(&PseudoElement::Selection).cloned()
         };
@@ -331,7 +370,12 @@ impl<'dom> ThreadSafeLayoutNode<'dom> for ServoThreadSafeLayoutNode<'dom> {
         }
     }
 
-    fn parent_style(&self) -> Arc<ComputedValues> {
+    fn parent_style(&self, context: &SharedStyleContext) -> Arc<ComputedValues> {
+        if let Some(chain) = self.pseudo_element_chain.without_innermost() {
+            let mut parent = *self;
+            parent.pseudo_element_chain = chain;
+            return parent.style(context);
+        }
         let parent_element = self.node.traversal_parent().unwrap();
         let parent_data = parent_element.borrow_data().unwrap();
         parent_data.styles.primary().clone()
@@ -380,19 +424,13 @@ impl<'dom> ThreadSafeLayoutNode<'dom> for ServoThreadSafeLayoutNode<'dom> {
         self.node
     }
 
-    fn node_text_content(self) -> Cow<'dom, str> {
+    fn text_content(self) -> Cow<'dom, str> {
         unsafe { self.get_jsmanaged().text_content() }
     }
 
-    fn selection(&self) -> Option<Range<ByteIndex>> {
+    fn selection(&self) -> Option<SharedSelection> {
         let this = unsafe { self.get_jsmanaged() };
-
-        this.selection().map(|range| {
-            Range::new(
-                ByteIndex(range.start as isize),
-                ByteIndex(range.len() as isize),
-            )
-        })
+        this.selection()
     }
 
     fn image_url(&self) -> Option<ServoUrl> {
@@ -425,7 +463,7 @@ impl<'dom> ThreadSafeLayoutNode<'dom> for ServoThreadSafeLayoutNode<'dom> {
         this.media_data()
     }
 
-    fn svg_data(&self) -> Option<SVGElementData> {
+    fn svg_data(&self) -> Option<SVGElementData<'dom>> {
         let this = unsafe { self.get_jsmanaged() };
         this.svg_data()
     }

@@ -44,7 +44,7 @@ impl DOMMatrix {
         Self::new_with_proto(global, None, is2D, matrix, can_gc)
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     fn new_with_proto(
         global: &GlobalScope,
         proto: Option<HandleObject>,
@@ -93,7 +93,7 @@ impl DOMMatrixMethods<crate::DomTypeHolder> for DOMMatrix {
             StringOrUnrestrictedDoubleSequence::String(ref s) => {
                 if !global.is::<Window>() {
                     return Err(error::Error::Type(
-                        "String constructor is only supported in the main thread.".to_owned(),
+                        c"String constructor is only supported in the main thread.".to_owned(),
                     ));
                 }
                 if s.is_empty() {

@@ -8,12 +8,14 @@ with import (builtins.fetchTarball {
   # NixOS users: if servoshell crashes with an assertion failure in surfman’s x11/connection.rs,
   # eglInitialize() may be failing, or you may be building with an incompatible version of glibc.
   # Use your system nixpkgs here, change `llvmPackages` below if necessary, then do a clean build.
-  url = "https://github.com/NixOS/nixpkgs/archive/a8d610af3f1a5fb71e23e08434d8d61a466fc942.tar.gz";
+  url = "https://github.com/NixOS/nixpkgs/archive/ffbc9f8cbaacfb331b6017d5a5abb21a492c9a38.tar.gz";
 }) {
   overlays = [
     (import (builtins.fetchTarball {
       # Bumped the channel in rust-toolchain.toml? Bump this commit too!
-      url = "https://github.com/oxalica/rust-overlay/archive/0881bcdf6c34cd3ba558b19d7a74d8ffc9e1fff0.tar.gz";
+      # Use the latest commit hash for the manifest associated with the relevant version number in
+      # https://github.com/oxalica/rust-overlay/tree/master/manifests
+      url = "https://github.com/oxalica/rust-overlay/archive/99cc5667eece98bb35dcf35f7e511031a8b7a125.tar.gz";
     }))
   ];
   config = {
@@ -144,7 +146,7 @@ stdenv.mkDerivation (androidEnvironment // {
   # Provide libraries that aren’t linked against but somehow required
   LD_LIBRARY_PATH = lib.makeLibraryPath [
     # Fixes missing library errors
-    xorg.libXcursor xorg.libXrandr xorg.libXi libxkbcommon
+    wayland xorg.libXcursor xorg.libXrandr xorg.libXi libxkbcommon
 
     # [WARN  script::dom::gpu] Could not get GPUAdapter ("NotFound")
     # TLA Err: Error: Couldn't request WebGPU adapter.

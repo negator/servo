@@ -3,13 +3,18 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use base64::Engine as _;
+use cssparser::{Parser, ParserInput};
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Prefix, local_name, ns};
 use js::rust::HandleObject;
 use layout_api::SVGElementData;
 use servo_url::ServoUrl;
-use style::attr::{AttrValue, parse_integer, parse_unsigned_integer};
-use style::str::char_is_whitespace;
+use style::attr::AttrValue;
+use style::parser::ParserContext;
+use style::stylesheets::Origin;
+use style::values::specified::Length;
+use style_traits::ParsingMode;
+use uuid::Uuid;
 use xml5ever::serialize::TraversalScope;
 
 use crate::dom::attr::Attr;
@@ -21,7 +26,10 @@ use crate::dom::bindings::root::{DomRoot, LayoutDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
 use crate::dom::element::{AttributeMutation, Element, LayoutElementHelpers};
-use crate::dom::node::{ChildrenMutation, CloneChildrenFlag, Node, NodeDamage, ShadowIncluding};
+use crate::dom::node::{
+    ChildrenMutation, CloneChildrenFlag, Node, NodeDamage, NodeTraits, ShadowIncluding,
+    UnbindContext,
+};
 use crate::dom::svg::svggraphicselement::SVGGraphicsElement;
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::script_runtime::CanGc;
@@ -29,6 +37,7 @@ use crate::script_runtime::CanGc;
 #[dom_struct]
 pub(crate) struct SVGSVGElement {
     svggraphicselement: SVGGraphicsElement,
+    uuid: String,
     // The XML source of subtree rooted at this SVG element, serialized into
     // a base64 encoded `data:` url. This is cached to avoid recomputation
     // on each layout and must be invalidated when the subtree changes.
@@ -44,6 +53,7 @@ impl SVGSVGElement {
     ) -> SVGSVGElement {
         SVGSVGElement {
             svggraphicselement: SVGGraphicsElement::new_inherited(local_name, prefix, document),
+            uuid: Uuid::new_v4().to_string(),
             cached_serialized_data_url: Default::default(),
         }
     }
@@ -153,46 +163,18 @@ impl SVGSVGElement {
     }
 }
 
-pub(crate) trait LayoutSVGSVGElementHelpers {
-    fn data(self) -> SVGElementData;
+pub(crate) trait LayoutSVGSVGElementHelpers<'dom> {
+    fn data(self) -> SVGElementData<'dom>;
 }
 
-fn ratio_from_view_box(view_box: &AttrValue) -> Option<f32> {
-    let mut iter = view_box.chars();
-    let _min_x = parse_integer(&mut iter).ok()?;
-    let _min_y = parse_integer(&mut iter).ok()?;
-    let width = parse_unsigned_integer(&mut iter).ok()?;
-    if width == 0 {
-        return None;
-    }
-    let height = parse_unsigned_integer(&mut iter).ok()?;
-    if height == 0 {
-        return None;
-    }
-    let mut iter = iter.skip_while(|c| char_is_whitespace(*c));
-    iter.next().is_none().then(|| width as f32 / height as f32)
-}
-
-impl LayoutSVGSVGElementHelpers for LayoutDom<'_, SVGSVGElement> {
+impl<'dom> LayoutSVGSVGElementHelpers<'dom> for LayoutDom<'dom, SVGSVGElement> {
     #[expect(unsafe_code)]
-    fn data(self) -> SVGElementData {
+    fn data(self) -> SVGElementData<'dom> {
+        let svg_id = self.unsafe_get().uuid.clone();
         let element = self.upcast::<Element>();
-        let get_size = |attr| {
-            element
-                .get_attr_for_layout(&ns!(), &attr)
-                .map(|val| val.as_int())
-                .filter(|val| *val >= 0)
-        };
-        let width = get_size(local_name!("width"));
-        let height = get_size(local_name!("height"));
-        let ratio = match (width, height) {
-            (Some(width), Some(height)) if width != 0 && height != 0 => {
-                Some(width as f32 / height as f32)
-            },
-            _ => element
-                .get_attr_for_layout(&ns!(), &local_name!("viewBox"))
-                .and_then(ratio_from_view_box),
-        };
+        let width = element.get_attr_for_layout(&ns!(), &local_name!("width"));
+        let height = element.get_attr_for_layout(&ns!(), &local_name!("height"));
+        let view_box = element.get_attr_for_layout(&ns!(), &local_name!("viewBox"));
         SVGElementData {
             source: unsafe {
                 self.unsafe_get()
@@ -202,7 +184,8 @@ impl LayoutSVGSVGElementHelpers for LayoutDom<'_, SVGSVGElement> {
             },
             width,
             height,
-            ratio,
+            view_box,
+            svg_id,
         }
     }
 }
@@ -232,8 +215,29 @@ impl VirtualMethods for SVGSVGElement {
 
     fn parse_plain_attribute(&self, name: &LocalName, value: DOMString) -> AttrValue {
         match *name {
-            // TODO: This should accept lengths in arbitrary units instead of assuming px.
-            local_name!("width") | local_name!("height") => AttrValue::from_i32(value.into(), -1),
+            local_name!("width") | local_name!("height") => {
+                let value = &value.str();
+                let parser_input = &mut ParserInput::new(value);
+                let parser = &mut Parser::new(parser_input);
+                let doc = self.owner_document();
+                let url = doc.url().into_url().into();
+                let context = ParserContext::new(
+                    Origin::Author,
+                    &url,
+                    None,
+                    ParsingMode::ALLOW_UNITLESS_LENGTH,
+                    doc.quirks_mode(),
+                    /* namespaces = */ Default::default(),
+                    None,
+                    None,
+                );
+                let val = Length::parse_quirky(
+                    &context,
+                    parser,
+                    style::values::specified::AllowQuirks::Always,
+                );
+                AttrValue::Length(value.to_string(), val.ok())
+            },
             _ => self
                 .super_type()
                 .unwrap()
@@ -246,6 +250,26 @@ impl VirtualMethods for SVGSVGElement {
             super_type.children_changed(mutation, can_gc);
         }
 
+        self.invalidate_cached_serialized_subtree();
+    }
+
+    fn unbind_from_tree(&self, context: &UnbindContext<'_>, can_gc: CanGc) {
+        if let Some(s) = self.super_type() {
+            s.unbind_from_tree(context, can_gc);
+        }
+        let owner_window = self.owner_window();
+        self.owner_window()
+            .image_cache()
+            .evict_rasterized_image(&self.uuid);
+        let data_url = self.cached_serialized_data_url.borrow().clone();
+        if let Some(Ok(url)) = data_url {
+            owner_window.layout_mut().remove_cached_image(&url);
+            owner_window.image_cache().evict_completed_image(
+                &url,
+                owner_window.origin().immutable(),
+                &None,
+            );
+        }
         self.invalidate_cached_serialized_subtree();
     }
 }

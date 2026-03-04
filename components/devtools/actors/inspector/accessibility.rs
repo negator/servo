@@ -5,6 +5,7 @@
 //! The Accessibility actor is responsible for the Accessibility tab in the DevTools page. Right
 //! now it is a placeholder for future functionality.
 
+use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -52,7 +53,8 @@ struct GetWalkerReply {
     walker: ActorMsg,
 }
 
-pub struct AccessibilityActor {
+#[derive(MallocSizeOf)]
+pub(crate) struct AccessibilityActor {
     name: String,
 }
 
@@ -89,10 +91,13 @@ impl Actor for AccessibilityActor {
             },
             "getSimulator" => {
                 // TODO: Create actual simulator
-                let simulator = registry.new_name("simulator");
+                let actor = registry.new_name::<SimulatorActor>();
+                registry.register(SimulatorActor {
+                    name: actor.clone(),
+                });
                 let msg = GetSimulatorReply {
                     from: self.name(),
-                    simulator: ActorMsg { actor: simulator },
+                    simulator: ActorMsg { actor },
                 };
                 request.reply_final(&msg)?
             },
@@ -107,10 +112,13 @@ impl Actor for AccessibilityActor {
             },
             "getWalker" => {
                 // TODO: Create actual accessible walker
-                let walker = registry.new_name("accesiblewalker");
+                let actor = registry.new_name::<AccessibleWalkerActor>();
+                registry.register(AccessibleWalkerActor {
+                    name: actor.clone(),
+                });
                 let msg = GetWalkerReply {
                     from: self.name(),
-                    walker: ActorMsg { actor: walker },
+                    walker: ActorMsg { actor },
                 };
                 request.reply_final(&msg)?
             },
@@ -123,5 +131,27 @@ impl Actor for AccessibilityActor {
 impl AccessibilityActor {
     pub fn new(name: String) -> Self {
         Self { name }
+    }
+}
+
+#[derive(MallocSizeOf)]
+pub(crate) struct SimulatorActor {
+    name: String,
+}
+
+impl Actor for SimulatorActor {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+}
+
+#[derive(MallocSizeOf)]
+pub(crate) struct AccessibleWalkerActor {
+    name: String,
+}
+
+impl Actor for AccessibleWalkerActor {
+    fn name(&self) -> String {
+        self.name.clone()
     }
 }

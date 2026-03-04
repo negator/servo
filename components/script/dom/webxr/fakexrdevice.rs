@@ -5,11 +5,10 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
+use base::generic_channel::GenericSender;
 use dom_struct::dom_struct;
 use euclid::{Point2D, Point3D, Rect, RigidTransform3D, Rotation3D, Size2D, Transform3D, Vector3D};
-use ipc_channel::ipc::IpcSender;
-use ipc_channel::router::ROUTER;
-use profile_traits::ipc;
+use profile_traits::generic_callback::GenericCallback as ProfileGenericCallback;
 use webxr_api::{
     EntityType, Handedness, InputId, InputSource, MockDeviceMsg, MockInputInit, MockRegion,
     MockViewInit, MockViewsInit, MockWorld, TargetRayMode, Triangle, Visibility,
@@ -39,16 +38,14 @@ use crate::script_runtime::CanGc;
 #[dom_struct]
 pub(crate) struct FakeXRDevice {
     reflector: Reflector,
-    #[ignore_malloc_size_of = "defined in ipc-channel"]
     #[no_trace]
-    sender: IpcSender<MockDeviceMsg>,
-    #[ignore_malloc_size_of = "defined in webxr-api"]
+    sender: GenericSender<MockDeviceMsg>,
     #[no_trace]
     next_input_id: Cell<InputId>,
 }
 
 impl FakeXRDevice {
-    pub(crate) fn new_inherited(sender: IpcSender<MockDeviceMsg>) -> FakeXRDevice {
+    pub(crate) fn new_inherited(sender: GenericSender<MockDeviceMsg>) -> FakeXRDevice {
         FakeXRDevice {
             reflector: Reflector::new(),
             sender,
@@ -58,7 +55,7 @@ impl FakeXRDevice {
 
     pub(crate) fn new(
         global: &GlobalScope,
-        sender: IpcSender<MockDeviceMsg>,
+        sender: GenericSender<MockDeviceMsg>,
         can_gc: CanGc,
     ) -> DomRoot<FakeXRDevice> {
         reflect_dom_object(
@@ -68,14 +65,14 @@ impl FakeXRDevice {
         )
     }
 
-    pub(crate) fn disconnect(&self, sender: IpcSender<()>) {
+    pub(crate) fn disconnect(&self, sender: ProfileGenericCallback<()>) {
         let _ = self.sender.send(MockDeviceMsg::Disconnect(sender));
     }
 }
 
 pub(crate) fn view<Eye>(view: &FakeXRViewInit) -> Fallible<MockViewInit<Eye>> {
     if view.projectionMatrix.len() != 16 || view.viewOffset.position.len() != 3 {
-        return Err(Error::Type("Incorrectly sized array".into()));
+        return Err(Error::Type(c"Incorrectly sized array".into()));
     }
 
     let mut proj = [0.; 16];
@@ -129,7 +126,7 @@ pub(crate) fn get_origin<T, U>(
     origin: &FakeXRRigidTransformInit,
 ) -> Fallible<RigidTransform3D<f32, T, U>> {
     if origin.position.len() != 3 || origin.orientation.len() != 4 {
-        return Err(Error::Type("Incorrectly sized array".into()));
+        return Err(Error::Type(c"Incorrectly sized array".into()));
     }
     let p = Vector3D::new(
         *origin.position[0],
@@ -162,7 +159,7 @@ pub(crate) fn get_world(world: &FakeXRWorldInit) -> Fallible<MockWorld> {
                 .map(|face| {
                     if face.vertices.len() != 3 {
                         return Err(Error::Type(
-                            "Incorrectly sized array for triangle list".into(),
+                            c"Incorrectly sized array for triangle list".into(),
                         ));
                     }
 
@@ -315,18 +312,16 @@ impl FakeXRDeviceMethods<crate::DomTypeHolder> for FakeXRDevice {
             .task_manager()
             .dom_manipulation_task_source()
             .to_sendable();
-        let (sender, receiver) = ipc::channel(global.time_profiler_chan().clone()).unwrap();
 
-        ROUTER.add_typed_route(
-            receiver.to_ipc_receiver(),
-            Box::new(move |_| {
+        let callback =
+            ProfileGenericCallback::new(global.time_profiler_chan().clone(), move |_| {
                 let trusted = trusted
                     .take()
                     .expect("disconnect callback called multiple times");
                 task_source.queue(trusted.resolve_task(()));
-            }),
-        );
-        self.disconnect(sender);
+            })
+            .expect("Could not create callback");
+        self.disconnect(callback);
         p
     }
 
@@ -334,7 +329,7 @@ impl FakeXRDeviceMethods<crate::DomTypeHolder> for FakeXRDevice {
     fn SetBoundsGeometry(&self, bounds_coodinates: Vec<FakeXRBoundsPoint>) -> Fallible<()> {
         if bounds_coodinates.len() < 3 {
             return Err(Error::Type(
-                "Bounds geometry must contain at least 3 points".into(),
+                c"Bounds geometry must contain at least 3 points".into(),
             ));
         }
         let coords = bounds_coodinates

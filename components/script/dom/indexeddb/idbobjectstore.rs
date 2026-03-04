@@ -1,17 +1,21 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+use std::collections::HashMap;
 
-use base::generic_channel::GenericSend;
+use base::generic_channel::{GenericSend, GenericSender};
 use dom_struct::dom_struct;
+use js::context::JSContext;
+use js::conversions::ToJSValConvertible;
 use js::gc::MutableHandleValue;
 use js::jsval::NullValue;
 use js::rust::HandleValue;
 use profile_traits::generic_channel::channel;
-use script_bindings::conversions::SafeToJSValConvertible;
+use script_bindings::codegen::GenericBindings::IDBObjectStoreBinding::IDBIndexParameters;
+use script_bindings::codegen::GenericUnionTypes::StringOrStringSequence;
 use script_bindings::error::ErrorResult;
 use storage_traits::indexeddb::{
-    AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, IndexedDBKeyType,
+    self, AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, IndexedDBKeyType,
     IndexedDBThreadMsg, SyncOperation,
 };
 
@@ -34,12 +38,14 @@ use crate::dom::domstringlist::DOMStringList;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::indexeddb::idbcursor::{IDBCursor, IterationParam, ObjectStoreOrIndex};
 use crate::dom::indexeddb::idbcursorwithvalue::IDBCursorWithValue;
+use crate::dom::indexeddb::idbindex::IDBIndex;
 use crate::dom::indexeddb::idbrequest::IDBRequest;
 use crate::dom::indexeddb::idbtransaction::IDBTransaction;
 use crate::indexeddb::{
-    ExtractionResult, convert_value_to_key, convert_value_to_key_range, extract_key,
+    ExtractionResult, can_inject_key_into_value, convert_value_to_key, convert_value_to_key_range,
+    extract_key, inject_key_into_value, map_backend_error_to_dom_error,
 };
-use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
+use crate::script_runtime::CanGc;
 
 #[derive(Clone, JSTraceable, MallocSizeOf)]
 pub enum KeyPath {
@@ -47,12 +53,43 @@ pub enum KeyPath {
     StringSequence(Vec<DOMString>),
 }
 
+impl From<StringOrStringSequence> for KeyPath {
+    fn from(value: StringOrStringSequence) -> Self {
+        match value {
+            StringOrStringSequence::String(s) => KeyPath::String(s),
+            StringOrStringSequence::StringSequence(ss) => KeyPath::StringSequence(ss),
+        }
+    }
+}
+
+impl From<indexeddb::KeyPath> for KeyPath {
+    fn from(value: indexeddb::KeyPath) -> Self {
+        match value {
+            indexeddb::KeyPath::String(s) => KeyPath::String(DOMString::from_string(s)),
+            indexeddb::KeyPath::Sequence(ss) => {
+                KeyPath::StringSequence(ss.into_iter().map(DOMString::from_string).collect())
+            },
+        }
+    }
+}
+
+impl From<KeyPath> for indexeddb::KeyPath {
+    fn from(item: KeyPath) -> Self {
+        match item {
+            KeyPath::String(s) => Self::String(s.to_string()),
+            KeyPath::StringSequence(ss) => {
+                Self::Sequence(ss.into_iter().map(|s| s.to_string()).collect())
+            },
+        }
+    }
+}
+
 #[dom_struct]
 pub struct IDBObjectStore {
     reflector_: Reflector,
     name: DomRefCell<DOMString>,
     key_path: Option<KeyPath>,
-    index_names: DomRoot<DOMStringList>,
+    index_set: DomRefCell<HashMap<DOMString, Dom<IDBIndex>>>,
     transaction: Dom<IDBTransaction>,
 
     // We store the db name in the object store to be able to find the correct
@@ -62,11 +99,9 @@ pub struct IDBObjectStore {
 
 impl IDBObjectStore {
     pub fn new_inherited(
-        global: &GlobalScope,
         db_name: DOMString,
         name: DOMString,
         options: Option<&IDBObjectStoreParameters>,
-        can_gc: CanGc,
         transaction: &IDBTransaction,
     ) -> IDBObjectStore {
         let key_path: Option<KeyPath> = match options {
@@ -83,8 +118,7 @@ impl IDBObjectStore {
             reflector_: Reflector::new(),
             name: DomRefCell::new(name),
             key_path,
-
-            index_names: DOMStringList::new(global, Vec::new(), can_gc),
+            index_set: DomRefCell::new(HashMap::new()),
             transaction: Dom::from_ref(transaction),
             db_name,
         }
@@ -100,11 +134,9 @@ impl IDBObjectStore {
     ) -> DomRoot<IDBObjectStore> {
         reflect_dom_object(
             Box::new(IDBObjectStore::new_inherited(
-                global,
                 db_name,
                 name,
                 options,
-                can_gc,
                 transaction,
             )),
             global,
@@ -116,31 +148,55 @@ impl IDBObjectStore {
         self.name.borrow().clone()
     }
 
-    pub fn transaction(&self) -> DomRoot<IDBTransaction> {
+    pub(crate) fn transaction(&self) -> DomRoot<IDBTransaction> {
         self.transaction.as_rooted()
     }
 
+    fn get_idb_thread(&self) -> GenericSender<IndexedDBThreadMsg> {
+        self.global().storage_threads().sender()
+    }
+
     fn has_key_generator(&self) -> bool {
+        // FIXME: blocking IPC call
         let (sender, receiver) = channel(self.global().time_profiler_chan().clone()).unwrap();
 
-        let operation = SyncOperation::HasKeyGenerator(
+        let operation = SyncOperation::GetObjectStore(
             sender,
             self.global().origin().immutable().clone(),
             self.db_name.to_string(),
             self.name.borrow().to_string(),
         );
 
-        self.global()
-            .storage_threads()
+        self.get_idb_thread()
             .send(IndexedDBThreadMsg::Sync(operation))
             .unwrap();
 
         // First unwrap for ipc
         // Second unwrap will never happen unless this db gets manually deleted somehow
-        receiver.recv().unwrap().unwrap()
+        receiver.recv().unwrap().unwrap().has_key_generator
     }
 
-    /// <https://www.w3.org/TR/IndexedDB-2/#object-store-in-line-keys>
+    fn generate_key(&self) -> Fallible<IndexedDBKeyType> {
+        // FIXME: blocking IPC call ? how ?
+        let (sender, receiver) = channel(self.global().time_profiler_chan().clone()).unwrap();
+        let operation = SyncOperation::GenerateKey(
+            sender,
+            self.global().origin().immutable().clone(),
+            self.db_name.to_string(),
+            self.name.borrow().to_string(),
+        );
+
+        self.get_idb_thread()
+            .send(IndexedDBThreadMsg::Sync(operation))
+            .unwrap();
+
+        receiver
+            .recv()
+            .unwrap()
+            .map_err(map_backend_error_to_dom_error)
+    }
+
+    /// <https://www.w3.org/TR/IndexedDB-3/#object-store-in-line-keys>
     fn uses_inline_keys(&self) -> bool {
         self.key_path.is_some()
     }
@@ -159,7 +215,10 @@ impl IDBObjectStore {
         let transaction = &self.transaction;
 
         // If transaction is not active, throw a "TransactionInactiveError" DOMException.
-        if !transaction.is_active() {
+        // https://w3c.github.io/IndexedDB/#transaction-inactive
+        // A transaction is in this state after control returns to the event loop after its creation, and when events are not being dispatched.
+        // No requests can be made against the transaction when it is in this state.
+        if !transaction.is_active() || !transaction.is_usable() {
             return Err(Error::TransactionInactive(None));
         }
 
@@ -181,14 +240,13 @@ impl IDBObjectStore {
         Ok(())
     }
 
-    /// <https://www.w3.org/TR/IndexedDB-2/#dom-idbobjectstore-put>
+    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-put>
     fn put(
         &self,
-        cx: SafeJSContext,
+        cx: &mut JSContext,
         value: HandleValue,
         key: HandleValue,
         overwrite: bool,
-        can_gc: CanGc,
     ) -> Fallible<DomRoot<IDBRequest>> {
         // Step 1. Let transaction be handle’s transaction.
         // Step 2: Let store be this object store handle's object store.
@@ -211,48 +269,93 @@ impl IDBObjectStore {
             return Err(Error::Data(None));
         }
 
-        // Step 8: If key was given, then: convert a value to a key with key
+        // Step 8. If key was given, then: convert a value to a key with key.
         let serialized_key: Option<IndexedDBKeyType>;
+        let maybe_modified_cloned_value;
 
         if !key.is_undefined() {
             serialized_key = Some(convert_value_to_key(cx, key, None)?.into_result()?);
+            maybe_modified_cloned_value = None;
         } else {
-            // Step 11: We should use in-line keys instead
-            // Step 11.1: Let kpk be the result of running the steps to extract a
-            // key from a value using a key path with clone and store’s key path.
-            let extraction_result = self
-                .key_path
-                .as_ref()
-                .map(|p| extract_key(cx, value, p, None));
+            match self.key_path.as_ref() {
+                Some(key_path) => {
+                    // Step 10. Let clone be a clone of value in targetRealm during transaction.
+                    // Rethrow any exceptions.
+                    let cloned_value = structuredclone::write(cx.into(), value, None)?;
 
-            match extraction_result {
-                Some(Ok(ExtractionResult::Failure)) | None => {
-                    // Step 11.4. Otherwise:
-                    // Step 11.4.1. If store does not have a key generator, throw
-                    // a "DataError" DOMException.
+                    rooted!(&in(cx) let mut cloned_js_value = NullValue());
+                    let _ = structuredclone::read(
+                        &self.global(),
+                        cloned_value,
+                        cloned_js_value.handle_mut(),
+                        CanGc::from_cx(cx),
+                    )?;
+
+                    // TODO: Avoid this deserialize/re-serialize round-trip once extract/inject can
+                    // operate directly on the structured clone payload.
+
+                    // Step 11: We should use in-line keys instead
+                    // Step 11.1: Let kpk be the result of running the steps to extract a
+                    // key from a value using a key path with clone and store’s key path.
+                    match extract_key(cx, cloned_js_value.handle(), key_path, None)? {
+                        // Step 11.2. If kpk is invalid, throw a "DataError" DOMException.
+                        ExtractionResult::Invalid => return Err(Error::Data(None)),
+                        // Step 11.3. If kpk is not failure, let key be kpk.
+                        ExtractionResult::Key(kpk) => serialized_key = Some(kpk),
+                        ExtractionResult::Failure => {
+                            // Step 11.4. Otherwise:
+                            // Step 11.4.1. If store does not have a key generator, throw
+                            // a "DataError" DOMException.
+                            if !self.has_key_generator() {
+                                return Err(Error::Data(None));
+                            }
+                            let KeyPath::String(key_path) = key_path else {
+                                return Err(Error::Data(None));
+                            };
+                            // Step 11.4.2. If the steps to check that a key could be injected
+                            // into a value with clone and store’s key path return false, throw a
+                            // "DataError" DOMException.
+                            if !can_inject_key_into_value(cx, cloned_js_value.handle(), key_path)? {
+                                return Err(Error::Data(None));
+                            }
+                            // Step 11.4.3. Let key be the result of generating a key for store.
+                            let generated_key = self.generate_key()?;
+                            // Step 11.4.4. Inject key into value.
+                            if !inject_key_into_value(
+                                cx,
+                                cloned_js_value.handle(),
+                                &generated_key,
+                                key_path,
+                            )? {
+                                return Err(Error::Data(None));
+                            }
+                            serialized_key = Some(generated_key);
+                        },
+                    }
+
+                    // Store the clone (possibly with an injected key path), without mutating
+                    // the original JS value that was passed to add()/put().
+                    maybe_modified_cloned_value = Some(structuredclone::write(
+                        cx.into(),
+                        cloned_js_value.handle(),
+                        None,
+                    )?);
+                },
+                None => {
                     if !self.has_key_generator() {
                         return Err(Error::Data(None));
                     }
-                    // Step 11.4.2. Otherwise, if the steps to check that a key could
-                    // be injected into a value with clone and store’s key path return
-                    // false, throw a "DataError" DOMException.
-                    // TODO
                     serialized_key = None;
-                },
-                // Step 11.1. Rethrow any exceptions.
-                Some(extraction_result) => match extraction_result? {
-                    // Step 11.2. If kpk is invalid, throw a "DataError" DOMException.
-                    ExtractionResult::Invalid => return Err(Error::Data(None)),
-                    // Step 11.3. If kpk is not failure, let key be kpk.
-                    ExtractionResult::Key(kpk) => serialized_key = Some(kpk),
-                    ExtractionResult::Failure => unreachable!(),
+                    maybe_modified_cloned_value = None;
                 },
             }
         }
-
-        // Step 10. Let clone be a clone of value in targetRealm during transaction. Rethrow any exceptions.
-        let cloned_value = structuredclone::write(cx, value, None)?;
-        let Ok(serialized_value) = bincode::serialize(&cloned_value) else {
+        // For paths that did not need key-path extraction/injection above, clone `value` here.
+        let cloned_value = match maybe_modified_cloned_value {
+            Some(cloned_value) => cloned_value,
+            None => structuredclone::write(cx.into(), value, None)?,
+        };
+        let Ok(serialized_value) = postcard::to_stdvec(&cloned_value) else {
             return Err(Error::InvalidState(None));
         };
         // Step 12. Let operation be an algorithm to run store a record into an object store with store, clone, key, and no-overwrite flag.
@@ -269,19 +372,18 @@ impl IDBObjectStore {
             },
             None,
             None,
-            can_gc,
+            CanGc::from_cx(cx),
         )
     }
 
-    /// <https://www.w3.org/TR/IndexedDB-2/#dom-idbobjectstore-opencursor>
-    /// <https://www.w3.org/TR/IndexedDB-2/#dom-idbobjectstore-openkeycursor>
+    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-opencursor>
+    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-openkeycursor>
     fn open_cursor(
         &self,
-        cx: SafeJSContext,
+        cx: &mut JSContext,
         query: HandleValue,
         direction: IDBCursorDirection,
         key_only: bool,
-        can_gc: CanGc,
     ) -> Fallible<DomRoot<IDBRequest>> {
         // Step 1. Let transaction be this object store handle's transaction.
         // Step 2. Let store be this object store handle's object store.
@@ -314,7 +416,7 @@ impl IDBObjectStore {
                 ObjectStoreOrIndex::ObjectStore(Dom::from_ref(self)),
                 range.clone(),
                 key_only,
-                can_gc,
+                CanGc::from_cx(cx),
             )
         } else {
             DomRoot::upcast(IDBCursorWithValue::new(
@@ -325,7 +427,7 @@ impl IDBObjectStore {
                 ObjectStoreOrIndex::ObjectStore(Dom::from_ref(self)),
                 range.clone(),
                 key_only,
-                can_gc,
+                CanGc::from_cx(cx),
             ))
         };
 
@@ -350,35 +452,57 @@ impl IDBObjectStore {
             },
             None,
             Some(iteration_param),
-            can_gc,
+            CanGc::from_cx(cx),
         )
         .inspect(|request| cursor.set_request(request))
+    }
+
+    pub(crate) fn add_index(
+        &self,
+        name: DOMString,
+        options: &IDBIndexParameters,
+        key_path: KeyPath,
+        can_gc: CanGc,
+    ) -> DomRoot<IDBIndex> {
+        let index = IDBIndex::new(
+            &self.global(),
+            DomRoot::from_ref(self),
+            name.clone(),
+            options.multiEntry,
+            options.unique,
+            key_path,
+            can_gc,
+        );
+        self.index_set
+            .borrow_mut()
+            .insert(name, Dom::from_ref(&index));
+        index
     }
 }
 
 impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
-    /// <https://www.w3.org/TR/IndexedDB-2/#dom-idbobjectstore-put>
+    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-put>
     fn Put(
         &self,
-        cx: SafeJSContext,
+        cx: &mut JSContext,
         value: HandleValue,
         key: HandleValue,
     ) -> Fallible<DomRoot<IDBRequest>> {
-        self.put(cx, value, key, true, CanGc::note())
+        self.put(cx, value, key, true)
     }
 
-    /// <https://www.w3.org/TR/IndexedDB-2/#dom-idbobjectstore-add>
+    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-add>
     fn Add(
         &self,
-        cx: SafeJSContext,
+        cx: &mut JSContext,
         value: HandleValue,
         key: HandleValue,
     ) -> Fallible<DomRoot<IDBRequest>> {
-        self.put(cx, value, key, false, CanGc::note())
+        self.put(cx, value, key, false)
     }
 
-    /// <https://www.w3.org/TR/IndexedDB-2/#dom-idbobjectstore-delete>
-    fn Delete(&self, cx: SafeJSContext, query: HandleValue) -> Fallible<DomRoot<IDBRequest>> {
+    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-delete>
+    fn Delete(&self, cx: &mut JSContext, query: HandleValue) -> Fallible<DomRoot<IDBRequest>> {
         // Step 1. Let transaction be this’s transaction.
         // Step 2. Let store be this's object store.
         // Step 3. If store has been deleted, throw an "InvalidStateError" DOMException.
@@ -403,13 +527,13 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
                 },
                 None,
                 None,
-                CanGc::note(),
+                CanGc::from_cx(cx),
             )
         })
     }
 
-    /// <https://www.w3.org/TR/IndexedDB-2/#dom-idbobjectstore-clear>
-    fn Clear(&self) -> Fallible<DomRoot<IDBRequest>> {
+    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-clear>
+    fn Clear(&self, cx: &mut JSContext) -> Fallible<DomRoot<IDBRequest>> {
         // Step 1. Let transaction be this’s transaction.
         // Step 2. Let store be this's object store.
         // Step 3. If store has been deleted, throw an "InvalidStateError" DOMException.
@@ -426,12 +550,12 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
             |callback| AsyncOperation::ReadWrite(AsyncReadWriteOperation::Clear(callback)),
             None,
             None,
-            CanGc::note(),
+            CanGc::from_cx(cx),
         )
     }
 
-    /// <https://www.w3.org/TR/IndexedDB-2/#dom-idbobjectstore-get>
-    fn Get(&self, cx: SafeJSContext, query: HandleValue) -> Fallible<DomRoot<IDBRequest>> {
+    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-get>
+    fn Get(&self, cx: &mut JSContext, query: HandleValue) -> Fallible<DomRoot<IDBRequest>> {
         // Step 1. Let transaction be this’s transaction.
         // Step 2. Let store be this's object store.
         // Step 3. If store has been deleted, throw an "InvalidStateError" DOMException.
@@ -456,13 +580,13 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
                 },
                 None,
                 None,
-                CanGc::note(),
+                CanGc::from_cx(cx),
             )
         })
     }
 
-    /// <https://www.w3.org/TR/IndexedDB-2/#dom-idbobjectstore-getkey>
-    fn GetKey(&self, cx: SafeJSContext, query: HandleValue) -> Result<DomRoot<IDBRequest>, Error> {
+    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-getkey>
+    fn GetKey(&self, cx: &mut JSContext, query: HandleValue) -> Result<DomRoot<IDBRequest>, Error> {
         // Step 1. Let transaction be this’s transaction.
         // Step 2. Let store be this's object store.
         // Step 3. If store has been deleted, throw an "InvalidStateError" DOMException.
@@ -488,15 +612,15 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
                 },
                 None,
                 None,
-                CanGc::note(),
+                CanGc::from_cx(cx),
             )
         })
     }
 
-    /// <https://www.w3.org/TR/IndexedDB-2/#dom-idbobjectstore-getall>
+    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-getall>
     fn GetAll(
         &self,
-        cx: SafeJSContext,
+        cx: &mut JSContext,
         query: HandleValue,
         count: Option<u32>,
     ) -> Fallible<DomRoot<IDBRequest>> {
@@ -526,15 +650,15 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
                 },
                 None,
                 None,
-                CanGc::note(),
+                CanGc::from_cx(cx),
             )
         })
     }
 
-    /// <https://www.w3.org/TR/IndexedDB-2/#dom-idbobjectstore-getallkeys>
+    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-getallkeys>
     fn GetAllKeys(
         &self,
-        cx: SafeJSContext,
+        cx: &mut JSContext,
         query: HandleValue,
         count: Option<u32>,
     ) -> Fallible<DomRoot<IDBRequest>> {
@@ -564,13 +688,13 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
                 },
                 None,
                 None,
-                CanGc::note(),
+                CanGc::from_cx(cx),
             )
         })
     }
 
-    /// <https://www.w3.org/TR/IndexedDB-2/#dom-idbobjectstore-count>
-    fn Count(&self, cx: SafeJSContext, query: HandleValue) -> Fallible<DomRoot<IDBRequest>> {
+    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-count>
+    fn Count(&self, cx: &mut JSContext, query: HandleValue) -> Fallible<DomRoot<IDBRequest>> {
         // Step 1. Let transaction be this’s transaction.
         // Step 2. Let store be this's object store.
         // Step 3. If store has been deleted, throw an "InvalidStateError" DOMException.
@@ -595,37 +719,37 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
                 },
                 None,
                 None,
-                CanGc::note(),
+                CanGc::from_cx(cx),
             )
         })
     }
 
-    /// <https://www.w3.org/TR/IndexedDB-2/#dom-idbobjectstore-opencursor>
+    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-opencursor>
     fn OpenCursor(
         &self,
-        cx: SafeJSContext,
+        cx: &mut JSContext,
         query: HandleValue,
         direction: IDBCursorDirection,
     ) -> Fallible<DomRoot<IDBRequest>> {
-        self.open_cursor(cx, query, direction, false, CanGc::note())
+        self.open_cursor(cx, query, direction, false)
     }
 
-    /// <https://www.w3.org/TR/IndexedDB-2/#dom-idbobjectstore-openkeycursor>
+    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-openkeycursor>
     fn OpenKeyCursor(
         &self,
-        cx: SafeJSContext,
+        cx: &mut JSContext,
         query: HandleValue,
         direction: IDBCursorDirection,
     ) -> Fallible<DomRoot<IDBRequest>> {
-        self.open_cursor(cx, query, direction, true, CanGc::note())
+        self.open_cursor(cx, query, direction, true)
     }
 
-    /// <https://www.w3.org/TR/IndexedDB-2/#dom-idbobjectstore-name>
+    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-name>
     fn Name(&self) -> DOMString {
         self.name.borrow().clone()
     }
 
-    /// <https://www.w3.org/TR/IndexedDB-2/#dom-idbobjectstore-setname>
+    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-setname>
     fn SetName(&self, value: DOMString) -> ErrorResult {
         // Step 2. Let transaction be this’s transaction.
         let transaction = &self.transaction;
@@ -645,27 +769,134 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
         Ok(())
     }
 
-    /// <https://www.w3.org/TR/IndexedDB-2/#dom-idbobjectstore-keypath>
-    fn KeyPath(&self, cx: SafeJSContext, mut ret_val: MutableHandleValue) {
+    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-keypath>
+    fn KeyPath(&self, cx: &mut JSContext, mut ret_val: MutableHandleValue) {
         match &self.key_path {
-            Some(KeyPath::String(path)) => path.safe_to_jsval(cx, ret_val, CanGc::note()),
-            Some(KeyPath::StringSequence(paths)) => paths.safe_to_jsval(cx, ret_val, CanGc::note()),
+            Some(KeyPath::String(path)) => path.safe_to_jsval(cx, ret_val),
+            Some(KeyPath::StringSequence(paths)) => paths.safe_to_jsval(cx, ret_val),
             None => ret_val.set(NullValue()),
         }
     }
 
-    /// <https://www.w3.org/TR/IndexedDB-2/#dom-idbobjectstore-indexnames>
-    fn IndexNames(&self) -> DomRoot<DOMStringList> {
-        self.index_names.clone()
+    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-indexnames>
+    fn IndexNames(&self, can_gc: CanGc) -> DomRoot<DOMStringList> {
+        DOMStringList::new_sorted(&self.global(), self.index_set.borrow().keys(), can_gc)
     }
 
-    /// <https://www.w3.org/TR/IndexedDB-2/#dom-idbobjectstore-transaction>
+    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-transaction>
     fn Transaction(&self) -> DomRoot<IDBTransaction> {
         self.transaction()
     }
 
-    /// <https://www.w3.org/TR/IndexedDB-2/#dom-idbobjectstore-autoincrement>
+    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-autoincrement>
     fn AutoIncrement(&self) -> bool {
         self.has_key_generator()
+    }
+
+    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-createindex>
+    fn CreateIndex(
+        &self,
+        name: DOMString,
+        key_path: StringOrStringSequence,
+        options: &IDBIndexParameters,
+        can_gc: CanGc,
+    ) -> Fallible<DomRoot<IDBIndex>> {
+        let key_path: KeyPath = key_path.into();
+        // Step 3. If transaction is not an upgrade transaction, throw an "InvalidStateError" DOMException.
+        if self.transaction.Mode() != IDBTransactionMode::Versionchange {
+            return Err(Error::InvalidState(None));
+        }
+
+        // Step 4. If store has been deleted, throw an "InvalidStateError" DOMException.
+        self.verify_not_deleted()?;
+        // Step 5. If transaction is not active, throw a "TransactionInactiveError" DOMException.
+        self.check_transaction_active()?;
+
+        // Step 6. If an index named name already exists in store, throw a "ConstraintError" DOMException.
+        if self.index_set.borrow().contains_key(&name) {
+            return Err(Error::Constraint(None));
+        }
+
+        // TODO: Step 7. If keyPath is not a valid key path, throw a "SyntaxError" DOMException.
+        // Step 8. Let unique be set if options’s unique member is true, and unset otherwise.
+        // Step 9. Let multiEntry be set if options’s multiEntry member is true, and unset otherwise.
+        // Step 10. If keyPath is a sequence and multiEntry is set, throw an "InvalidAccessError" DOMException.
+        if matches!(key_path, KeyPath::StringSequence(_)) && options.multiEntry {
+            return Err(Error::InvalidAccess(None));
+        }
+
+        // Step 11. Let index be a new index in store.
+        // Set index’s name to name and key path to keyPath. If unique is set, set index’s unique flag.
+        // If multiEntry is set, set index’s multiEntry flag.
+        let create_index_operation = SyncOperation::CreateIndex(
+            self.global().origin().immutable().clone(),
+            self.db_name.to_string(),
+            self.name.borrow().to_string(),
+            name.to_string(),
+            key_path.clone().into(),
+            options.unique,
+            options.multiEntry,
+        );
+        if self
+            .get_idb_thread()
+            .send(IndexedDBThreadMsg::Sync(create_index_operation))
+            .is_err()
+        {
+            return Err(Error::Operation(None));
+        }
+
+        // Step 12. Add index to this object store handle's index set.
+        let index = self.add_index(name, options, key_path, can_gc);
+
+        // Step 13. Return a new index handle associated with index and this object store handle.
+        Ok(index)
+    }
+
+    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-deleteindex>
+    fn DeleteIndex(&self, name: DOMString) -> Fallible<()> {
+        // Step 3. If transaction is not an upgrade transaction, throw an "InvalidStateError" DOMException.
+        if self.transaction.Mode() != IDBTransactionMode::Versionchange {
+            return Err(Error::InvalidState(None));
+        }
+        // Step 4. If store has been deleted, throw an "InvalidStateError" DOMException.
+        self.verify_not_deleted()?;
+        // Step 5. If transaction is not active, throw a "TransactionInactiveError" DOMException.
+        self.check_transaction_active()?;
+        // Step 6. Let index be the index named name in store if one exists,
+        // or throw a "NotFoundError" DOMException otherwise.
+        if !self.index_set.borrow().contains_key(&name) {
+            return Err(Error::NotFound(None));
+        }
+        // Step 7. Remove index from this object store handle's index set.
+        self.index_set.borrow_mut().retain(|n, _| n != &name);
+        // Step 8. Destroy index.
+        let delete_index_operation = SyncOperation::DeleteIndex(
+            self.global().origin().immutable().clone(),
+            self.db_name.to_string(),
+            self.name.borrow().to_string(),
+            name.to_string(),
+        );
+        self.get_idb_thread()
+            .send(IndexedDBThreadMsg::Sync(delete_index_operation))
+            .unwrap();
+        Ok(())
+    }
+
+    /// <https://w3c.github.io/IndexedDB/#dom-idbobjectstore-index>
+    fn Index(&self, name: DOMString) -> Fallible<DomRoot<IDBIndex>> {
+        // Step 3. If store has been deleted, throw an "InvalidStateError" DOMException.
+        self.verify_not_deleted()?;
+
+        // Step 4. If the transaction's state is finished, then throw an "InvalidStateError" DOMException.
+        if self.transaction.is_finished() {
+            return Err(Error::InvalidState(None));
+        }
+
+        // Step 5. Let index be the index named name in this’s index set if one exists, or throw a "NotFoundError" DOMException otherwise.
+        let index_set = self.index_set.borrow();
+        let index = index_set.get(&name).ok_or(Error::NotFound(None))?;
+
+        // Step 6. Return an index handle associated with index and this.
+        Ok(index.as_rooted())
     }
 }

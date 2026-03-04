@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use aws_lc_rs::hmac;
+use js::context::JSContext;
 use rand::TryRngCore;
 use rand::rngs::OsRng;
 use script_bindings::codegen::GenericBindings::CryptoKeyBinding::CryptoKeyMethods;
@@ -16,10 +17,9 @@ use crate::dom::cryptokey::{CryptoKey, Handle};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::subtlecrypto::{
     ALG_HMAC, ALG_SHA1, ALG_SHA256, ALG_SHA384, ALG_SHA512, ExportedKey, JsonWebKeyExt,
-    JwkStringField, KeyAlgorithmAndDerivatives, SubtleHmacImportParams, SubtleHmacKeyAlgorithm,
-    SubtleHmacKeyGenParams, SubtleKeyAlgorithm,
+    JwkStringField, KeyAlgorithmAndDerivatives, NormalizedAlgorithm, SubtleHmacImportParams,
+    SubtleHmacKeyAlgorithm, SubtleHmacKeyGenParams, SubtleKeyAlgorithm,
 };
-use crate::script_runtime::CanGc;
 
 /// <https://w3c.github.io/webcrypto/#hmac-operations-sign>
 pub(crate) fn sign(key: &CryptoKey, message: &[u8]) -> Result<Vec<u8>, Error> {
@@ -69,11 +69,11 @@ pub(crate) fn verify(key: &CryptoKey, message: &[u8], signature: &[u8]) -> Resul
 
 /// <https://w3c.github.io/webcrypto/#hmac-operations-generate-key>
 pub(crate) fn generate_key(
+    cx: &mut JSContext,
     global: &GlobalScope,
     normalized_algorithm: &SubtleHmacKeyGenParams,
     extractable: bool,
     usages: Vec<KeyUsage>,
-    can_gc: CanGc,
 ) -> Result<DomRoot<CryptoKey>, Error> {
     // Step 1. If usages contains any entry which is not "sign" or "verify", then throw a SyntaxError.
     if usages
@@ -132,13 +132,13 @@ pub(crate) fn generate_key(
     // Step 14. Set the [[extractable]] internal slot of key to be extractable.
     // Step 15. Set the [[usages]] internal slot of key to be usages.
     let key = CryptoKey::new(
+        cx,
         global,
         KeyType::Secret,
         extractable,
         KeyAlgorithmAndDerivatives::HmacKeyAlgorithm(algorithm),
         usages,
         Handle::Hmac(key_data),
-        can_gc,
     );
 
     // Step 16. Return key.
@@ -147,13 +147,13 @@ pub(crate) fn generate_key(
 
 /// <https://w3c.github.io/webcrypto/#hmac-operations-import-key>
 pub(crate) fn import_key(
+    cx: &mut JSContext,
     global: &GlobalScope,
     normalized_algorithm: &SubtleHmacImportParams,
     format: KeyFormat,
     key_data: &[u8],
     extractable: bool,
     usages: Vec<KeyUsage>,
-    can_gc: CanGc,
 ) -> Result<DomRoot<CryptoKey>, Error> {
     // Step 1. Let keyData be the key data to be imported.
 
@@ -179,14 +179,14 @@ pub(crate) fn import_key(
             data = key_data.to_vec();
 
             // Step 4.2. Set hash to equal the hash member of normalizedAlgorithm.
-            hash = normalized_algorithm.hash.as_ref();
+            hash = &normalized_algorithm.hash;
         },
         // If format is "jwk":
         KeyFormat::Jwk => {
             // Step 2.1. If keyData is a JsonWebKey dictionary: Let jwk equal keyData.
             // Otherwise: Throw a DataError.
             // NOTE: Deserialize keyData to JsonWebKey dictionary by running JsonWebKey::parse
-            let jwk = JsonWebKey::parse(GlobalScope::get_cx(), key_data)?;
+            let jwk = JsonWebKey::parse(cx, key_data)?;
 
             // Step 2.2. If the kty field of jwk is not "oct", then throw a DataError.
             if jwk.kty.as_ref().is_none_or(|kty| kty != "oct") {
@@ -201,7 +201,7 @@ pub(crate) fn import_key(
             data = jwk.decode_required_string_field(JwkStringField::K)?;
 
             // Step 2.5. Set the hash to equal the hash member of normalizedAlgorithm.
-            hash = normalized_algorithm.hash.as_ref();
+            hash = &normalized_algorithm.hash;
 
             // Step 2.6.
             match hash.name() {
@@ -307,13 +307,13 @@ pub(crate) fn import_key(
     // Step 14. Set the [[algorithm]] internal slot of key to algorithm.
     let truncated_data = data[..length as usize / 8].to_vec();
     let key = CryptoKey::new(
+        cx,
         global,
         KeyType::Secret,
         extractable,
         KeyAlgorithmAndDerivatives::HmacKeyAlgorithm(algorithm),
         usages,
         Handle::Hmac(truncated_data),
-        can_gc,
     );
 
     // Step 15. Return key.
@@ -405,7 +405,7 @@ pub(crate) fn get_key_length(
         // Otherwise:
         _ => {
             // throw a TypeError.
-            return Err(Error::Type("[[length]] must not be zero".to_string()));
+            return Err(Error::Type(c"[[length]] must not be zero".to_owned()));
         },
     };
 

@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use hkdf::Hkdf;
+use js::context::JSContext;
 use sha1::Sha1;
 use sha2::{Sha256, Sha384, Sha512};
 
@@ -14,9 +15,8 @@ use crate::dom::cryptokey::{CryptoKey, Handle};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::subtlecrypto::{
     ALG_HKDF, ALG_SHA1, ALG_SHA256, ALG_SHA384, ALG_SHA512, KeyAlgorithmAndDerivatives,
-    SubtleHkdfParams, SubtleKeyAlgorithm,
+    NormalizedAlgorithm, SubtleHkdfParams, SubtleKeyAlgorithm,
 };
-use crate::script_runtime::CanGc;
 
 /// <https://w3c.github.io/webcrypto/#hkdf-operations-derive-bits>
 pub(crate) fn derive_bits(
@@ -26,15 +26,19 @@ pub(crate) fn derive_bits(
 ) -> Result<Vec<u8>, Error> {
     // Step 1. If length is null or is not a multiple of 8, then throw an OperationError.
     let Some(length) = length else {
-        return Err(Error::Operation(None));
+        return Err(Error::Operation(Some("length is null".into())));
     };
     if length % 8 != 0 {
-        return Err(Error::Operation(None));
+        return Err(Error::Operation(Some(
+            "length is not a multiple of 8".into(),
+        )));
     };
 
     // Step 2. Let keyDerivationKey be the secret represented by the [[handle]] internal slot of key.
     let Handle::HkdfSecret(key_derivation_key) = key.handle() else {
-        return Err(Error::Operation(None));
+        return Err(Error::Operation(Some(
+            "The [[handle]] internal slot is not from an HKDF key".into(),
+        )));
     };
 
     // Step 3. Let result be the result of performing the HKDF extract and then the HKDF expand
@@ -49,17 +53,21 @@ pub(crate) fn derive_bits(
     match normalized_algorithm.hash.name() {
         ALG_SHA1 => Hkdf::<Sha1>::new(Some(&normalized_algorithm.salt), key_derivation_key)
             .expand(&normalized_algorithm.info, &mut result)
-            .map_err(|_| Error::Operation(None))?,
+            .map_err(|error| Error::Operation(Some(error.to_string())))?,
         ALG_SHA256 => Hkdf::<Sha256>::new(Some(&normalized_algorithm.salt), key_derivation_key)
             .expand(&normalized_algorithm.info, &mut result)
-            .map_err(|_| Error::Operation(None))?,
+            .map_err(|error| Error::Operation(Some(error.to_string())))?,
         ALG_SHA384 => Hkdf::<Sha384>::new(Some(&normalized_algorithm.salt), key_derivation_key)
             .expand(&normalized_algorithm.info, &mut result)
-            .map_err(|_| Error::Operation(None))?,
+            .map_err(|error| Error::Operation(Some(error.to_string())))?,
         ALG_SHA512 => Hkdf::<Sha512>::new(Some(&normalized_algorithm.salt), key_derivation_key)
             .expand(&normalized_algorithm.info, &mut result)
-            .map_err(|_| Error::Operation(None))?,
-        _ => return Err(Error::Operation(None)),
+            .map_err(|error| Error::Operation(Some(error.to_string())))?,
+        algorithm_name => {
+            return Err(Error::Operation(Some(format!(
+                "Invalid hash algorithm: {algorithm_name}"
+            ))));
+        },
     }
 
     // Step 5. Return result.
@@ -68,12 +76,12 @@ pub(crate) fn derive_bits(
 
 /// <https://w3c.github.io/webcrypto/#hkdf-operations-import-key>
 pub(crate) fn import_key(
+    cx: &mut JSContext,
     global: &GlobalScope,
     format: KeyFormat,
     key_data: &[u8],
     extractable: bool,
     usages: Vec<KeyUsage>,
-    can_gc: CanGc,
 ) -> Result<DomRoot<CryptoKey>, Error> {
     // Step 1. Let keyData be the key data to be imported.
 
@@ -86,12 +94,14 @@ pub(crate) fn import_key(
             .any(|usage| !matches!(usage, KeyUsage::DeriveKey | KeyUsage::DeriveBits)) ||
             usages.is_empty()
         {
-            return Err(Error::Syntax(None));
+            return Err(Error::Syntax(Some(
+                "Usages contains an entry which is not \"deriveKey\" or \"deriveBits\"".into(),
+            )));
         }
 
         // Step 2.2. If extractable is not false, then throw a SyntaxError.
         if extractable {
-            return Err(Error::Syntax(None));
+            return Err(Error::Syntax(Some("'extractable' is not false".into())));
         }
 
         // Step 2.3. Let key be a new CryptoKey representing the key data provided in keyData.
@@ -103,13 +113,13 @@ pub(crate) fn import_key(
             name: ALG_HKDF.to_string(),
         };
         let key = CryptoKey::new(
+            cx,
             global,
             KeyType::Secret,
             extractable,
             KeyAlgorithmAndDerivatives::KeyAlgorithm(algorithm),
             usages,
             Handle::HkdfSecret(key_data.to_vec()),
-            can_gc,
         );
 
         // Step 2.8. Return key.
@@ -118,7 +128,9 @@ pub(crate) fn import_key(
     // Otherwise:
     else {
         // throw a NotSupportedError.
-        Err(Error::NotSupported(None))
+        Err(Error::NotSupported(Some(
+            "Formats different than \"raw\" are unsupported".into(),
+        )))
     }
 }
 

@@ -8,18 +8,17 @@ use std::sync::Arc;
 use app_units::{AU_PER_PX, Au};
 use base::id::ScrollTreeNodeId;
 use clip::{Clip, ClipId};
-use compositing_traits::display_list::{PaintDisplayListInfo, SpatialTreeNodeInfo};
-use compositing_traits::largest_contentful_paint_candidate::{
-    LCPCandidateID, LargestContentfulPaintType,
-};
-use euclid::{Point2D, Scale, SideOffsets2D, Size2D, UnknownUnit, Vector2D};
+use euclid::{Box2D, Point2D, Rect, Scale, SideOffsets2D, Size2D, UnknownUnit, Vector2D};
 use fonts::GlyphStore;
 use gradient::WebRenderGradient;
+use layout_api::ReflowStatistics;
 use net_traits::image_cache::Image as CachedImage;
-use range::Range as ServoRange;
+use paint_api::display_list::{PaintDisplayListInfo, SpatialTreeNodeInfo};
 use servo_arc::Arc as ServoArc;
 use servo_config::opts::DiagnosticsLogging;
+use servo_config::pref;
 use servo_geometry::MaxRect;
+use servo_url::ServoUrl;
 use style::Zero;
 use style::color::{AbsoluteColor, ColorSpace};
 use style::computed_values::border_image_outset::T as BorderImageOutset;
@@ -35,17 +34,18 @@ use style::values::computed::{
     NonNegativeLengthOrNumber, NumberOrPercentage, OutlineStyle,
 };
 use style::values::generics::NonNegative;
-use style::values::generics::rect::Rect;
+use style::values::generics::color::ColorOrAuto;
+use style::values::generics::rect::Rect as StyleRect;
 use style::values::specified::text::TextDecorationLine;
 use style_traits::{CSSPixel as StyloCSSPixel, DevicePixel as StyloDevicePixel};
 use webrender_api::units::{
-    DeviceIntSize, DevicePixel, LayoutPixel, LayoutRect, LayoutSideOffsets, LayoutSize,
+    DeviceIntSize, DevicePixel, LayoutPixel, LayoutPoint, LayoutRect, LayoutSideOffsets, LayoutSize,
 };
 use webrender_api::{
     self as wr, BorderDetails, BorderRadius, BorderSide, BoxShadowClipMode, BuiltDisplayList,
-    ClipChainId, ClipMode, ColorF, CommonItemProperties, ComplexClipRegion, NinePatchBorder,
-    NinePatchBorderSource, NormalBorder, PrimitiveFlags, PropertyBinding, SpatialId,
-    SpatialTreeItemKey, units,
+    ClipChainId, ClipMode, ColorF, CommonItemProperties, ComplexClipRegion, GlyphInstance,
+    NinePatchBorder, NinePatchBorderSource, NormalBorder, PrimitiveFlags, PropertyBinding,
+    SpatialId, SpatialTreeItemKey, units,
 };
 use wr::units::LayoutVector2D;
 
@@ -54,8 +54,8 @@ use crate::context::{ImageResolver, ResolvedImage};
 pub(crate) use crate::display_list::conversions::ToWebRender;
 use crate::display_list::stacking_context::StackingContextSection;
 use crate::fragment_tree::{
-    BackgroundMode, BoxFragment, Fragment, FragmentFlags, FragmentTree, SpecificLayoutInfo, Tag,
-    TextFragment,
+    BackgroundMode, BoxFragment, Fragment, FragmentFlags, FragmentStatus, FragmentTree,
+    SpecificLayoutInfo, Tag, TextFragment,
 };
 use crate::geom::{
     LengthPercentageOrAuto, PhysicalPoint, PhysicalRect, PhysicalSides, PhysicalSize,
@@ -68,12 +68,12 @@ mod clip;
 mod conversions;
 mod gradient;
 mod hit_test;
-mod largest_contenful_paint_candidate_collector;
+mod paint_timing_handler;
 mod stacking_context;
 
 use background::BackgroundPainter;
 pub(crate) use hit_test::HitTest;
-pub(crate) use largest_contenful_paint_candidate_collector::LargestContentfulPaintCandidateCollector;
+pub(crate) use paint_timing_handler::PaintTimingHandler;
 pub(crate) use stacking_context::*;
 
 const INSERTION_POINT_LOGICAL_WIDTH: Au = Au(AU_PER_PX);
@@ -123,8 +123,11 @@ pub(crate) struct DisplayListBuilder<'a> {
     /// The device pixel ratio used for this `Document`'s display list.
     device_pixel_ratio: Scale<f32, StyloCSSPixel, StyloDevicePixel>,
 
-    /// The collector for calculating Largest Contentful Paint
-    lcp_candidate_collector: Option<&'a mut LargestContentfulPaintCandidateCollector>,
+    /// Handler for all Paint Timings
+    paint_timing_handler: &'a mut PaintTimingHandler,
+
+    /// Statistics collected about the reflow, in order to write tests for incremental layout.
+    reflow_statistics: &'a mut ReflowStatistics,
 }
 
 struct InspectorHighlight {
@@ -141,7 +144,7 @@ struct InspectorHighlight {
 struct HighlightTraversalState {
     /// The smallest rectangle that fully encloses all fragments created by the highlighted
     /// dom node, if any.
-    content_box: euclid::Rect<Au, StyloCSSPixel>,
+    content_box: Rect<Au, StyloCSSPixel>,
 
     spatial_id: SpatialId,
 
@@ -166,6 +169,7 @@ impl InspectorHighlight {
 }
 
 impl DisplayListBuilder<'_> {
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn build(
         stacking_context_tree: &mut StackingContextTree,
         fragment_tree: &FragmentTree,
@@ -173,7 +177,8 @@ impl DisplayListBuilder<'_> {
         device_pixel_ratio: Scale<f32, StyloCSSPixel, StyloDevicePixel>,
         highlighted_dom_node: Option<OpaqueNode>,
         debug: &DiagnosticsLogging,
-        lcp_candidate_collector: Option<&mut LargestContentfulPaintCandidateCollector>,
+        paint_timing_handler: &mut PaintTimingHandler,
+        reflow_statistics: &mut ReflowStatistics,
     ) -> BuiltDisplayList {
         // Build the rest of the display list which inclues all of the WebRender primitives.
         let paint_info = &mut stacking_context_tree.paint_info;
@@ -202,7 +207,8 @@ impl DisplayListBuilder<'_> {
             clip_map: Default::default(),
             image_resolver,
             device_pixel_ratio,
-            lcp_candidate_collector,
+            paint_timing_handler,
+            reflow_statistics,
         };
 
         builder.add_all_spatial_nodes();
@@ -522,27 +528,46 @@ impl DisplayListBuilder<'_> {
         }
     }
 
-    #[inline]
-    fn collect_lcp_candidate(
+    fn check_for_contentful_paint(
         &mut self,
-        lcp_type: LargestContentfulPaintType,
-        lcp_candidate_id: LCPCandidateID,
+        bounds: LayoutRect,
+        clip_rect: LayoutRect,
+        opacity: f32,
+    ) {
+        // From <https://www.w3.org/TR/paint-timing/#sec-terminology>:
+        // An element el is paintable when all of the following apply:
+        // > el and all of its ancestors' used opacity is greater than zero.
+        if opacity <= 0.0 {
+            return;
+        }
+
+        // > el’s paintable bounding rect intersects with the scrolling area of the document.
+        if self
+            .paint_timing_handler
+            .check_bounding_rect(bounds, clip_rect)
+        {
+            self.mark_is_contentful();
+        }
+    }
+
+    fn check_for_lcp_candidate(
+        &mut self,
         clip_rect: LayoutRect,
         bounds: LayoutRect,
+        tag: Option<Tag>,
+        url: Option<ServoUrl>,
     ) {
-        if let Some(lcp_collector) = &mut self.lcp_candidate_collector {
-            let transform = self
-                .paint_info
-                .scroll_tree
-                .cumulative_node_to_root_transform(self.current_scroll_node_id);
-            lcp_collector.add_or_update_candidate(
-                lcp_type,
-                lcp_candidate_id,
-                clip_rect,
-                bounds,
-                transform,
-            );
+        if !pref!(largest_contentful_paint_enabled) {
+            return;
         }
+
+        let transform = self
+            .paint_info
+            .scroll_tree
+            .cumulative_node_to_root_transform(self.current_scroll_node_id);
+
+        self.paint_timing_handler
+            .update_lcp_candidate(tag, bounds, clip_rect, transform, url);
     }
 }
 
@@ -555,14 +580,18 @@ impl InspectorHighlight {
         containing_block: &PhysicalRect<Au>,
     ) {
         let state = self.state.get_or_insert(HighlightTraversalState {
-            content_box: euclid::Rect::zero(),
+            content_box: Rect::zero(),
             spatial_id,
             clip_chain_id,
             maybe_box_fragment: None,
         });
 
-        // We expect all fragments generated by one node to be in the same scroll tree node and clip node
-        debug_assert_eq!(spatial_id, state.spatial_id);
+        // We only need to highlight the first `SpatialId`. Typically this will include the bottommost
+        // fragment for a node, which generally surrounds the entire content.
+        if spatial_id != state.spatial_id {
+            return;
+        }
+
         if clip_chain_id != ClipChainId::INVALID && state.clip_chain_id != ClipChainId::INVALID {
             debug_assert_eq!(
                 clip_chain_id, state.clip_chain_id,
@@ -594,6 +623,20 @@ impl Fragment {
         is_collapsed_table_borders: bool,
         text_decorations: &Arc<Vec<FragmentTextDecoration>>,
     ) {
+        if let Some(mut base) = self.base_mut() {
+            match base.status {
+                FragmentStatus::New => {
+                    builder.reflow_statistics.rebuilt_fragment_count += 1;
+                    base.status = FragmentStatus::Clean;
+                },
+                FragmentStatus::StyleChanged => {
+                    builder.reflow_statistics.restyle_fragment_count += 1;
+                    base.status = FragmentStatus::Clean;
+                },
+                FragmentStatus::Clean => {},
+            }
+        }
+
         let spatial_id = builder.spatial_id(builder.current_scroll_node_id);
         let clip_chain_id = builder.clip_chain_id(builder.current_clip_id);
         if let Some(inspector_highlight) = &mut builder.inspector_highlight {
@@ -628,8 +671,6 @@ impl Fragment {
                 let style = image.base.style();
                 match style.get_inherited_box().visibility {
                     Visibility::Visible => {
-                        builder.mark_is_contentful();
-
                         let image_rendering =
                             style.get_inherited_box().image_rendering.to_webrender();
                         let rect = image
@@ -652,6 +693,15 @@ impl Fragment {
                                 image_key,
                                 wr::ColorF::WHITE,
                             );
+
+                            // From <https://www.w3.org/TR/paint-timing/#sec-terminology>:
+                            // An element target is contentful when one or more of the following apply:
+                            // > target is a replaced element representing an available image.
+                            builder.check_for_contentful_paint(
+                                rect,
+                                common.clip_rect,
+                                style.clone_opacity(),
+                            );
                         }
 
                         if image.showing_broken_image_icon {
@@ -662,16 +712,11 @@ impl Fragment {
                             );
                         }
 
-                        let lcp_candidate_id = image
-                            .base
-                            .tag
-                            .map(|tag| LCPCandidateID(tag.node.id()))
-                            .unwrap_or(LCPCandidateID(0));
-                        builder.collect_lcp_candidate(
-                            LargestContentfulPaintType::Image,
-                            lcp_candidate_id,
+                        builder.check_for_lcp_candidate(
                             common.clip_rect,
                             rect,
+                            image.base.tag,
+                            image.url.clone(),
                         );
                     },
                     Visibility::Hidden => (),
@@ -683,7 +728,10 @@ impl Fragment {
                 let style = iframe.base.style();
                 match style.get_inherited_box().visibility {
                     Visibility::Visible => {
-                        builder.mark_is_contentful();
+                        // From <https://www.w3.org/TR/paint-timing/#mark-paint-timing>:
+                        // > A parent frame should not be aware of the paint events from its child iframes, and
+                        // > vice versa. This means that a frame that contains just iframes will have first paint
+                        // > (due to the enclosing boxes of the iframes) but no first contentful paint.
                         let rect = iframe
                             .base
                             .rect
@@ -730,9 +778,6 @@ impl Fragment {
     ) {
         // NB: The order of painting text components (CSS Text Decoration Module Level 3) is:
         // shadows, underline, overline, text, text-emphasis, and then line-through.
-
-        builder.mark_is_contentful();
-
         let rect = fragment
             .base
             .rect
@@ -740,14 +785,15 @@ impl Fragment {
         let mut baseline_origin = rect.origin;
         baseline_origin.y += fragment.font_metrics.ascent;
         let include_whitespace =
-            fragment.has_selection() || text_decorations.iter().any(|item| !item.line.is_empty());
+            fragment.offsets.is_some() || text_decorations.iter().any(|item| !item.line.is_empty());
 
-        let glyphs = glyphs(
+        let (glyphs, largest_advance) = glyphs(
             &fragment.glyphs,
             baseline_origin,
             fragment.justification_adjustment,
             include_whitespace,
         );
+
         if glyphs.is_empty() {
             return;
         }
@@ -756,7 +802,17 @@ impl Fragment {
         let color = parent_style.clone_color();
         let font_metrics = &fragment.font_metrics;
         let dppx = builder.device_pixel_ratio.get();
-        let common = builder.common_properties(rect.to_webrender(), &parent_style);
+
+        // Gecko gets the text bounding box based on the ink overflow bounds. Since
+        // we don't need to calculate this yet (as we do not implement `contain:
+        // paint`), we just need to make sure these boundaries are big enough to
+        // contain the inked portion of the glyphs. We assume that the descent and
+        // ascent are big enough and then just expand the advance-based boundaries by
+        // twice the size of the biggest advance in the advance dimention.
+        let glyph_bounds = rect
+            .inflate(largest_advance.scale_by(2.0), Au::zero())
+            .to_webrender();
+        let common = builder.common_properties(glyph_bounds, &parent_style);
 
         // Shadows. According to CSS-BACKGROUNDS, text shadows render in *reverse* order (front to
         // back).
@@ -808,77 +864,30 @@ impl Fragment {
             }
         }
 
-        // TODO: This caret/text selection implementation currently does not account for vertical text
-        // and RTL text properly.
-        if let Some(range) = fragment.selection_range {
-            let baseline_origin = rect.origin;
-            if !range.is_empty() {
-                let start = glyphs_advance_by_index(
-                    &fragment.glyphs,
-                    range.begin(),
-                    baseline_origin,
-                    fragment.justification_adjustment,
-                );
-
-                let end = glyphs_advance_by_index(
-                    &fragment.glyphs,
-                    range.end(),
-                    baseline_origin,
-                    fragment.justification_adjustment,
-                );
-
-                let selection_rect = LayoutRect::new(
-                    Point2D::new(start.x.to_f32_px(), containing_block.min_y().to_f32_px()),
-                    Point2D::new(end.x.to_f32_px(), containing_block.max_y().to_f32_px()),
-                );
-                if let Some(selection_color) = fragment
-                    .selected_style
-                    .borrow()
-                    .clone_background_color()
-                    .as_absolute()
-                {
-                    let selection_common = builder.common_properties(selection_rect, &parent_style);
-                    builder.wr().push_rect(
-                        &selection_common,
-                        selection_rect,
-                        rgba(*selection_color),
-                    );
-                }
-            } else {
-                let insertion_point = glyphs_advance_by_index(
-                    &fragment.glyphs,
-                    range.begin(),
-                    baseline_origin,
-                    fragment.justification_adjustment,
-                );
-
-                let insertion_point_rect = LayoutRect::new(
-                    Point2D::new(
-                        insertion_point.x.to_f32_px(),
-                        containing_block.min_y().to_f32_px(),
-                    ),
-                    Point2D::new(
-                        insertion_point.x.to_f32_px() + INSERTION_POINT_LOGICAL_WIDTH.to_f32_px(),
-                        containing_block.max_y().to_f32_px(),
-                    ),
-                );
-                let insertion_point_common =
-                    builder.common_properties(insertion_point_rect, &parent_style);
-                // TODO: The color of the caret is currently hardcoded to the text color.
-                // We should be retrieving the caret color from the style properly.
-                builder
-                    .wr()
-                    .push_rect(&insertion_point_common, insertion_point_rect, rgba(color));
-            }
-        }
+        self.build_display_list_for_text_selection(
+            fragment,
+            builder,
+            containing_block,
+            fragment.base.rect.min_x(),
+            fragment.justification_adjustment,
+        );
 
         builder.wr().push_text(
             &common,
-            rect.to_webrender(),
+            glyph_bounds,
             &glyphs,
             fragment.font_key,
             rgba(color),
             None,
+        );
+
+        // From <https://www.w3.org/TR/paint-timing/#sec-terminology>:
+        // An element target is contentful when one or more of the following apply:
+        // > target has a text node child, representing non-empty text, and the node’s used opacity is greater than zero.
+        builder.check_for_contentful_paint(
+            glyph_bounds,
+            common.clip_rect,
+            parent_style.clone_opacity(),
         );
 
         for text_decoration in text_decorations.iter() {
@@ -977,6 +986,115 @@ impl Fragment {
             }),
         );
     }
+
+    // TODO: This caret/text selection implementation currently does not account for vertical text
+    // and RTL text properly.
+    fn build_display_list_for_text_selection(
+        &self,
+        fragment: &TextFragment,
+        builder: &mut DisplayListBuilder<'_>,
+        containing_block_rect: &PhysicalRect<Au>,
+        fragment_x_offset: Au,
+        justification_adjustment: Au,
+    ) {
+        let Some(offsets) = fragment.offsets.as_ref() else {
+            return;
+        };
+
+        let shared_selection = offsets.shared_selection.borrow();
+        if !shared_selection.enabled {
+            return;
+        }
+
+        if offsets.character_range.start > shared_selection.character_range.end ||
+            offsets.character_range.end < shared_selection.character_range.start
+        {
+            return;
+        }
+
+        let mut current_character_index = offsets.character_range.start;
+        let mut current_advance = Au::zero();
+        let mut start_advance = None;
+        let mut end_advance = None;
+        for glyph_store in fragment.glyphs.iter() {
+            let glyph_store_character_count = glyph_store.total_characters();
+            if current_character_index + glyph_store_character_count <
+                shared_selection.character_range.start
+            {
+                current_advance += glyph_store.total_advance() +
+                    (justification_adjustment * glyph_store.total_word_separators() as i32);
+                current_character_index += glyph_store_character_count;
+                continue;
+            }
+
+            if current_character_index >= shared_selection.character_range.end {
+                break;
+            }
+
+            for glyph in glyph_store.glyphs() {
+                if current_character_index >= shared_selection.character_range.start {
+                    start_advance = start_advance.or(Some(current_advance));
+                }
+
+                current_character_index += glyph.character_count();
+                current_advance += glyph.advance();
+                if glyph.char_is_word_separator() {
+                    current_advance += justification_adjustment;
+                }
+
+                if current_character_index <= shared_selection.character_range.end {
+                    end_advance = Some(current_advance);
+                }
+            }
+        }
+
+        let start_x = start_advance.unwrap_or(current_advance);
+        let end_x = end_advance.unwrap_or(current_advance);
+
+        let parent_style = fragment.base.style();
+        if !shared_selection.range.is_empty() {
+            let selection_rect = Rect::new(
+                containing_block_rect.origin +
+                    Vector2D::new(fragment_x_offset + start_x, Au::zero()),
+                Size2D::new(end_x - start_x, containing_block_rect.height()),
+            )
+            .to_webrender();
+
+            if let Some(selection_color) = fragment
+                .selected_style
+                .borrow()
+                .clone_background_color()
+                .as_absolute()
+            {
+                let selection_common = builder.common_properties(selection_rect, &parent_style);
+                builder
+                    .wr()
+                    .push_rect(&selection_common, selection_rect, rgba(*selection_color));
+            }
+            return;
+        }
+
+        let insertion_point_rect = Rect::new(
+            containing_block_rect.origin + Vector2D::new(start_x + fragment_x_offset, Au::zero()),
+            Size2D::new(
+                INSERTION_POINT_LOGICAL_WIDTH,
+                containing_block_rect.height(),
+            ),
+        )
+        .to_webrender();
+
+        let color = parent_style.clone_color();
+        let caret_color = match parent_style.clone_caret_color().0 {
+            ColorOrAuto::Color(caret_color) => caret_color.resolve_to_absolute(&color),
+            ColorOrAuto::Auto => color,
+        };
+        let insertion_point_common = builder.common_properties(insertion_point_rect, &parent_style);
+        builder.wr().push_rect(
+            &insertion_point_common,
+            insertion_point_rect,
+            rgba(caret_color),
+        );
+    }
 }
 
 struct BuilderForBoxFragment<'a> {
@@ -1071,7 +1189,7 @@ impl<'a> BuilderForBoxFragment<'a> {
             return Some(clip);
         }
 
-        let radii = inner_radii(self.border_radius, self.fragment.border.to_webrender());
+        let radii = offset_radii(self.border_radius, -self.fragment.border.to_webrender());
         let maybe_clip =
             builder.maybe_create_clip(radii, *self.padding_rect(), force_clip_creation);
         *self.padding_edge_clip_chain_id.borrow_mut() = maybe_clip;
@@ -1087,9 +1205,9 @@ impl<'a> BuilderForBoxFragment<'a> {
             return Some(clip);
         }
 
-        let radii = inner_radii(
+        let radii = offset_radii(
             self.border_radius,
-            (self.fragment.border + self.fragment.padding).to_webrender(),
+            -(self.fragment.border + self.fragment.padding).to_webrender(),
         );
         let maybe_clip =
             builder.maybe_create_clip(radii, *self.content_rect(), force_clip_creation);
@@ -1102,7 +1220,13 @@ impl<'a> BuilderForBoxFragment<'a> {
             self.fragment.style().get_inherited_ui().pointer_events !=
                 style::computed_values::pointer_events::T::None
         {
-            self.build_hit_test(builder, self.fragment.scrollable_overflow().to_webrender());
+            self.build_hit_test(
+                builder,
+                self.fragment
+                    .scrollable_overflow()
+                    .translate(self.containing_block.origin.to_vector())
+                    .to_webrender(),
+            );
             return;
         }
         if self.is_collapsed_table_borders {
@@ -1290,6 +1414,7 @@ impl<'a> BuilderForBoxFragment<'a> {
                                     vector_image.id,
                                     size,
                                     node,
+                                    vector_image.svg_id,
                                 )
                             })
                             .and_then(|rasterized_image| rasterized_image.id)
@@ -1323,17 +1448,21 @@ impl<'a> BuilderForBoxFragment<'a> {
                             )
                         }
 
-                        let lcp_candidate_id = self
-                            .fragment
-                            .base
-                            .tag
-                            .map(|tag| LCPCandidateID(tag.node.id()))
-                            .unwrap_or(LCPCandidateID(0));
-                        builder.collect_lcp_candidate(
-                            LargestContentfulPaintType::BackgroundImage,
-                            lcp_candidate_id,
+                        // From <https://www.w3.org/TR/paint-timing/#sec-terminology>:
+                        // An element target is contentful when one or more of the following apply:
+                        // > target has a background-image which is a contentful image, and its used
+                        // > background-size has non-zero width and height values.
+                        builder.check_for_contentful_paint(
+                            layer.bounds,
+                            layer.common.clip_rect,
+                            style.clone_opacity(),
+                        );
+
+                        builder.check_for_lcp_candidate(
                             layer.common.clip_rect,
                             layer.bounds,
+                            self.fragment.base.tag,
+                            None,
                         );
                     }
                 },
@@ -1500,6 +1629,15 @@ impl<'a> BuilderForBoxFragment<'a> {
                     return false;
                 };
 
+                // From <https://www.w3.org/TR/paint-timing/#sec-terminology>:
+                // An element target is contentful when one or more of the following apply:
+                // > target has a background-image which is a contentful image,
+                // > and its used background-size has non-zero width and height values.
+                builder.check_for_contentful_paint(
+                    Box2D::from_size(size.cast_unit()),
+                    common.clip_rect,
+                    style.clone_opacity(),
+                );
                 width = size.width;
                 height = size.height;
                 let image_rendering = style.clone_image_rendering().to_webrender();
@@ -1520,7 +1658,7 @@ impl<'a> BuilderForBoxFragment<'a> {
             },
         };
 
-        let size = euclid::Size2D::new(width as i32, height as i32);
+        let size = Size2D::new(width as i32, height as i32);
 
         // If the size of the border is zero or the size of the border image is zero, just
         // don't render anything. Zero-sized gradients cause problems in WebRender.
@@ -1587,7 +1725,7 @@ impl<'a> BuilderForBoxFragment<'a> {
             right: side,
             bottom: side,
             left: side,
-            radius: offset_radii(self.border_radius, offset),
+            radius: offset_radii(self.border_radius, SideOffsets2D::new_all_same(offset)),
             do_aa: true,
         });
         builder
@@ -1643,96 +1781,72 @@ fn glyphs(
     mut baseline_origin: PhysicalPoint<Au>,
     justification_adjustment: Au,
     include_whitespace: bool,
-) -> Vec<wr::GlyphInstance> {
-    use fonts_traits::ByteIndex;
-    use range::Range;
-
+) -> (Vec<GlyphInstance>, Au) {
     let mut glyphs = vec![];
+    let mut largest_advance = Au::zero();
+
     for run in glyph_runs {
-        for glyph in run.iter_glyphs_for_byte_range(&Range::new(ByteIndex(0), run.len())) {
+        for glyph in run.glyphs() {
             if !run.is_whitespace() || include_whitespace {
                 let glyph_offset = glyph.offset().unwrap_or(Point2D::zero());
-                let point = units::LayoutPoint::new(
+                let point = LayoutPoint::new(
                     baseline_origin.x.to_f32_px() + glyph_offset.x.to_f32_px(),
                     baseline_origin.y.to_f32_px() + glyph_offset.y.to_f32_px(),
                 );
-                let glyph = wr::GlyphInstance {
+                let glyph_instance = GlyphInstance {
                     index: glyph.id(),
                     point,
                 };
-                glyphs.push(glyph);
+                glyphs.push(glyph_instance);
             }
 
             if glyph.char_is_word_separator() {
                 baseline_origin.x += justification_adjustment;
             }
-            baseline_origin.x += glyph.advance();
+
+            let advance = glyph.advance();
+            baseline_origin.x += advance;
+            largest_advance.max_assign(advance);
         }
     }
-    glyphs
+    (glyphs, largest_advance)
 }
 
-// TODO: The implementation here does not account for multiple glyph runs properly.
-fn glyphs_advance_by_index(
-    glyph_runs: &[Arc<GlyphStore>],
-    index: fonts_traits::ByteIndex,
-    baseline_origin: PhysicalPoint<Au>,
-    justification_adjustment: Au,
-) -> PhysicalPoint<Au> {
-    let mut point = baseline_origin;
-    let mut index = index;
-    for run in glyph_runs {
-        let range = ServoRange::new(fonts::ByteIndex(0), index.min(run.len()));
-        index = index - range.length();
-        let total_advance = run.advance_for_byte_range(&range, justification_adjustment);
-        point.x += total_advance;
-    }
-    point
-}
+/// Given a set of corner radii for a rectangle, this function returns the corresponding radii
+/// for the [outer rectangle][`Rect::outer_rect`] resulting from expanding the original
+/// rectangle by the given offsets.
+fn offset_radii(mut radii: BorderRadius, offsets: LayoutSideOffsets) -> BorderRadius {
+    let expand = |radius: &mut f32, offset: f32| {
+        // For negative offsets, just shrink the radius by that amount.
+        if offset < 0.0 {
+            *radius = (*radius + offset).max(0.0);
+            return;
+        }
 
-/// Radii for the padding edge or content edge
-fn inner_radii(mut radii: wr::BorderRadius, insets: units::LayoutSideOffsets) -> wr::BorderRadius {
-    assert!(insets.left >= 0.0, "left inset must not be negative");
-    radii.top_left.width = (radii.top_left.width - insets.left).max(0.0);
-    radii.bottom_left.width = (radii.bottom_left.width - insets.left).max(0.0);
-
-    assert!(insets.right >= 0.0, "left inset must not be negative");
-    radii.top_right.width = (radii.top_right.width - insets.right).max(0.0);
-    radii.bottom_right.width = (radii.bottom_right.width - insets.right).max(0.0);
-
-    assert!(insets.top >= 0.0, "top inset must not be negative");
-    radii.top_left.height = (radii.top_left.height - insets.top).max(0.0);
-    radii.top_right.height = (radii.top_right.height - insets.top).max(0.0);
-
-    assert!(insets.bottom >= 0.0, "bottom inset must not be negative");
-    radii.bottom_left.height = (radii.bottom_left.height - insets.bottom).max(0.0);
-    radii.bottom_right.height = (radii.bottom_right.height - insets.bottom).max(0.0);
-    radii
-}
-
-fn offset_radii(mut radii: wr::BorderRadius, offset: f32) -> wr::BorderRadius {
-    if offset == 0.0 {
-        return radii;
-    }
-    if offset < 0.0 {
-        return inner_radii(radii, units::LayoutSideOffsets::new_all_same(-offset));
-    }
-    let expand = |radius: &mut f32| {
-        // Expand the radius by the specified amount, but keeping sharp corners.
-        // TODO: this behavior is not continuous, it's being discussed in the CSSWG:
-        // https://github.com/w3c/csswg-drafts/issues/7103
+        // For positive offsets, expand the radius by that amount. But only if the
+        // radius is positive, in order to preserve sharp corners.
+        // TODO: this behavior is not continuous, we should use this algorithm instead:
+        // https://github.com/w3c/csswg-drafts/issues/7103#issuecomment-3357331922
         if *radius > 0.0 {
             *radius += offset;
         }
     };
-    expand(&mut radii.top_left.width);
-    expand(&mut radii.top_left.height);
-    expand(&mut radii.top_right.width);
-    expand(&mut radii.top_right.height);
-    expand(&mut radii.bottom_right.width);
-    expand(&mut radii.bottom_right.height);
-    expand(&mut radii.bottom_left.width);
-    expand(&mut radii.bottom_left.height);
+    if offsets.left != 0.0 {
+        expand(&mut radii.top_left.width, offsets.left);
+        expand(&mut radii.bottom_left.width, offsets.left);
+    }
+    if offsets.right != 0.0 {
+        expand(&mut radii.top_right.width, offsets.right);
+        expand(&mut radii.bottom_right.width, offsets.right);
+    }
+    if offsets.top != 0.0 {
+        expand(&mut radii.top_left.height, offsets.top);
+        expand(&mut radii.top_right.height, offsets.top);
+    }
+    if offsets.bottom != 0.0 {
+        expand(&mut radii.bottom_right.height, offsets.bottom);
+        expand(&mut radii.bottom_left.height, offsets.bottom);
+    }
     radii
 }
 
@@ -1786,7 +1900,7 @@ fn resolve_border_image_width(
 
 /// Resolve the WebRender border-image slice from the style values.
 fn resolve_border_image_slice(
-    border_image_slice: &Rect<NonNegative<NumberOrPercentage>>,
+    border_image_slice: &StyleRect<NonNegative<NumberOrPercentage>>,
     size: Size2D<i32, UnknownUnit>,
 ) -> SideOffsets2D<i32, DevicePixel> {
     fn resolve_percentage(value: NonNegative<NumberOrPercentage>, length: i32) -> i32 {

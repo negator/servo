@@ -16,7 +16,7 @@ use ipc_channel::router::ROUTER;
 use js::jsapi::JSObject;
 use js::rust::MutableHandleValue;
 use js::typedarray::HeapFloat32Array;
-use profile_traits::ipc;
+use profile_traits::generic_callback::GenericCallback as ProfileGenericCallback;
 use rustc_hash::FxBuildHasher;
 use script_bindings::trace::RootedTraceableBox;
 use stylo_atoms::Atom;
@@ -80,7 +80,6 @@ pub(crate) struct XRSession {
     mode: XRSessionMode,
     visibility_state: Cell<XRVisibilityState>,
     viewer_space: MutNullableDom<XRSpace>,
-    #[ignore_malloc_size_of = "defined in webxr"]
     #[no_trace]
     session: DomRefCell<Session>,
     frame_requested: Cell<bool>,
@@ -101,16 +100,14 @@ pub(crate) struct XRSession {
     end_promises: DomRefCell<Vec<Rc<Promise>>>,
     /// <https://immersive-web.github.io/webxr/#ended>
     ended: Cell<bool>,
-    #[ignore_malloc_size_of = "defined in webxr"]
     #[no_trace]
     next_hit_test_id: Cell<HitTestId>,
-    #[ignore_malloc_size_of = "defined in webxr"]
+    #[ignore_malloc_size_of = "Promise"]
     pending_hit_test_promises:
         DomRefCell<HashMapTracedValues<HitTestId, Rc<Promise>, FxBuildHasher>>,
     /// Opaque framebuffers need to know the session is "outside of a requestAnimationFrame"
     /// <https://immersive-web.github.io/webxr/#opaque-framebuffer>
     outside_raf: Cell<bool>,
-    #[ignore_malloc_size_of = "defined in webxr"]
     #[no_trace]
     input_frames: DomRefCell<HashMap<InputId, InputFrame>>,
     framerate: Cell<f32>,
@@ -236,20 +233,17 @@ impl XRSession {
             .task_manager()
             .dom_manipulation_task_source()
             .to_sendable();
-        let (sender, receiver) = ipc::channel(global.time_profiler_chan().clone()).unwrap();
-
-        ROUTER.add_typed_route(
-            receiver.to_ipc_receiver(),
-            Box::new(move |message| {
+        let callback =
+            ProfileGenericCallback::new(global.time_profiler_chan().clone(), move |message| {
                 let this = this.clone();
                 task_source.queue(task!(xr_event_callback: move || {
                     this.root().event_callback(message.unwrap(), CanGc::note());
-                }));
-            }),
-        );
+                }))
+            })
+            .expect("Could not create callback");
 
         // request animation frame
-        self.session.borrow_mut().set_event_dest(sender);
+        self.session.borrow_mut().set_event_dest(callback);
     }
 
     // Must be called after the promise for session creation is resolved
@@ -700,16 +694,16 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
                     .filter(|other| other.layer_id() == layer.layer_id())
                     .count();
                 if count > 1 {
-                    return Err(Error::Type(String::from("Duplicate entry in WebXR layers")));
+                    return Err(Error::Type(c"Duplicate entry in WebXR layers".to_owned()));
                 }
             }
 
             // Step 3
             for layer in layers {
                 if layer.session() != self {
-                    return Err(Error::Type(String::from(
-                        "Layer from different session in WebXR layers",
-                    )));
+                    return Err(Error::Type(
+                        c"Layer from different session in WebXR layers".to_owned(),
+                    ));
                 }
             }
         }
@@ -1056,7 +1050,7 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
 
             if !supported_frame_rates.contains(&*rate) {
                 promise.reject_error(
-                    Error::Type("Provided framerate not supported".into()),
+                    Error::Type(c"Provided framerate not supported".into()),
                     can_gc,
                 );
                 return promise;
@@ -1071,11 +1065,9 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
             .task_manager()
             .dom_manipulation_task_source()
             .to_sendable();
-        let (sender, receiver) = ipc::channel(global.time_profiler_chan().clone()).unwrap();
 
-        ROUTER.add_typed_route(
-            receiver.to_ipc_receiver(),
-            Box::new(move |message| {
+        let callback =
+            ProfileGenericCallback::new(global.time_profiler_chan().clone(), move |message| {
                 let this = this.clone();
                 task_source.queue(task!(update_session_framerate: move || {
                     let session = this.root();
@@ -1084,10 +1076,10 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
                         promise.resolve_native(&(), CanGc::note());
                     };
                 }));
-            }),
-        );
+            })
+            .expect("Could not create callback");
 
-        self.session.borrow_mut().update_frame_rate(*rate, sender);
+        self.session.borrow_mut().update_frame_rate(*rate, callback);
 
         promise
     }

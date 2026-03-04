@@ -48,11 +48,12 @@ use net_traits::{
 use parking_lot::Mutex;
 use servo_arc::Arc as ServoArc;
 use servo_url::{ImmutableOrigin, ServoUrl};
+use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
 use crate::http_loader::{devtools_response_with_body, expect_devtools_http_request};
 use crate::{
-    DEFAULT_USER_AGENT, create_embedder_proxy, create_embedder_proxy_and_receiver,
+    DEFAULT_USER_AGENT, create_generic_embedder_proxy, create_generic_embedder_proxy_and_receiver,
     create_http_state, fetch, fetch_with_context, fetch_with_cors_cache, make_body, make_server,
     make_ssl_server, mock_origin, new_fetch_context,
 };
@@ -184,12 +185,9 @@ fn test_fetch_blob() {
     let origin = ServoUrl::parse("http://www.example.org/").unwrap();
 
     let id = Uuid::new_v4();
-    context.filemanager.lock().promote_memory(
-        id.clone(),
-        blob_buf,
-        true,
-        "http://www.example.org".into(),
-    );
+    context
+        .filemanager
+        .promote_memory(id.clone(), blob_buf, true, origin.origin());
     let url = ServoUrl::parse(&format!("blob:{}{}", origin.as_str(), id.simple())).unwrap();
 
     let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
@@ -744,15 +742,15 @@ fn test_fetch_with_hsts() {
 
     let (server, url) = make_ssl_server(handler);
 
-    let embedder_proxy = create_embedder_proxy();
+    let embedder_proxy = create_generic_embedder_proxy();
 
     let mut context = FetchContext {
         state: Arc::new(create_http_state(None)),
         user_agent: DEFAULT_USER_AGENT.into(),
         devtools_chan: None,
-        filemanager: Arc::new(Mutex::new(FileManager::new(embedder_proxy.clone()))),
+        filemanager: FileManager::new(embedder_proxy.clone()),
         file_token: FileTokenCheck::NotRequired,
-        request_interceptor: Arc::new(Mutex::new(RequestInterceptor::new(embedder_proxy))),
+        request_interceptor: Arc::new(TokioMutex::new(RequestInterceptor::new(embedder_proxy))),
         cancellation_listener: Arc::new(Default::default()),
         timing: ServoArc::new(Mutex::new(ResourceFetchTiming::new(
             ResourceTimingType::Navigation,
@@ -807,15 +805,15 @@ fn test_load_adds_host_to_hsts_list_when_url_is_https() {
     let (server, mut url) = make_ssl_server(handler);
     url.as_mut_url().set_scheme("https").unwrap();
 
-    let embedder_proxy = create_embedder_proxy();
+    let embedder_proxy = create_generic_embedder_proxy();
 
     let mut context = FetchContext {
         state: Arc::new(create_http_state(None)),
         user_agent: DEFAULT_USER_AGENT.into(),
         devtools_chan: None,
-        filemanager: Arc::new(Mutex::new(FileManager::new(embedder_proxy.clone()))),
+        filemanager: FileManager::new(embedder_proxy.clone()),
         file_token: FileTokenCheck::NotRequired,
-        request_interceptor: Arc::new(Mutex::new(RequestInterceptor::new(embedder_proxy))),
+        request_interceptor: Arc::new(TokioMutex::new(RequestInterceptor::new(embedder_proxy))),
         cancellation_listener: Arc::new(Default::default()),
         timing: ServoArc::new(Mutex::new(ResourceFetchTiming::new(
             ResourceTimingType::Navigation,
@@ -875,15 +873,15 @@ fn test_fetch_self_signed() {
     let (server, mut url) = make_ssl_server(handler);
     url.as_mut_url().set_scheme("https").unwrap();
 
-    let embedder_proxy = create_embedder_proxy();
+    let embedder_proxy = create_generic_embedder_proxy();
 
     let mut context = FetchContext {
         state: Arc::new(create_http_state(None)),
         user_agent: DEFAULT_USER_AGENT.into(),
         devtools_chan: None,
-        filemanager: Arc::new(Mutex::new(FileManager::new(embedder_proxy.clone()))),
+        filemanager: FileManager::new(embedder_proxy.clone()),
         file_token: FileTokenCheck::NotRequired,
-        request_interceptor: Arc::new(Mutex::new(RequestInterceptor::new(embedder_proxy))),
+        request_interceptor: Arc::new(TokioMutex::new(RequestInterceptor::new(embedder_proxy))),
         cancellation_listener: Arc::new(Default::default()),
         timing: ServoArc::new(Mutex::new(ResourceFetchTiming::new(
             ResourceTimingType::Navigation,
@@ -1421,10 +1419,7 @@ fn test_fetch_with_devtools() {
 
     headers.insert(header::ACCEPT, HeaderValue::from_static("*/*"));
 
-    headers.insert(
-        header::ACCEPT_LANGUAGE,
-        HeaderValue::from_static("en-US,en;q=0.5"),
-    );
+    headers.insert(header::ACCEPT_LANGUAGE, HeaderValue::from_static("en-US"));
 
     headers.typed_insert::<UserAgent>(DEFAULT_USER_AGENT.parse().unwrap());
 
@@ -1493,12 +1488,12 @@ fn test_fetch_request_intercepted() {
     static HEADERVALUE: &str = "custom-value";
     static STATUS_MESSAGE: &[u8] = b"custom status message";
 
-    let (embedder_proxy, embedder_receiver) = create_embedder_proxy_and_receiver();
+    let (embedder_proxy, embedder_receiver) = create_generic_embedder_proxy_and_receiver();
 
     std::thread::spawn(move || {
         let embedder_msg = embedder_receiver.recv().unwrap();
         match embedder_msg {
-            embedder_traits::EmbedderMsg::WebResourceRequested(
+            net::embedder::NetToEmbedderMsg::WebResourceRequested(
                 _,
                 web_resource_request,
                 response_sender,
@@ -1531,9 +1526,9 @@ fn test_fetch_request_intercepted() {
         state: Arc::new(create_http_state(None)),
         user_agent: DEFAULT_USER_AGENT.into(),
         devtools_chan: None,
-        filemanager: Arc::new(Mutex::new(FileManager::new(embedder_proxy.clone()))),
+        filemanager: FileManager::new(embedder_proxy.clone()),
         file_token: FileTokenCheck::NotRequired,
-        request_interceptor: Arc::new(Mutex::new(RequestInterceptor::new(embedder_proxy))),
+        request_interceptor: Arc::new(TokioMutex::new(RequestInterceptor::new(embedder_proxy))),
         cancellation_listener: Arc::new(Default::default()),
         timing: ServoArc::new(Mutex::new(ResourceFetchTiming::new(
             ResourceTimingType::Navigation,

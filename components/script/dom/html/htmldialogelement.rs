@@ -2,12 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 use std::borrow::Borrow;
-use std::cell::Cell;
 
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Prefix, local_name, ns};
 use js::rust::HandleObject;
 use script_bindings::error::{Error, ErrorResult};
+use stylo_dom::ElementState;
 
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::HTMLDialogElementBinding::HTMLDialogElementMethods;
@@ -20,15 +20,16 @@ use crate::dom::element::Element;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::html::htmlelement::HTMLElement;
+use crate::dom::htmlbuttonelement::{CommandState, HTMLButtonElement};
 use crate::dom::node::{Node, NodeTraits};
 use crate::dom::toggleevent::ToggleEvent;
+use crate::dom::virtualmethods::VirtualMethods;
 use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct HTMLDialogElement {
     htmlelement: HTMLElement,
     return_value: DomRefCell<DOMString>,
-    is_modal: Cell<bool>,
 }
 
 impl HTMLDialogElement {
@@ -40,11 +41,9 @@ impl HTMLDialogElement {
         HTMLDialogElement {
             htmlelement: HTMLElement::new_inherited(local_name, prefix, document),
             return_value: DomRefCell::new(DOMString::new()),
-            is_modal: Cell::new(false),
         }
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
@@ -66,7 +65,9 @@ impl HTMLDialogElement {
     pub fn show_a_modal(&self, source: Option<DomRoot<Element>>, can_gc: CanGc) -> ErrorResult {
         let subject = self.upcast::<Element>();
         // Step 1. If subject has an open attribute and is modal of subject is true, then return.
-        if subject.has_attribute(&local_name!("open")) && self.is_modal.get() {
+        if subject.has_attribute(&local_name!("open")) &&
+            subject.state().contains(ElementState::MODAL)
+        {
             return Ok(());
         }
 
@@ -124,11 +125,12 @@ impl HTMLDialogElement {
 
         // Step 11. Add an open attribute to subject, whose value is the empty string.
         subject.set_bool_attribute(&local_name!("open"), true, can_gc);
+        subject.set_open_state(true);
 
         // TODO: Step 12. Assert: subject's close watcher is not null.
 
         // Step 13. Set is modal of subject to true.
-        self.is_modal.set(true);
+        self.upcast::<Element>().set_modal_state(true);
 
         // TODO: Step 14. Set subject's node document to be blocked by the modal dialog subject.
 
@@ -191,13 +193,14 @@ impl HTMLDialogElement {
 
         // Step 5. Remove subject's open attribute.
         subject.remove_attribute(&ns!(), &local_name!("open"), can_gc);
+        subject.set_open_state(false);
 
         // TODO: Step 6. If is modal of subject is true, then request an element to be removed from the top layer given subject.
 
         // TODO: Step 7. Let wasModal be the value of subject's is modal flag.
 
         // Step 8. Set is modal of subject to false.
-        self.is_modal.set(false);
+        self.upcast::<Element>().set_modal_state(false);
 
         // Step 9. If result is not null, then set subject's returnValue attribute to result.
         if let Some(new_value) = result {
@@ -293,7 +296,9 @@ impl HTMLDialogElementMethods<crate::DomTypeHolder> for HTMLDialogElement {
     fn Show(&self, can_gc: CanGc) -> ErrorResult {
         let element = self.upcast::<Element>();
         // Step 1. If this has an open attribute and is modal of this is false, then return.
-        if element.has_attribute(&local_name!("open")) && !self.is_modal.get() {
+        if element.has_attribute(&local_name!("open")) &&
+            !element.state().contains(ElementState::MODAL)
+        {
             return Ok(());
         }
 
@@ -332,6 +337,7 @@ impl HTMLDialogElementMethods<crate::DomTypeHolder> for HTMLDialogElement {
 
         // Step 6. Add an open attribute to this, whose value is the empty string.
         element.set_bool_attribute(&local_name!("open"), true, can_gc);
+        element.set_open_state(true);
 
         // TODO: Step 7. Set this's previously focused element to the focused element.
 
@@ -361,5 +367,62 @@ impl HTMLDialogElementMethods<crate::DomTypeHolder> for HTMLDialogElement {
         // Step 1. If returnValue is not given, then set it to null.
         // Step 2. Close the dialog this with returnValue and null.
         self.close_the_dialog(return_value, None, can_gc);
+    }
+}
+
+impl VirtualMethods for HTMLDialogElement {
+    fn super_type(&self) -> Option<&dyn VirtualMethods> {
+        Some(self.upcast::<HTMLElement>() as &dyn VirtualMethods)
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#the-dialog-element:is-valid-command-steps>
+    fn is_valid_command_steps(&self, command: CommandState) -> bool {
+        // Step 1. If command is in the Close state, the Request Close state (TODO), or the
+        // ShowModal state, then return true.
+        if command == CommandState::Close || command == CommandState::ShowModal {
+            return true;
+        }
+        // Step 2. Return false.
+        false
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#the-dialog-element:command-steps>
+    fn command_steps(
+        &self,
+        source: DomRoot<HTMLButtonElement>,
+        command: CommandState,
+        can_gc: CanGc,
+    ) -> bool {
+        if self
+            .super_type()
+            .unwrap()
+            .command_steps(source.clone(), command, can_gc)
+        {
+            return true;
+        }
+
+        // TODO Step 1. If element is in the popover showing state, then return.
+        let element = self.upcast::<Element>();
+
+        // Step 2. If command is in the Close state and element has an open attribute, then
+        // close the dialog element with source's optional value and source.
+        if command == CommandState::Close && element.has_attribute(&local_name!("open")) {
+            let button_element = DomRoot::from_ref(source.upcast::<Element>());
+            self.close_the_dialog(source.optional_value(), Some(button_element), can_gc);
+            return true;
+        }
+
+        // TODO Step 3. If command is in the Request Close state and element has an open attribute,
+        // then request to close the dialog element with source's optional value and source.
+
+        // Step 4. If command is the Show Modal state and element does not have an open attribute,
+        // then show a modal dialog given element and source.
+        if command == CommandState::ShowModal && !element.has_attribute(&local_name!("open")) {
+            let button_element = DomRoot::from_ref(source.upcast::<Element>());
+            let _ = self.show_a_modal(Some(button_element), can_gc);
+            return true;
+        }
+
+        false
     }
 }

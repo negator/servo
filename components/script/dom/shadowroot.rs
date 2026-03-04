@@ -13,7 +13,6 @@ use script_bindings::error::{ErrorResult, Fallible};
 use script_bindings::script_runtime::JSContext;
 use servo_arc::Arc;
 use style::author_styles::AuthorStyles;
-use style::dom::TElement;
 use style::invalidation::element::restyle_hints::RestyleHint;
 use style::shared_lock::SharedRwLockReadGuard;
 use style::stylesheets::Stylesheet;
@@ -35,12 +34,12 @@ use crate::dom::bindings::frozenarray::CachedFrozenArray;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::reflector::reflect_dom_object;
-use crate::dom::bindings::root::{Dom, DomRoot, LayoutDom, MutNullableDom, ToLayout};
+use crate::dom::bindings::root::{Dom, DomRoot, LayoutDom, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::css::cssstylesheet::CSSStyleSheet;
 use crate::dom::css::stylesheetlist::{StyleSheetList, StyleSheetListOwner};
 use crate::dom::document::Document;
-use crate::dom::documentfragment::DocumentFragment;
+use crate::dom::documentfragment::{DocumentFragment, LayoutDocumentFragmentHelpers};
 use crate::dom::documentorshadowroot::{
     DocumentOrShadowRoot, ServoStylesheetInDocument, StylesheetSource,
 };
@@ -71,7 +70,6 @@ pub(crate) struct ShadowRoot {
     document_fragment: DocumentFragment,
     document_or_shadow_root: DocumentOrShadowRoot,
     document: Dom<Document>,
-    host: Dom<Element>,
     /// List of author styles associated with nodes in this shadow tree.
     #[custom_trace]
     author_styles: DomRefCell<AuthorStyles<ServoStylesheetInDocument>>,
@@ -115,7 +113,7 @@ pub(crate) struct ShadowRoot {
 }
 
 impl ShadowRoot {
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     fn new_inherited(
         host: &Element,
         document: &Document,
@@ -124,7 +122,7 @@ impl ShadowRoot {
         clonable: bool,
         is_user_agent_widget: IsUserAgentWidget,
     ) -> ShadowRoot {
-        let document_fragment = DocumentFragment::new_inherited(document);
+        let document_fragment = DocumentFragment::new_inherited(document, Some(host));
         let node = document_fragment.upcast::<Node>();
         node.set_flag(NodeFlags::IS_IN_SHADOW_TREE, true);
         node.set_flag(
@@ -136,7 +134,6 @@ impl ShadowRoot {
             document_fragment,
             document_or_shadow_root: DocumentOrShadowRoot::new(document.window()),
             document: Dom::from_ref(document),
-            host: Dom::from_ref(host),
             author_styles: DomRefCell::new(AuthorStyles::new()),
             stylesheet_list: MutNullableDom::new(None),
             window: Dom::from_ref(document.window()),
@@ -204,7 +201,7 @@ impl ShadowRoot {
     /// any constructed stylesheet.
     ///
     /// <https://drafts.csswg.org/cssom/#documentorshadowroot-final-css-style-sheets>
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))] // Owner needs to be rooted already necessarily.
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))] // Owner needs to be rooted already necessarily.
     pub(crate) fn add_owned_stylesheet(&self, owner_node: &Element, sheet: Arc<Stylesheet>) {
         let stylesheets = &mut self.author_styles.borrow_mut().stylesheets;
 
@@ -223,6 +220,13 @@ impl ShadowRoot {
             })
             .cloned();
 
+        if self.document.has_browsing_context() {
+            let document_context = self.window.web_font_context();
+            self.window
+                .layout_mut()
+                .load_web_fonts_from_stylesheet(&sheet, &document_context);
+        }
+
         DocumentOrShadowRoot::add_stylesheet(
             StylesheetSource::Element(Dom::from_ref(owner_node)),
             StylesheetSetRef::Author(stylesheets),
@@ -233,7 +237,7 @@ impl ShadowRoot {
     }
 
     /// Append a constructed stylesheet to the back of shadow root stylesheet set.
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     pub(crate) fn append_constructed_stylesheet(&self, cssom_stylesheet: &CSSStyleSheet) {
         debug_assert!(cssom_stylesheet.is_constructed());
 
@@ -241,6 +245,13 @@ impl ShadowRoot {
         let sheet = cssom_stylesheet.style_stylesheet().clone();
 
         let insertion_point = stylesheets.iter().last().cloned();
+
+        if self.document.has_browsing_context() {
+            let document_context = self.window.web_font_context();
+            self.window
+                .layout_mut()
+                .load_web_fonts_from_stylesheet(&sheet, &document_context);
+        }
 
         DocumentOrShadowRoot::add_stylesheet(
             StylesheetSource::Constructed(Dom::from_ref(cssom_stylesheet)),
@@ -252,7 +263,7 @@ impl ShadowRoot {
     }
 
     /// Remove a stylesheet owned by `owner` from the list of shadow root sheets.
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))] // Owner needs to be rooted already necessarily.
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))] // Owner needs to be rooted already necessarily.
     pub(crate) fn remove_stylesheet(&self, owner: StylesheetSource, s: &Arc<Stylesheet>) {
         DocumentOrShadowRoot::remove_stylesheet(
             owner,
@@ -265,11 +276,11 @@ impl ShadowRoot {
         self.document.invalidate_shadow_roots_stylesheets();
         self.author_styles.borrow_mut().stylesheets.force_dirty();
         // Mark the host element dirty so a reflow will be performed.
-        self.host.upcast::<Node>().dirty(NodeDamage::Style);
+        self.Host().upcast::<Node>().dirty(NodeDamage::Style);
 
         // Also mark the host element with `RestyleHint::restyle_subtree` so a reflow
         // can traverse into the shadow tree.
-        let mut restyle = self.document.ensure_pending_restyle(&self.host);
+        let mut restyle = self.document.ensure_pending_restyle(&self.Host());
         restyle.hint.insert(RestyleHint::restyle_subtree());
     }
 
@@ -438,7 +449,9 @@ impl ShadowRootMethods<crate::DomTypeHolder> for ShadowRoot {
 
     /// <https://dom.spec.whatwg.org/#dom-shadowroot-host>
     fn Host(&self) -> DomRoot<Element> {
-        self.host.as_rooted()
+        self.upcast::<DocumentFragment>()
+            .host()
+            .expect("ShadowRoot always has an element as host")
     }
 
     /// <https://drafts.csswg.org/cssom/#dom-document-stylesheets>
@@ -474,14 +487,18 @@ impl ShadowRootMethods<crate::DomTypeHolder> for ShadowRoot {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-shadowroot-innerhtml>
-    fn SetInnerHTML(&self, value: TrustedHTMLOrNullIsEmptyString, can_gc: CanGc) -> ErrorResult {
+    fn SetInnerHTML(
+        &self,
+        cx: &mut js::context::JSContext,
+        value: TrustedHTMLOrNullIsEmptyString,
+    ) -> ErrorResult {
         // Step 1. Let compliantString be the result of invoking the Get Trusted Type compliant string algorithm
         // with TrustedHTML, this's relevant global object, the given value, "ShadowRoot innerHTML", and "script".
         let value = TrustedHTML::get_trusted_script_compliant_string(
             &self.owner_global(),
             value.convert(),
             "ShadowRoot innerHTML",
-            can_gc,
+            CanGc::from_cx(cx),
         )?;
 
         // Step 2. Let context be this's host.
@@ -492,10 +509,10 @@ impl ShadowRootMethods<crate::DomTypeHolder> for ShadowRoot {
         //
         // NOTE: The spec doesn't strictly tell us to bail out here, but
         // we can't continue if parsing failed
-        let frag = context.parse_fragment(value, can_gc)?;
+        let frag = context.parse_fragment(value, cx)?;
 
         // Step 4. Replace all with fragment within this.
-        Node::replace_all(Some(frag.upcast()), self.upcast(), can_gc);
+        Node::replace_all(Some(frag.upcast()), self.upcast(), CanGc::from_cx(cx));
         Ok(())
     }
 
@@ -505,7 +522,11 @@ impl ShadowRootMethods<crate::DomTypeHolder> for ShadowRoot {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-shadowroot-sethtmlunsafe>
-    fn SetHTMLUnsafe(&self, value: TrustedHTMLOrString, can_gc: CanGc) -> ErrorResult {
+    fn SetHTMLUnsafe(
+        &self,
+        cx: &mut js::context::JSContext,
+        value: TrustedHTMLOrString,
+    ) -> ErrorResult {
         // Step 1. Let compliantHTML be the result of invoking the
         // Get Trusted Type compliant string algorithm with TrustedHTML,
         // this's relevant global object, html, "ShadowRoot setHTMLUnsafe", and "script".
@@ -513,13 +534,13 @@ impl ShadowRootMethods<crate::DomTypeHolder> for ShadowRoot {
             &self.owner_global(),
             value,
             "ShadowRoot setHTMLUnsafe",
-            can_gc,
+            CanGc::from_cx(cx),
         )?;
         // Step 2. Unsafely set HTMl given this, this's shadow host, and complaintHTML
         let target = self.upcast::<Node>();
         let context_element = self.Host();
 
-        Node::unsafely_set_html(target, &context_element, value, can_gc);
+        Node::unsafely_set_html(target, &context_element, value, cx);
         Ok(())
     }
 
@@ -564,6 +585,14 @@ impl ShadowRootMethods<crate::DomTypeHolder> for ShadowRoot {
         }
 
         result
+    }
+
+    /// <https://fullscreen.spec.whatwg.org/#dom-document-fullscreenelement>
+    fn GetFullscreenElement(&self) -> Option<DomRoot<Element>> {
+        DocumentOrShadowRoot::get_fullscreen_element(
+            self.upcast::<Node>(),
+            self.document.fullscreen_element(),
+        )
     }
 }
 
@@ -617,18 +646,14 @@ pub(crate) trait LayoutShadowRootHelpers<'dom> {
     fn get_host_for_layout(self) -> LayoutDom<'dom, Element>;
     fn get_style_data_for_layout(self) -> &'dom CascadeData;
     fn is_ua_widget(&self) -> bool;
-    unsafe fn flush_stylesheets<E: TElement>(
-        self,
-        stylist: &mut Stylist,
-        guard: &SharedRwLockReadGuard,
-    );
+    unsafe fn flush_stylesheets(self, stylist: &mut Stylist, guard: &SharedRwLockReadGuard);
 }
 
 impl<'dom> LayoutShadowRootHelpers<'dom> for LayoutDom<'dom, ShadowRoot> {
     #[inline]
-    #[expect(unsafe_code)]
     fn get_host_for_layout(self) -> LayoutDom<'dom, Element> {
-        unsafe { self.unsafe_get().host.to_layout() }
+        self.upcast::<DocumentFragment>()
+            .shadowroot_host_for_layout()
     }
 
     #[inline]
@@ -648,14 +673,10 @@ impl<'dom> LayoutShadowRootHelpers<'dom> for LayoutDom<'dom, ShadowRoot> {
     // probably be revisited.
     #[inline]
     #[expect(unsafe_code)]
-    unsafe fn flush_stylesheets<E: TElement>(
-        self,
-        stylist: &mut Stylist,
-        guard: &SharedRwLockReadGuard,
-    ) {
+    unsafe fn flush_stylesheets(self, stylist: &mut Stylist, guard: &SharedRwLockReadGuard) {
         let author_styles = unsafe { self.unsafe_get().author_styles.borrow_mut_for_layout() };
         if author_styles.stylesheets.dirty() {
-            author_styles.flush::<E>(stylist, guard);
+            author_styles.flush(stylist, guard);
         }
     }
 }

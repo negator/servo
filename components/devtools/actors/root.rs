@@ -9,12 +9,13 @@
 //!
 //! [Firefox JS implementation]: https://searchfox.org/mozilla-central/source/devtools/server/actors/root.js
 
-use std::cell::RefCell;
+use std::collections::HashMap;
 
+use atomic_refcell::AtomicRefCell;
+use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use crate::StreamId;
 use crate::actor::{Actor, ActorEncode, ActorError, ActorRegistry};
 use crate::actors::device::DeviceActor;
 use crate::actors::performance::PerformanceActor;
@@ -23,14 +24,16 @@ use crate::actors::process::{ProcessActor, ProcessActorMsg};
 use crate::actors::tab::{TabDescriptorActor, TabDescriptorActorMsg};
 use crate::actors::worker::{WorkerActor, WorkerActorMsg};
 use crate::protocol::{ActorDescription, ClientRequest};
+use crate::{EmptyReplyMsg, StreamId};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ActorTraits {
+struct RootTraits {
     sources: bool,
     highlightable: bool,
     custom_highlighters: bool,
     network_monitor: bool,
+    resources: HashMap<&'static str, bool>,
 }
 
 #[derive(Serialize)]
@@ -42,7 +45,7 @@ struct ListAddonsReply {
 #[derive(Serialize)]
 enum AddonMsg {}
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Default, Serialize, MallocSizeOf)]
 #[serde(rename_all = "camelCase")]
 struct GlobalActors {
     device_actor: String,
@@ -76,14 +79,14 @@ struct GetTabReply {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RootActorMsg {
+pub(crate) struct RootActorMsg {
     from: String,
     application_type: String,
-    traits: ActorTraits,
+    traits: RootTraits,
 }
 
 #[derive(Serialize)]
-pub struct ProtocolDescriptionReply {
+pub(crate) struct ProtocolDescriptionReply {
     from: String,
     types: Types,
 }
@@ -101,7 +104,7 @@ struct ListServiceWorkerRegistrationsReply {
 }
 
 #[derive(Serialize)]
-pub struct Types {
+pub(crate) struct Types {
     performance: ActorDescription,
     device: ActorDescription,
 }
@@ -114,7 +117,7 @@ struct ListProcessesResponse {
 
 #[derive(Default, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DescriptorTraits {
+pub(crate) struct DescriptorTraits {
     pub(crate) watcher: bool,
     pub(crate) supports_reload_descriptor: bool,
 }
@@ -126,12 +129,13 @@ struct GetProcessResponse {
     process_descriptor: ProcessActorMsg,
 }
 
-pub struct RootActor {
-    active_tab: RefCell<Option<String>>,
+#[derive(Default, MallocSizeOf)]
+pub(crate) struct RootActor {
+    active_tab: AtomicRefCell<Option<String>>,
     global_actors: GlobalActors,
     process: String,
-    pub tabs: Vec<String>,
-    pub workers: Vec<String>,
+    pub tabs: AtomicRefCell<Vec<String>>,
+    pub workers: AtomicRefCell<Vec<String>>,
 }
 
 impl Actor for RootActor {
@@ -220,6 +224,7 @@ impl Actor for RootActor {
                     from: "root".to_owned(),
                     tabs: self
                         .tabs
+                        .borrow()
                         .iter()
                         .filter_map(|target| {
                             let tab_actor = registry.find::<TabDescriptorActor>(target);
@@ -240,6 +245,7 @@ impl Actor for RootActor {
                     from: self.name(),
                     workers: self
                         .workers
+                        .borrow()
                         .iter()
                         .map(|name| registry.encode::<WorkerActor, _>(name))
                         .collect(),
@@ -258,6 +264,16 @@ impl Actor for RootActor {
                 request.reply_final(&msg)?
             },
 
+            "watchResources" => {
+                // TODO: Respond to watch resource requests
+                request.reply_final(&EmptyReplyMsg { from: self.name() })?
+            },
+
+            "unwatchResources" => {
+                // TODO: Respond to unwatch resource requests
+                request.reply_final(&EmptyReplyMsg { from: self.name() })?
+            },
+
             _ => return Err(ActorError::UnrecognizedPacketType),
         };
         Ok(())
@@ -268,24 +284,22 @@ impl RootActor {
     /// Registers the root actor and its global actors (those not associated with a specific target).
     pub fn register(registry: &mut ActorRegistry) {
         // Global actors
-        let device = DeviceActor::new(registry.new_name("device"));
-        let perf = PerformanceActor::new(registry.new_name("perf"));
-        let preference = PreferenceActor::new(registry.new_name("preference"));
+        let device = DeviceActor::new(registry.new_name::<DeviceActor>());
+        let perf = PerformanceActor::new(registry.new_name::<PerformanceActor>());
+        let preference = PreferenceActor::new(registry.new_name::<PreferenceActor>());
 
         // Process descriptor
-        let process = ProcessActor::new(registry.new_name("process"));
+        let process = ProcessActor::new(registry.new_name::<ProcessActor>());
 
         // Root actor
         let root = Self {
-            active_tab: None.into(),
             global_actors: GlobalActors {
                 device_actor: device.name(),
                 perf_actor: perf.name(),
                 preference_actor: preference.name(),
             },
             process: process.name(),
-            tabs: vec![],
-            workers: vec![],
+            ..Default::default()
         };
 
         registry.register(perf);
@@ -302,6 +316,7 @@ impl RootActor {
     ) -> Option<TabDescriptorActorMsg> {
         let mut tab_msg = self
             .tabs
+            .borrow()
             .iter()
             .map(|target| registry.encode::<TabDescriptorActor, _>(target))
             .find(|tab| tab.browser_id() == browser_id);
@@ -323,11 +338,12 @@ impl ActorEncode<RootActorMsg> for RootActor {
         RootActorMsg {
             from: "root".to_owned(),
             application_type: "browser".to_owned(),
-            traits: ActorTraits {
+            traits: RootTraits {
                 sources: false,
                 highlightable: true,
                 custom_highlighters: true,
                 network_monitor: true,
+                resources: HashMap::from([("extensions-backgroundscript-status", true)]),
             },
         }
     }

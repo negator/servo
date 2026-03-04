@@ -7,15 +7,15 @@ use std::ptr::{self, NonNull};
 use std::slice;
 
 use devtools_traits::{
-    ConsoleLogLevel, ConsoleMessage, ConsoleMessageArgument, ConsoleMessageBuilder,
-    ScriptToDevtoolsControlMsg, StackFrame,
+    ConsoleArgument, ConsoleArgumentObject, ConsoleArgumentPropertyValue, ConsoleLogLevel,
+    ConsoleMessage, ConsoleMessageFields, ScriptToDevtoolsControlMsg, StackFrame, get_time_stamp,
 };
 use embedder_traits::EmbedderMsg;
 use js::conversions::jsstr_to_string;
-use js::jsapi::{self, ESClass, PropertyDescriptor};
+use js::jsapi::{self, ESClass, JS_IsTypedArrayObject, PropertyDescriptor};
 use js::jsval::{Int32Value, UndefinedValue};
 use js::rust::wrappers::{
-    GetBuiltinClass, GetPropertyKeys, JS_GetOwnPropertyDescriptorById, JS_GetPropertyById,
+    GetBuiltinClass, GetPropertyKeys, IsArray, JS_GetOwnPropertyDescriptorById, JS_GetPropertyById,
     JS_IdToValue, JS_Stringify, JS_ValueToSource,
 };
 use js::rust::{
@@ -41,11 +41,25 @@ pub(crate) struct Console;
 
 impl Console {
     #[expect(unsafe_code)]
-    fn build_message(level: ConsoleLogLevel) -> ConsoleMessageBuilder {
+    fn build_message(
+        level: ConsoleLogLevel,
+        arguments: Vec<ConsoleArgument>,
+        stacktrace: Option<Vec<StackFrame>>,
+    ) -> ConsoleMessage {
         let cx = GlobalScope::get_cx();
         let caller = unsafe { describe_scripted_caller(*cx) }.unwrap_or_default();
 
-        ConsoleMessageBuilder::new(level, caller.filename, caller.line, caller.col)
+        ConsoleMessage {
+            fields: ConsoleMessageFields {
+                level,
+                filename: caller.filename,
+                line_number: caller.line,
+                column_number: caller.col,
+                time_stamp: get_time_stamp(),
+            },
+            arguments,
+            stacktrace,
+        }
     }
 
     /// Helper to send a message that only consists of a single string
@@ -55,11 +69,9 @@ impl Console {
 
         Self::send_to_embedder(global, level.clone(), formatted_message);
 
-        let mut builder = Self::build_message(level);
-        builder.add_argument(message.into());
-        let log_message = builder.finish();
+        let console_message = Self::build_message(level, vec![message.into()], None);
 
-        Self::send_to_devtools(global, log_message);
+        Self::send_to_devtools(global, console_message);
     }
 
     fn method(
@@ -70,16 +82,15 @@ impl Console {
     ) {
         let cx = GlobalScope::get_cx();
 
-        let mut log: ConsoleMessageBuilder = Console::build_message(level.clone());
-        for message in &messages {
-            log.add_argument(console_argument_from_handle_value(cx, *message));
-        }
+        let arguments = messages
+            .iter()
+            .map(|msg| console_argument_from_handle_value(cx, *msg, &mut Vec::new()))
+            .collect();
+        let stacktrace = (include_stacktrace == IncludeStackTrace::Yes)
+            .then_some(get_js_stack(*GlobalScope::get_cx()));
+        let console_message = Self::build_message(level.clone(), arguments, stacktrace);
 
-        if include_stacktrace == IncludeStackTrace::Yes {
-            log.attach_stack_trace(get_js_stack(*GlobalScope::get_cx()));
-        }
-
-        Console::send_to_devtools(global, log.finish());
+        Console::send_to_devtools(global, console_message);
 
         let prefix = global.current_group_label().unwrap_or_default();
         let msgs = stringify_handle_values(&messages);
@@ -129,26 +140,133 @@ unsafe fn handle_value_to_string(cx: *mut jsapi::JSContext, value: HandleValue) 
 fn console_argument_from_handle_value(
     cx: JSContext,
     handle_value: HandleValue,
-) -> ConsoleMessageArgument {
+    seen: &mut Vec<u64>,
+) -> ConsoleArgument {
     if handle_value.is_string() {
         let js_string = ptr::NonNull::new(handle_value.to_string()).unwrap();
         let dom_string = unsafe { jsstr_to_string(*cx, js_string) };
-        return ConsoleMessageArgument::String(dom_string);
+        return ConsoleArgument::String(dom_string);
     }
 
     if handle_value.is_int32() {
         let integer = handle_value.to_int32();
-        return ConsoleMessageArgument::Integer(integer);
+        return ConsoleArgument::Integer(integer);
     }
 
     if handle_value.is_number() {
         let number = handle_value.to_number();
-        return ConsoleMessageArgument::Number(number);
+        return ConsoleArgument::Number(number);
+    }
+
+    if handle_value.is_boolean() {
+        let boolean = handle_value.to_boolean();
+        return ConsoleArgument::Boolean(boolean);
+    }
+
+    if handle_value.is_object() {
+        // JS objects can create circular reference, and we want to avoid recursing infinitely
+        if seen.contains(&handle_value.asBits_) {
+            // FIXME: Handle this properly
+            return ConsoleArgument::String("[circular]".into());
+        }
+
+        seen.push(handle_value.asBits_);
+        let maybe_argument_object = console_object_from_handle_value(cx, handle_value, seen);
+        let js_value = seen.pop();
+        debug_assert_eq!(js_value, Some(handle_value.asBits_));
+
+        if let Some(console_argument_object) = maybe_argument_object {
+            return ConsoleArgument::Object(console_argument_object);
+        }
     }
 
     // FIXME: Handle more complex argument types here
     let stringified_value = stringify_handle_value(handle_value);
-    ConsoleMessageArgument::String(stringified_value.into())
+
+    ConsoleArgument::String(stringified_value.into())
+}
+
+#[expect(unsafe_code)]
+fn console_object_from_handle_value(
+    cx: JSContext,
+    handle_value: HandleValue,
+    seen: &mut Vec<u64>,
+) -> Option<ConsoleArgumentObject> {
+    rooted!(in(*cx) let object = handle_value.to_object());
+
+    // We should not generate object previews for arrays, although they are objects
+    let mut is_array = false;
+    if !unsafe { IsArray(*cx, object.handle(), &mut is_array) } || is_array {
+        return None;
+    }
+    if unsafe { JS_IsTypedArrayObject(object.get()) } {
+        return None;
+    }
+
+    let mut own_properties = Vec::new();
+    let mut ids = unsafe { IdVector::new(*cx) };
+    if !unsafe {
+        GetPropertyKeys(
+            *cx,
+            object.handle(),
+            jsapi::JSITER_OWNONLY | jsapi::JSITER_SYMBOLS | jsapi::JSITER_HIDDEN,
+            ids.handle_mut(),
+        )
+    } {
+        return None;
+    }
+
+    for id in ids.iter() {
+        rooted!(in(*cx) let id = *id);
+        rooted!(in(*cx) let mut descriptor = PropertyDescriptor::default());
+
+        let mut is_none = false;
+        if !unsafe {
+            JS_GetOwnPropertyDescriptorById(
+                *cx,
+                object.handle(),
+                id.handle(),
+                descriptor.handle_mut(),
+                &mut is_none,
+            )
+        } {
+            return None;
+        }
+
+        rooted!(in(*cx) let mut property = UndefinedValue());
+        if !unsafe { JS_GetPropertyById(*cx, object.handle(), id.handle(), property.handle_mut()) }
+        {
+            return None;
+        }
+
+        let key = if id.is_string() {
+            rooted!(in(*cx) let mut key_value = UndefinedValue());
+            let raw_id: jsapi::HandleId = id.handle().into();
+            if !unsafe { JS_IdToValue(*cx, *raw_id.ptr, key_value.handle_mut()) } {
+                continue;
+            }
+            rooted!(in(*cx) let js_string = key_value.to_string());
+            let Some(js_string) = NonNull::new(js_string.get()) else {
+                continue;
+            };
+            unsafe { jsstr_to_string(*cx, js_string) }
+        } else {
+            continue;
+        };
+
+        own_properties.push(ConsoleArgumentPropertyValue {
+            key,
+            configurable: descriptor.hasConfigurable_() && descriptor.configurable_(),
+            enumerable: descriptor.hasEnumerable_() && descriptor.enumerable_(),
+            writable: descriptor.hasWritable_() && descriptor.writable_(),
+            value: console_argument_from_handle_value(cx, property.handle(), seen),
+        });
+    }
+
+    Some(ConsoleArgumentObject {
+        class: "Object".to_owned(),
+        own_properties,
+    })
 }
 
 #[expect(unsafe_code)]

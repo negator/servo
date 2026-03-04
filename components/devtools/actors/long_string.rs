@@ -1,6 +1,7 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -10,14 +11,15 @@ use crate::protocol::ClientRequest;
 
 const INITIAL_LENGTH: usize = 500;
 
-pub struct LongStringActor {
+#[derive(MallocSizeOf)]
+pub(crate) struct LongStringActor {
     name: String,
     full_string: String,
 }
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct LongStringObj {
+pub(crate) struct LongStringObj {
     #[serde(rename = "type")]
     type_: String,
     actor: String,
@@ -72,7 +74,7 @@ impl Actor for LongStringActor {
 
 impl LongStringActor {
     pub fn new(registry: &ActorRegistry, full_string: String) -> Self {
-        let name = registry.new_name("longStringActor");
+        let name = registry.new_name::<Self>();
         LongStringActor { name, full_string }
     }
 

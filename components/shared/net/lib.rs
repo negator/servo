@@ -9,7 +9,9 @@ use std::sync::{LazyLock, OnceLock};
 use std::thread::{self, JoinHandle};
 
 use base::cross_process_instant::CrossProcessInstant;
-use base::generic_channel::{self, GenericSend, GenericSender, SendResult};
+use base::generic_channel::{
+    self, CallbackSetter, GenericOneshotSender, GenericSend, GenericSender, SendResult,
+};
 use base::id::{CookieStoreId, HistoryStateId, PipelineId};
 use content_security_policy::{self as csp};
 use cookie::Cookie;
@@ -18,7 +20,7 @@ use headers::{ContentType, HeaderMapExt, ReferrerPolicy as ReferrerPolicyHeader}
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 use hyper_serde::Serde;
 use hyper_util::client::legacy::Error as HyperError;
-use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
+use ipc_channel::ipc::{self, IpcSender};
 use ipc_channel::router::ROUTER;
 use malloc_size_of::malloc_size_of_is_0;
 use malloc_size_of_derive::MallocSizeOf;
@@ -31,8 +33,10 @@ use rustls_pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
 use servo_url::{ImmutableOrigin, ServoUrl};
 
+use crate::fetch::headers::determine_nosniff;
 use crate::filemanager_thread::FileManagerThreadMsg;
 use crate::http_status::HttpStatus;
+use crate::mime_classifier::{ApacheBugFlag, MimeClassifier};
 use crate::request::{PreloadId, Request, RequestBuilder};
 use crate::response::{HttpsState, Response, ResponseInit};
 
@@ -244,11 +248,11 @@ pub enum FetchResponseMsg {
     // todo: send more info about the response (or perhaps the entire Response)
     ProcessResponse(RequestId, Result<FetchMetadata, NetworkError>),
     ProcessResponseChunk(RequestId, DebugVec),
-    ProcessResponseEOF(RequestId, Result<ResourceFetchTiming, NetworkError>),
+    ProcessResponseEOF(RequestId, Result<(), NetworkError>, ResourceFetchTiming),
     ProcessCspViolations(RequestId, Vec<csp::Violation>),
 }
 
-#[derive(Deserialize, PartialEq, Serialize)]
+#[derive(Deserialize, PartialEq, Serialize, MallocSizeOf)]
 pub struct DebugVec(pub Vec<u8>);
 
 impl From<Vec<u8>> for DebugVec {
@@ -374,13 +378,14 @@ impl FetchTaskTarget for IpcSender<FetchResponseMsg> {
     }
 
     fn process_response_eof(&mut self, request: &Request, response: &Response) {
-        let payload = if let Some(network_error) = response.get_network_error() {
-            Err(network_error.clone())
-        } else {
-            Ok(response.get_resource_timing().lock().clone())
-        };
+        let result = response
+            .get_network_error()
+            .map_or_else(|| Ok(()), |network_error| Err(network_error.clone()));
+        let timing = response.get_resource_timing().lock().clone();
 
-        let _ = self.send(FetchResponseMsg::ProcessResponseEOF(request.id, payload));
+        let _ = self.send(FetchResponseMsg::ProcessResponseEOF(
+            request.id, result, timing,
+        ));
     }
 
     fn process_csp_violations(&mut self, request: &Request, violations: Vec<csp::Violation>) {
@@ -575,7 +580,7 @@ pub enum MessageData {
     Binary(Vec<u8>),
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, MallocSizeOf)]
 pub enum WebSocketDomAction {
     SendMessage(MessageData),
     Close(Option<u16>, Option<String>),
@@ -596,7 +601,7 @@ pub enum FetchChannels {
     ResponseMsg(IpcSender<FetchResponseMsg>),
     WebSocket {
         event_sender: IpcSender<WebSocketNetworkEvent>,
-        action_receiver: IpcReceiver<WebSocketDomAction>,
+        action_receiver: CallbackSetter<WebSocketDomAction>,
     },
     /// If the fetch is just being done to populate the cache,
     /// not because the data is needed now.
@@ -630,6 +635,8 @@ pub enum CoreResourceMsg {
     GetCookieDataForUrlAsync(CookieStoreId, ServoUrl, Option<String>),
     GetAllCookieDataForUrlAsync(CookieStoreId, ServoUrl, Option<String>),
     DeleteCookiesForSites(Vec<String>, GenericSender<()>),
+    /// This currently is used by unit tests and WebDriver only.
+    /// When url is `None`, this clears cookies across all origins.
     DeleteCookies(Option<ServoUrl>, Option<IpcSender<()>>),
     DeleteCookie(ServoUrl, String),
     DeleteCookieAsync(CookieStoreId, ServoUrl, String),
@@ -654,7 +661,7 @@ pub enum CoreResourceMsg {
     TotalSizeOfInFlightKeepAliveRecords(PipelineId, GenericSender<u64>),
     /// Break the load handler loop, send a reply when done cleaning up local resources
     /// and exit
-    Exit(IpcSender<()>),
+    Exit(GenericOneshotSender<()>),
     CollectMemoryReport(ReportsChan),
 }
 
@@ -1101,6 +1108,27 @@ impl Metadata {
             .unwrap()
             .typed_insert::<ReferrerPolicyHeader>(referrer_policy.into());
     }
+
+    /// <https://html.spec.whatwg.org/multipage/#content-type>
+    pub fn resource_content_type_metadata(&self, load_context: LoadContext, data: &[u8]) -> Mime {
+        // The Content-Type metadata of a resource must be obtained and interpreted in a manner consistent with the requirements of MIME Sniffing. [MIMESNIFF]
+        let no_sniff = self
+            .headers
+            .as_deref()
+            .is_some_and(determine_nosniff)
+            .into();
+        let mime = self
+            .content_type
+            .clone()
+            .map(|content_type| content_type.into_inner().into());
+        MimeClassifier::default().classify(
+            load_context,
+            no_sniff,
+            ApacheBugFlag::from_content_type(mime.as_ref()),
+            &mime,
+            data,
+        )
+    }
 }
 
 /// The creator of a given cookie
@@ -1168,6 +1196,7 @@ pub enum NetworkError {
     ProtocolHandlerSubstitutionError,
     BlobURLStoreError(String),
     HttpError(String),
+    DecompressionError,
 }
 
 impl fmt::Debug for NetworkError {
@@ -1215,6 +1244,7 @@ impl fmt::Debug for NetworkError {
                 write!(f, "Websocket connection failure: {}", s)
             },
             NetworkError::HttpError(s) => write!(f, "HTTP failure: {}", s),
+            NetworkError::DecompressionError => write!(f, "Decompression error"),
         }
     }
 }
@@ -1223,9 +1253,19 @@ impl NetworkError {
     pub fn is_permanent_failure(&self) -> bool {
         matches!(
             self,
-            NetworkError::InvalidPort |
+            NetworkError::ContentSecurityPolicy |
                 NetworkError::MixedContent |
-                NetworkError::ContentSecurityPolicy |
+                NetworkError::SubresourceIntegrity |
+                NetworkError::Nosniff |
+                NetworkError::InvalidPort |
+                NetworkError::CorsGeneral |
+                NetworkError::CrossOriginResponse |
+                NetworkError::CorsCredentials |
+                NetworkError::CorsAllowMethods |
+                NetworkError::CorsAllowHeaders |
+                NetworkError::CorsMethod |
+                NetworkError::CorsAuthorization |
+                NetworkError::CorsHeaders |
                 NetworkError::UnsupportedScheme
         )
     }
@@ -1289,6 +1329,24 @@ pub fn http_percent_encode(bytes: &[u8]) -> String {
     percent_encoding::percent_encode(bytes, HTTP_VALUE).to_string()
 }
 
+/// Returns the cached current system locale, or en-US by default.
+pub fn get_current_locale() -> &'static (String, HeaderValue) {
+    static CURRENT_LOCALE: OnceLock<(String, HeaderValue)> = OnceLock::new();
+
+    CURRENT_LOCALE.get_or_init(|| {
+        let locale_override = servo_config::pref!(intl_locale_override);
+        let locale = if locale_override.is_empty() {
+            sys_locale::get_locale().unwrap_or_else(|| "en-US".into())
+        } else {
+            locale_override
+        };
+        let header_value = HeaderValue::from_str(&locale)
+            .ok()
+            .unwrap_or_else(|| HeaderValue::from_static("en-US"));
+        (locale, header_value)
+    })
+}
+
 /// Step 12 of <https://fetch.spec.whatwg.org/#concept-fetch>
 pub fn set_default_accept_language(headers: &mut HeaderMap) {
     // If request’s header list does not contain `Accept-Language`,
@@ -1297,11 +1355,8 @@ pub fn set_default_accept_language(headers: &mut HeaderMap) {
         return;
     }
 
-    // TODO(eijebong): Change this once typed headers are done
-    headers.insert(
-        header::ACCEPT_LANGUAGE,
-        HeaderValue::from_static("en-US,en;q=0.5"),
-    );
+    // To reduce fingerprinting we set only a single language.
+    headers.insert(header::ACCEPT_LANGUAGE, get_current_locale().1.clone());
 }
 
 pub static PRIVILEGED_SECRET: LazyLock<u32> = LazyLock::new(|| rng().next_u32());

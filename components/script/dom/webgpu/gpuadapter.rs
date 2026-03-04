@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 use dom_struct::dom_struct;
 use js::jsapi::{HandleObject, Heap, JSObject};
+use script_bindings::cformat;
 use webgpu_traits::{
     RequestDeviceError, WebGPU, WebGPUAdapter, WebGPUDeviceResponse, WebGPURequest,
 };
@@ -27,23 +28,42 @@ use crate::dom::types::{GPUAdapterInfo, GPUSupportedLimits};
 use crate::dom::webgpu::gpudevice::GPUDevice;
 use crate::dom::webgpu::gpusupportedfeatures::gpu_to_wgt_feature;
 use crate::realms::InRealm;
-use crate::routed_promise::{RoutedPromiseListener, route_promise};
+use crate::routed_promise::{RoutedPromiseListener, callback_promise};
 use crate::script_runtime::CanGc;
+
+#[derive(JSTraceable, MallocSizeOf)]
+struct DroppableGPUAdapter {
+    #[no_trace]
+    channel: WebGPU,
+    #[no_trace]
+    adapter: WebGPUAdapter,
+}
+
+impl Drop for DroppableGPUAdapter {
+    fn drop(&mut self) {
+        if let Err(e) = self
+            .channel
+            .0
+            .send(WebGPURequest::DropAdapter(self.adapter.0))
+        {
+            warn!(
+                "Failed to send WebGPURequest::DropAdapter({:?}) ({})",
+                self.adapter.0, e
+            );
+        };
+    }
+}
 
 #[dom_struct]
 pub(crate) struct GPUAdapter {
     reflector_: Reflector,
-    #[ignore_malloc_size_of = "channels are hard"]
-    #[no_trace]
-    channel: WebGPU,
     name: DOMString,
     #[ignore_malloc_size_of = "mozjs"]
     extensions: Heap<*mut JSObject>,
     features: Dom<GPUSupportedFeatures>,
     limits: Dom<GPUSupportedLimits>,
     info: Dom<GPUAdapterInfo>,
-    #[no_trace]
-    adapter: WebGPUAdapter,
+    droppable: DroppableGPUAdapter,
 }
 
 impl GPUAdapter {
@@ -57,13 +77,12 @@ impl GPUAdapter {
     ) -> Self {
         Self {
             reflector_: Reflector::new(),
-            channel,
             name,
             extensions: Heap::default(),
             features: Dom::from_ref(features),
             limits: Dom::from_ref(limits),
             info: Dom::from_ref(info),
-            adapter,
+            droppable: DroppableGPUAdapter { channel, adapter },
         }
     }
 
@@ -167,21 +186,6 @@ impl GPUAdapter {
     }
 }
 
-impl Drop for GPUAdapter {
-    fn drop(&mut self) {
-        if let Err(e) = self
-            .channel
-            .0
-            .send(WebGPURequest::DropAdapter(self.adapter.0))
-        {
-            warn!(
-                "Failed to send WebGPURequest::DropAdapter({:?}) ({})",
-                self.adapter.0, e
-            );
-        };
-    }
-}
-
 impl GPUAdapterMethods<crate::DomTypeHolder> for GPUAdapter {
     /// <https://gpuweb.github.io/gpuweb/#dom-gpuadapter-requestdevice>
     fn RequestDevice(
@@ -192,7 +196,7 @@ impl GPUAdapterMethods<crate::DomTypeHolder> for GPUAdapter {
     ) -> Rc<Promise> {
         // Step 2
         let promise = Promise::new_in_current_realm(comp, can_gc);
-        let sender = route_promise(
+        let callback = callback_promise(
             &promise,
             self,
             self.global().task_manager().dom_manipulation_task_source(),
@@ -203,7 +207,7 @@ impl GPUAdapterMethods<crate::DomTypeHolder> for GPUAdapter {
                 required_features.insert(feature);
             } else {
                 promise.reject_error(
-                    Error::Type(format!("{} is not supported feature", ext.as_str())),
+                    Error::Type(cformat!("{} is not supported feature", ext.as_str())),
                     can_gc,
                 );
                 return promise;
@@ -232,11 +236,12 @@ impl GPUAdapterMethods<crate::DomTypeHolder> for GPUAdapter {
         let queue_id = self.global().wgpu_id_hub().create_queue_id();
         let pipeline_id = self.global().pipeline_id();
         if self
+            .droppable
             .channel
             .0
             .send(WebGPURequest::RequestDevice {
-                sender,
-                adapter_id: self.adapter,
+                sender: callback,
+                adapter_id: self.droppable.adapter,
                 descriptor: desc,
                 device_id,
                 queue_id,
@@ -279,7 +284,7 @@ impl RoutedPromiseListener<WebGPUDeviceResponse> for GPUAdapter {
             (device_id, queue_id, Ok(descriptor)) => {
                 let device = GPUDevice::new(
                     &self.global(),
-                    self.channel.clone(),
+                    self.droppable.channel.clone(),
                     self,
                     HandleObject::null(),
                     descriptor.required_features,
@@ -294,9 +299,10 @@ impl RoutedPromiseListener<WebGPUDeviceResponse> for GPUAdapter {
             },
             // 1. If features are not supported reject promise with a TypeError.
             (_, _, Err(RequestDeviceError::UnsupportedFeature(f))) => promise.reject_error(
-                Error::Type(
-                    wgpu_core::instance::RequestDeviceError::UnsupportedFeature(f).to_string(),
-                ),
+                Error::Type(cformat!(
+                    "{}",
+                    wgpu_core::instance::RequestDeviceError::UnsupportedFeature(f)
+                )),
                 can_gc,
             ),
             // 2. If limits are not supported reject promise with an OperationError.
@@ -312,7 +318,7 @@ impl RoutedPromiseListener<WebGPUDeviceResponse> for GPUAdapter {
                 // 1. Let device be a new device.
                 let device = GPUDevice::new(
                     &self.global(),
-                    self.channel.clone(),
+                    self.droppable.channel.clone(),
                     self,
                     HandleObject::null(),
                     wgpu_types::Features::default(),

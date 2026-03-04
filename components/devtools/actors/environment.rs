@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -37,7 +38,7 @@ struct EnvironmentFunction {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct EnvironmentActorMsg {
+pub(crate) struct EnvironmentActorMsg {
     actor: String,
     #[serde(rename = "type")]
     type_: EnvironmentType,
@@ -57,7 +58,8 @@ pub struct EnvironmentActorMsg {
 /// Resposible for listing the bindings in an environment and assigning new values to them.
 /// Referenced by `FrameActor` when replying to `getEnvironment` messages.
 /// <https://searchfox.org/firefox-main/source/devtools/server/actors/environment.js>
-pub struct EnvironmentActor {
+#[derive(MallocSizeOf)]
+pub(crate) struct EnvironmentActor {
     pub name: String,
     pub parent: Option<String>,
 }

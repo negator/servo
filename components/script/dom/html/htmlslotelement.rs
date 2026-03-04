@@ -29,7 +29,8 @@ use crate::dom::element::{AttributeMutation, Element};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::node::{
-    BindContext, IsShadowTree, Node, NodeDamage, NodeTraits, ShadowIncluding, UnbindContext,
+    BindContext, ForceSlottableNodeReconciliation, IsShadowTree, Node, NodeDamage, NodeTraits,
+    ShadowIncluding, UnbindContext,
 };
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::script_runtime::CanGc;
@@ -135,7 +136,7 @@ impl HTMLSlotElementMethods<crate::DomTypeHolder> for HTMLSlotElement {
         // Step 5. Run assign slottables for a tree for this's root.
         self.upcast::<Node>()
             .GetRootNode(&GetRootNodeOptions::empty())
-            .assign_slottables_for_a_tree();
+            .assign_slottables_for_a_tree(ForceSlottableNodeReconciliation::Force);
     }
 }
 
@@ -180,7 +181,6 @@ impl HTMLSlotElement {
         }
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
@@ -488,7 +488,7 @@ impl VirtualMethods for HTMLSlotElement {
             // Changing the name might cause slot assignments to change
             self.upcast::<Node>()
                 .GetRootNode(&GetRootNodeOptions::empty())
-                .assign_slottables_for_a_tree()
+                .assign_slottables_for_a_tree(ForceSlottableNodeReconciliation::Skip);
         }
     }
 
@@ -523,7 +523,7 @@ impl js::gc::Rootable for Slottable {}
 
 impl js::gc::Initialize for Slottable {
     #[expect(unsafe_code)]
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     unsafe fn initial() -> Option<Self> {
         None
     }

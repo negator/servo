@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::ffi::CString;
+use std::ffi::CStr;
 use std::os::raw::{c_char, c_void};
 use std::ptr::{self, NonNull};
 use std::slice;
@@ -19,16 +19,17 @@ use js::jsapi::{
     HandleObject as RawHandleObject, Heap, JS_AtomizeStringN, JS_ClearPendingException,
     JS_DeprecatedStringHasLatin1Chars, JS_GetLatin1StringCharsAndLength, JS_IsExceptionPending,
     JS_IsGlobalObject, JS_MayResolveStandardClass, JS_NewEnumerateStandardClasses,
-    JS_ResolveStandardClass, JSAtom, JSAtomState, JSContext, JSJitInfo, JSObject, JSTracer,
-    MutableHandleIdVector as RawMutableHandleIdVector, MutableHandleValue as RawMutableHandleValue,
-    ObjectOpResult, PropertyKey, StringIsArrayIndex, jsid,
+    JS_ResolveStandardClass, JSAtom, JSAtomState, JSContext, JSJitInfo, JSObject, JSPROP_ENUMERATE,
+    JSTracer, MutableHandleIdVector as RawMutableHandleIdVector,
+    MutableHandleValue as RawMutableHandleValue, ObjectOpResult, PropertyKey, StringIsArrayIndex,
+    jsid,
 };
 use js::jsid::StringId;
 use js::jsval::{JSVal, UndefinedValue};
 use js::rust::wrappers::{
-    CallOriginalPromiseReject, JS_DeletePropertyById, JS_ForwardGetPropertyTo,
-    JS_GetPendingException, JS_GetProperty, JS_GetPrototype, JS_HasProperty, JS_HasPropertyById,
-    JS_SetPendingException, JS_SetProperty,
+    CallOriginalPromiseReject, JS_DefineProperty, JS_DeletePropertyById, JS_ForwardGetPropertyTo,
+    JS_GetPendingException, JS_GetProperty, JS_GetPrototype, JS_HasOwnProperty, JS_HasProperty,
+    JS_HasPropertyById, JS_SetPendingException, JS_SetProperty,
 };
 use js::rust::{
     HandleId, HandleObject, HandleValue, MutableHandleValue, Runtime, ToString, get_object_class,
@@ -245,14 +246,14 @@ pub(crate) unsafe fn find_enum_value<'a, T>(
 pub unsafe fn get_dictionary_property(
     cx: *mut JSContext,
     object: HandleObject,
-    property: &str,
+    property: &CStr,
     rval: MutableHandleValue,
     _can_gc: CanGc,
 ) -> Result<bool, ()> {
     unsafe fn has_property(
         cx: *mut JSContext,
         object: HandleObject,
-        property: &CString,
+        property: &CStr,
         found: &mut bool,
     ) -> bool {
         JS_HasProperty(cx, object, property.as_ptr(), found)
@@ -260,19 +261,18 @@ pub unsafe fn get_dictionary_property(
     unsafe fn get_property(
         cx: *mut JSContext,
         object: HandleObject,
-        property: &CString,
+        property: &CStr,
         value: MutableHandleValue,
     ) -> bool {
         JS_GetProperty(cx, object, property.as_ptr(), value)
     }
 
-    let property = CString::new(property).unwrap();
     if object.get().is_null() {
         return Ok(false);
     }
 
     let mut found = false;
-    if !has_property(cx, object, &property, &mut found) {
+    if !has_property(cx, object, property, &mut found) {
         return Err(());
     }
 
@@ -280,7 +280,7 @@ pub unsafe fn get_dictionary_property(
         return Ok(false);
     }
 
-    if !get_property(cx, object, &property, rval) {
+    if !get_property(cx, object, property, rval) {
         return Err(());
     }
 
@@ -294,14 +294,13 @@ pub unsafe fn get_dictionary_property(
 pub fn set_dictionary_property(
     cx: SafeJSContext,
     object: HandleObject,
-    property: &str,
+    property: &CStr,
     value: HandleValue,
 ) -> Result<(), ()> {
     if object.get().is_null() {
         return Err(());
     }
 
-    let property = CString::new(property).unwrap();
     unsafe {
         if !JS_SetProperty(*cx, object, property.as_ptr(), value) {
             return Err(());
@@ -309,6 +308,58 @@ pub fn set_dictionary_property(
     }
 
     Ok(())
+}
+
+/// Define an own enumerable data property with name `property` on `object`.
+/// Returns `Err(())` on JSAPI failure, or null object,
+/// and Ok(()) otherwise.
+#[allow(clippy::result_unit_err)]
+pub fn define_dictionary_property(
+    cx: SafeJSContext,
+    object: HandleObject,
+    property: &CStr,
+    value: HandleValue,
+) -> Result<(), ()> {
+    if object.get().is_null() {
+        return Err(());
+    }
+
+    unsafe {
+        if !JS_DefineProperty(
+            *cx,
+            object,
+            property.as_ptr(),
+            value,
+            JSPROP_ENUMERATE as u32,
+        ) {
+            return Err(());
+        }
+    }
+
+    Ok(())
+}
+
+/// Checks whether `object` has an own property named `property`.
+/// Returns `Err(())` on JSAPI failure (there is a pending exception),
+/// and `Ok(false)` for null objects or when the property is not own.
+#[allow(clippy::result_unit_err)]
+pub fn has_own_property(
+    cx: SafeJSContext,
+    object: HandleObject,
+    property: &CStr,
+) -> Result<bool, ()> {
+    if object.get().is_null() {
+        return Ok(false);
+    }
+
+    let mut found = false;
+    unsafe {
+        if !JS_HasOwnProperty(*cx, object, property.as_ptr(), &mut found) {
+            return Err(());
+        }
+    }
+
+    Ok(found)
 }
 
 /// Computes whether `proxy` has a property `id` on its prototype and stores
@@ -558,27 +609,6 @@ pub(crate) unsafe fn trace_global(tracer: *mut JSTracer, obj: *mut JSObject) {
     }
 }
 
-// Generic method for returning libc::c_void from caller
-pub trait AsVoidPtr {
-    fn as_void_ptr(&self) -> *const libc::c_void;
-}
-impl<T> AsVoidPtr for T {
-    fn as_void_ptr(&self) -> *const libc::c_void {
-        self as *const T as *const libc::c_void
-    }
-}
-
-// Generic method for returning c_char from caller
-pub(crate) trait AsCCharPtrPtr {
-    fn as_c_char_ptr(&self) -> *const c_char;
-}
-
-impl AsCCharPtrPtr for [u8] {
-    fn as_c_char_ptr(&self) -> *const c_char {
-        self as *const [u8] as *const c_char
-    }
-}
-
 /// Enumerate lazy properties of a global object.
 /// Modeled after <https://github.com/mozilla/gecko-dev/blob/3fd619f47/dom/bindings/BindingUtils.cpp#L2814>
 pub(crate) unsafe extern "C" fn enumerate_global(
@@ -599,7 +629,8 @@ pub(crate) unsafe extern "C" fn enumerate_window<D: DomTypes>(
     props: RawMutableHandleIdVector,
     enumerable_only: bool,
 ) -> bool {
-    if !enumerate_global(cx, obj, props, enumerable_only) {
+    let mut cx = js::context::JSContext::from_ptr(NonNull::new(cx).unwrap());
+    if !enumerate_global(cx.raw_cx(), obj, props, enumerable_only) {
         return false;
     }
 
@@ -609,14 +640,13 @@ pub(crate) unsafe extern "C" fn enumerate_window<D: DomTypes>(
         return true;
     }
 
-    let cx = SafeJSContext::from_ptr(cx);
     let obj = Handle::from_raw(obj);
     for (name, interface) in <D as DomHelpers<D>>::interface_map() {
-        if !(interface.enabled)(cx, obj) {
+        if !(interface.enabled)(&mut cx, obj) {
             continue;
         }
-        let s = JS_AtomizeStringN(*cx, name.as_c_char_ptr(), name.len());
-        rooted!(in(*cx) let id = StringId(s));
+        let s = JS_AtomizeStringN(cx.raw_cx(), name.as_ptr() as *const c_char, name.len());
+        rooted!(&in(cx) let id = StringId(s));
         if s.is_null() || !AppendToIdVector(props, id.handle().into()) {
             return false;
         }
@@ -675,20 +705,21 @@ pub(crate) unsafe extern "C" fn resolve_window<D: DomTypes>(
     id: RawHandleId,
     rval: *mut bool,
 ) -> bool {
-    if !resolve_global(cx, obj, id, rval) {
+    let mut cx = js::context::JSContext::from_ptr(NonNull::new(cx).unwrap());
+    if !resolve_global(cx.raw_cx(), obj, id, rval) {
         return false;
     }
 
     if *rval {
         return true;
     }
-    let Ok(bytes) = latin1_bytes_from_id(cx, *id) else {
+    let Ok(bytes) = latin1_bytes_from_id(cx.raw_cx(), *id) else {
         *rval = false;
         return true;
     };
 
     if let Some(interface) = <D as DomHelpers<D>>::interface_map().get(bytes) {
-        (interface.define)(SafeJSContext::from_ptr(cx), Handle::from_raw(obj));
+        (interface.define)(&mut cx, Handle::from_raw(obj));
         *rval = true;
     } else {
         *rval = false;

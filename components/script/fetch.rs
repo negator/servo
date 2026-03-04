@@ -18,10 +18,10 @@ use net_traits::request::{
 };
 use net_traits::{
     CoreResourceMsg, CoreResourceThread, FetchChannels, FetchMetadata, FetchResponseMsg,
-    FilteredMetadata, Metadata, NetworkError, ResourceFetchTiming, ResourceTimingType,
-    cancel_async_fetch,
+    FilteredMetadata, Metadata, NetworkError, ResourceFetchTiming, cancel_async_fetch,
 };
 use rustc_hash::FxHashMap;
+use script_bindings::cformat;
 use serde::{Deserialize, Serialize};
 use servo_url::ServoUrl;
 use timers::TimerEventRequest;
@@ -205,7 +205,6 @@ fn abort_fetch_call(
 
 /// <https://fetch.spec.whatwg.org/#dom-global-fetch>
 #[expect(non_snake_case)]
-#[cfg_attr(crown, allow(crown::unrooted_must_root))]
 pub(crate) fn Fetch(
     global: &GlobalScope,
     input: RequestInfo,
@@ -382,25 +381,25 @@ pub(crate) fn FetchLater(
     }
     // Step 6. If activateAfter is less than 0, then throw a RangeError.
     if *activate_after < 0.0 {
-        return Err(Error::Range("activateAfter must be at least 0".to_owned()));
+        return Err(Error::Range(c"activateAfter must be at least 0".to_owned()));
     }
     // Step 7. If this’s relevant global object’s associated document is not fully active, then throw a TypeError.
     if !document.is_fully_active() {
-        return Err(Error::Type("Document is not fully active".to_owned()));
+        return Err(Error::Type(c"Document is not fully active".to_owned()));
     }
     let url = request.url();
     // Step 8. If request’s URL’s scheme is not an HTTP(S) scheme, then throw a TypeError.
     if !matches!(url.scheme(), "http" | "https") {
-        return Err(Error::Type("URL is not http(s)".to_owned()));
+        return Err(Error::Type(c"URL is not http(s)".to_owned()));
     }
     // Step 9. If request’s URL is not a potentially trustworthy URL, then throw a SecurityError.
     if !url.is_potentially_trustworthy() {
-        return Err(Error::Type("URL is not trustworthy".to_owned()));
+        return Err(Error::Type(c"URL is not trustworthy".to_owned()));
     }
     // Step 10. If request’s body is not null, and request’s body length is null or zero, then throw a TypeError.
     if let Some(body) = request.body.as_ref() {
         if body.len().is_none_or(|len| len == 0) {
-            return Err(Error::Type("Body is empty".to_owned()));
+            return Err(Error::Type(c"Body is empty".to_owned()));
         }
     }
     // Step 11. If the available deferred-fetch quota given request’s client and request’s URL’s
@@ -541,7 +540,6 @@ impl FetchResponseListener for FetchContext {
         // TODO
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn process_response(
         &mut self,
         _: RequestId,
@@ -563,14 +561,14 @@ impl FetchResponseListener for FetchContext {
             // p with a TypeError and abort these steps.
             Err(error) => {
                 promise.reject_error(
-                    Error::Type(format!("Network error: {:?}", error)),
+                    Error::Type(cformat!("Network error: {:?}", error)),
                     CanGc::note(),
                 );
                 self.fetch_promise = Some(TrustedPromise::new(promise));
                 let response = self.response_object.root();
                 response.set_type(DOMResponseType::Error, CanGc::note());
                 response.error_stream(
-                    Error::Type("Network error occurred".to_string()),
+                    Error::Type(c"Network error occurred".to_owned()),
                     CanGc::note(),
                 );
                 return;
@@ -623,21 +621,27 @@ impl FetchResponseListener for FetchContext {
 
     fn process_response_eof(
         self,
+        cx: &mut js::context::JSContext,
         _: RequestId,
-        response: Result<ResourceFetchTiming, NetworkError>,
+        response: Result<(), NetworkError>,
+        timing: ResourceFetchTiming,
     ) {
         let response_object = self.response_object.root();
         let _ac = enter_realm(&*response_object);
-        response_object.finish(CanGc::note());
+        if let Err(ref error) = response {
+            if *error == NetworkError::DecompressionError {
+                response_object.error_stream(
+                    Error::Type(c"Network error occurred".to_owned()),
+                    CanGc::from_cx(cx),
+                );
+            }
+        }
+        response_object.finish(CanGc::from_cx(cx));
         // TODO
         // ... trailerObject is not supported in Servo yet.
 
         // navigation submission is handled in servoparser/mod.rs
-        if let Ok(response) = response {
-            if response.timing_type == ResourceTimingType::Resource {
-                network_listener::submit_timing(&self, &response, CanGc::note());
-            }
-        }
+        network_listener::submit_timing(&self, &response, &timing, CanGc::from_cx(cx));
     }
 
     fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<Violation>) {
@@ -682,12 +686,12 @@ impl FetchResponseListener for FetchLaterListener {
 
     fn process_response_eof(
         self,
+        cx: &mut js::context::JSContext,
         _: RequestId,
-        response: Result<ResourceFetchTiming, NetworkError>,
+        response: Result<(), NetworkError>,
+        timing: ResourceFetchTiming,
     ) {
-        if let Ok(response) = response {
-            network_listener::submit_timing(&self, &response, CanGc::note());
-        }
+        network_listener::submit_timing(&self, &response, &timing, CanGc::from_cx(cx));
     }
 
     fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<Violation>) {
@@ -723,7 +727,7 @@ pub(crate) fn load_whole_resource(
     core_resource_thread: &CoreResourceThread,
     global: &GlobalScope,
     csp_violations_processor: &dyn CspViolationsProcessor,
-    can_gc: CanGc,
+    cx: &mut js::context::JSContext,
 ) -> Result<(Metadata, Vec<u8>, bool), NetworkError> {
     let request = request.https_state(global.get_https_state());
     let (action_sender, action_receiver) = ipc::channel().unwrap();
@@ -750,15 +754,21 @@ pub(crate) fn load_whole_resource(
                 })
             },
             FetchResponseMsg::ProcessResponseChunk(_, data) => buf.extend_from_slice(&data),
-            FetchResponseMsg::ProcessResponseEOF(_, Ok(_)) => {
+            FetchResponseMsg::ProcessResponseEOF(_, Ok(_), _) => {
                 let metadata = metadata.unwrap();
                 if let Some(timing) = &metadata.timing {
-                    submit_timing_data(global, url, InitiatorType::Other, timing, can_gc);
+                    submit_timing_data(
+                        global,
+                        url,
+                        InitiatorType::Other,
+                        timing,
+                        CanGc::from_cx(cx),
+                    );
                 }
                 return Ok((metadata, buf, muted_errors));
             },
             FetchResponseMsg::ProcessResponse(_, Err(e)) |
-            FetchResponseMsg::ProcessResponseEOF(_, Err(e)) => return Err(e),
+            FetchResponseMsg::ProcessResponseEOF(_, Err(e), _) => return Err(e),
             FetchResponseMsg::ProcessCspViolations(_, violations) => {
                 csp_violations_processor.process_csp_violations(violations);
             },

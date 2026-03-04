@@ -4,10 +4,10 @@
 
 use std::fmt;
 use std::ops::Deref;
+use std::sync::{Arc, Weak};
 
 use atomic_refcell::AtomicRefCell;
 use malloc_size_of_derive::MallocSizeOf;
-use servo_arc::Arc;
 
 #[derive(MallocSizeOf)]
 pub struct ArcRefCell<T> {
@@ -20,6 +20,16 @@ impl<T> ArcRefCell<T> {
         Self {
             value: Arc::new(AtomicRefCell::new(value)),
         }
+    }
+
+    pub(crate) fn downgrade(&self) -> WeakRefCell<T> {
+        WeakRefCell {
+            value: Arc::downgrade(&self.value),
+        }
+    }
+
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.value, &other.value)
     }
 }
 
@@ -56,5 +66,24 @@ where
 {
     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
         self.value.fmt(formatter)
+    }
+}
+
+#[derive(Debug, MallocSizeOf)]
+pub(crate) struct WeakRefCell<T> {
+    value: Weak<AtomicRefCell<T>>,
+}
+
+impl<T> Clone for WeakRefCell<T> {
+    fn clone(&self) -> Self {
+        Self {
+            value: self.value.clone(),
+        }
+    }
+}
+
+impl<T> WeakRefCell<T> {
+    pub(crate) fn upgrade(&self) -> Option<ArcRefCell<T>> {
+        self.value.upgrade().map(|value| ArcRefCell { value })
     }
 }

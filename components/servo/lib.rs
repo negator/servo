@@ -13,6 +13,8 @@
 //! `ScriptThread` and the `LayoutThread`, as well maintains the navigation context.
 
 mod clipboard_delegate;
+#[cfg(feature = "gamepad")]
+mod gamepad_provider;
 mod javascript_evaluator;
 mod network_manager;
 mod proxies;
@@ -26,12 +28,9 @@ mod webview_delegate;
 
 // These are Servo's public exports. Everything (apart from a couple exceptions below)
 // should be exported at the root. See <https://github.com/servo/servo/issues/18475>.
+pub use accesskit;
 pub use base::generic_channel::GenericSender;
 pub use base::id::WebViewId;
-pub use compositing::WebRenderDebugOption;
-pub use compositing_traits::rendering_context::{
-    OffscreenRenderingContext, RenderingContext, SoftwareRenderingContext, WindowRenderingContext,
-};
 pub use embedder_traits::user_contents::UserScript;
 pub use embedder_traits::*;
 pub use image::RgbaImage;
@@ -44,6 +43,10 @@ pub use media::{
 // This API should probably not be exposed in this way. Instead there should be a fully
 // fleshed out public domains API if we want to expose it.
 pub use net_traits::pub_domains::is_reg_domain;
+pub use paint::WebRenderDebugOption;
+pub use paint_api::rendering_context::{
+    OffscreenRenderingContext, RenderingContext, SoftwareRenderingContext, WindowRenderingContext,
+};
 // This should be replaced with an API on ServoBuilder.
 // See <https://github.com/servo/servo/issues/40950>.
 pub use resources;
@@ -60,6 +63,10 @@ pub use webrender_api::units::{
     DeviceIntPoint, DeviceIntRect, DeviceIntSize, DevicePixel, DevicePoint, DeviceVector2D,
 };
 
+#[cfg(feature = "gamepad")]
+pub use crate::gamepad_provider::{
+    GamepadHapticEffectRequest, GamepadHapticEffectRequestType, GamepadProvider,
+};
 pub use crate::network_manager::{CacheEntry, NetworkManager};
 pub use crate::servo::{Servo, ServoBuilder, run_content_process};
 pub use crate::servo_delegate::{ServoDelegate, ServoError};

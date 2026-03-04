@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use app_units::Au;
 use base::id::{PainterId, WebViewId};
-use compositing_traits::CrossProcessPaintApi;
 use content_security_policy::Violation;
 use fonts_traits::{
     CSSFontFaceDescriptors, FontDescriptor, FontIdentifier, FontTemplate, FontTemplateRef,
@@ -23,7 +22,10 @@ use net_traits::request::{
     CredentialsMode, Destination, InsecureRequestsPolicy, Referrer, RequestBuilder, RequestClient,
     RequestMode, ServiceWorkersMode,
 };
-use net_traits::{CoreResourceThread, FetchResponseMsg, ResourceThreads, fetch_async};
+use net_traits::{
+    CoreResourceThread, FetchResponseMsg, ResourceFetchTiming, ResourceThreads, fetch_async,
+};
+use paint_api::CrossProcessPaintApi;
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashSet;
 use servo_arc::Arc as ServoArc;
@@ -110,6 +112,13 @@ pub trait CspViolationHandler: Send + std::fmt::Debug {
     fn clone(&self) -> Box<dyn CspViolationHandler>;
 }
 
+/// A callback that will be invoked on the Fetch thread when a web font
+/// download succeeds, providing timing information about the request.
+pub trait NetworkTimingHandler: Send + std::fmt::Debug {
+    fn submit_timing(&self, url: ServoUrl, response: ResourceFetchTiming);
+    fn clone(&self) -> Box<dyn NetworkTimingHandler>;
+}
+
 /// Document-specific data required to fetch a web font.
 #[derive(Debug)]
 pub struct WebFontDocumentContext {
@@ -119,6 +128,7 @@ pub struct WebFontDocumentContext {
     pub has_trustworthy_ancestor_origin: bool,
     pub insecure_requests_policy: InsecureRequestsPolicy,
     pub csp_handler: Box<dyn CspViolationHandler>,
+    pub network_timing_handler: Box<dyn NetworkTimingHandler>,
 }
 
 impl Clone for WebFontDocumentContext {
@@ -130,6 +140,7 @@ impl Clone for WebFontDocumentContext {
             has_trustworthy_ancestor_origin: self.has_trustworthy_ancestor_origin,
             insecure_requests_policy: self.insecure_requests_policy,
             csp_handler: self.csp_handler.clone(),
+            network_timing_handler: self.network_timing_handler.clone(),
         }
     }
 }
@@ -253,6 +264,15 @@ impl FontContext {
             font_template, font_descriptor
         );
 
+        // Check one more time whether the font is cached or not. There's a potential race
+        // condition, where between the time we took the read lock above and now, another thread
+        // added the font to the cache. This check makes sense, because loading a font has memory
+        // implications and is much slower than checking the map again.
+        let mut fonts = self.fonts.write();
+        if let Some(font) = fonts.get(&cache_key).cloned() {
+            return font;
+        }
+
         // TODO: Inserting `None` into the cache here is a bit bogus. Instead we should somehow
         // mark this template as invalid so it isn't tried again.
         let font = self
@@ -262,7 +282,7 @@ impl FontContext {
                 synthesized_small_caps_font,
             )
             .ok();
-        self.fonts.write().insert(cache_key, font.clone());
+        fonts.insert(cache_key, font.clone());
         font
     }
 
@@ -1044,7 +1064,7 @@ impl RemoteWebFontDownloader {
                 }
                 DownloaderResponseResult::InProcess
             },
-            FetchResponseMsg::ProcessResponseEOF(_, response) => {
+            FetchResponseMsg::ProcessResponseEOF(_, response, timing) => {
                 trace!(
                     "@font-face {} EOF={:?}",
                     self.web_font_family_name, response
@@ -1052,6 +1072,12 @@ impl RemoteWebFontDownloader {
                 if response.is_err() || !self.response_valid {
                     return DownloaderResponseResult::Failure;
                 }
+                self.state
+                    .as_ref()
+                    .expect("must have download state before termination")
+                    .document_context
+                    .network_timing_handler
+                    .submit_timing(ServoUrl::from_url(self.url.as_ref().clone()), timing);
                 DownloaderResponseResult::Finished
             },
         }

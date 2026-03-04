@@ -28,7 +28,7 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::structuredclone::StructuredData;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
-use crate::dom::readablestream::ReadableStream;
+use crate::dom::stream::readablestream::ReadableStream;
 use crate::realms::{AlreadyInRealm, InRealm};
 use crate::script_runtime::CanGc;
 
@@ -61,7 +61,6 @@ impl Blob {
         dom_blob
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub(crate) fn new_inherited(blob_impl: &BlobImpl) -> Blob {
         Blob {
             reflector_: Reflector::new(),
@@ -236,7 +235,7 @@ impl BlobMethods<crate::DomTypeHolder> for Blob {
             p.clone(),
             Box::new(|promise, bytes| match bytes {
                 Ok(b) => {
-                    let (text, _, _) = UTF_8.decode(&b);
+                    let (text, _) = UTF_8.decode_with_bom_removal(&b);
                     let text = DOMString::from(text);
                     promise.resolve_native(&text, CanGc::note());
                 },

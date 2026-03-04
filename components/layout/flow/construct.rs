@@ -25,7 +25,9 @@ use crate::dom_traversal::{
 };
 use crate::flow::float::FloatBox;
 use crate::flow::{BlockContainer, BlockFormattingContext, BlockLevelBox};
-use crate::formatting_contexts::IndependentFormattingContext;
+use crate::formatting_contexts::{
+    IndependentFormattingContext, IndependentFormattingContextContents,
+};
 use crate::fragment_tree::FragmentFlags;
 use crate::layout_box_base::LayoutBoxBase;
 use crate::positioned::AbsolutelyPositionedBox;
@@ -65,7 +67,7 @@ struct BlockLevelJob<'dom> {
     kind: BlockLevelCreator,
 }
 
-enum BlockLevelCreator {
+pub(crate) enum BlockLevelCreator {
     SameFormattingContextBlock(IntermediateBlockContainer),
     Independent {
         display_inside: DisplayInside,
@@ -88,6 +90,45 @@ enum BlockLevelCreator {
     },
 }
 
+impl BlockLevelCreator {
+    pub(crate) fn new_for_inflow_block_level_element<'dom>(
+        info: &NodeAndStyleInfo<'dom>,
+        display_inside: DisplayInside,
+        contents: Contents,
+        propagated_data: PropagatedBoxTreeData,
+    ) -> Self {
+        match contents {
+            Contents::NonReplaced(contents) => match display_inside {
+                DisplayInside::Flow { is_list_item }
+                    // Fragment flags are just used to indicate whether the element is replaced or a widget,
+                    // and whether it's a body or root propagating its `overflow` to the viewport. We have
+                    // already checked that the former is not the case.
+                    // TODO(#39932): empty flags are wrong when propagating `overflow` to the viewport.
+                    if !info.style.establishes_block_formatting_context(
+                        FragmentFlags::empty()
+                    ) =>
+                {
+                    Self::SameFormattingContextBlock(
+                        IntermediateBlockContainer::Deferred {
+                            contents,
+                            propagated_data,
+                            is_list_item,
+                        },
+                    )
+                },
+                _ => Self::Independent {
+                    display_inside,
+                    contents: Contents::NonReplaced(contents),
+                },
+            },
+            Contents::Replaced(_) | Contents::Widget(_) => Self::Independent {
+                display_inside,
+                contents,
+            },
+        }
+    }
+}
+
 /// A block container that may still have to be constructed.
 ///
 /// Represents either the inline formatting context of an anonymous block
@@ -95,7 +136,7 @@ enum BlockLevelCreator {
 /// of a given element.
 ///
 /// Deferring allows using rayon’s `into_par_iter`.
-enum IntermediateBlockContainer {
+pub(crate) enum IntermediateBlockContainer {
     InlineFormattingContext(BlockContainer),
     Deferred {
         contents: NonReplacedContents,
@@ -216,7 +257,7 @@ impl<'dom, 'style> BlockContainerBuilder<'dom, 'style> {
     fn ensure_inline_formatting_context_builder(&mut self) -> &mut InlineFormattingContextBuilder {
         self.inline_formatting_context_builder
             .get_or_insert_with(|| {
-                let mut builder = InlineFormattingContextBuilder::new(self.info);
+                let mut builder = InlineFormattingContextBuilder::new(self.info, self.context);
                 for shared_inline_styles in self.display_contents_shared_styles.iter() {
                     builder.enter_display_contents(shared_inline_styles.clone());
                 }
@@ -444,7 +485,8 @@ impl<'dom> BlockContainerBuilder<'dom, '_> {
         contents: Contents,
         box_slot: BoxSlot<'dom>,
     ) {
-        let old_layout_box = box_slot.take_layout_box_if_undamaged(info.damage);
+        let context = self.context;
+        let old_layout_box = box_slot.take_layout_box();
         let (is_list_item, non_replaced_contents) = match (display_inside, contents) {
             (
                 DisplayInside::Flow { is_list_item },
@@ -452,7 +494,6 @@ impl<'dom> BlockContainerBuilder<'dom, '_> {
             ) => (is_list_item, non_replaced_contents),
             (_, contents) => {
                 // If this inline element is an atomic, handle it and return.
-                let context = self.context;
                 let propagated_data = self.propagated_data;
 
                 let construction_callback = || {
@@ -476,7 +517,10 @@ impl<'dom> BlockContainerBuilder<'dom, '_> {
         // Otherwise, this is just a normal inline box. Whatever happened before, all we need to do
         // before recurring is to remember this ongoing inline level box.
         let inline_builder = self.ensure_inline_formatting_context_builder();
-        inline_builder.start_inline_box(|| ArcRefCell::new(InlineBox::new(info)), old_layout_box);
+        inline_builder.start_inline_box(
+            || ArcRefCell::new(InlineBox::new(info, context)),
+            old_layout_box,
+        );
         box_slot.set(LayoutBox::InlineLevel(
             inline_builder.inline_items.last().unwrap().clone(),
         ));
@@ -511,33 +555,12 @@ impl<'dom> BlockContainerBuilder<'dom, '_> {
         box_slot: BoxSlot<'dom>,
     ) {
         let propagated_data = self.propagated_data;
-        let kind = match contents {
-            Contents::NonReplaced(contents) => match display_inside {
-                DisplayInside::Flow { is_list_item }
-                    // Fragment flags are just used to indicate that the element is not replaced, so empty
-                    // flags are okay here.
-                    if !info.style.establishes_block_formatting_context(
-                        FragmentFlags::empty()
-                    ) =>
-                {
-                    BlockLevelCreator::SameFormattingContextBlock(
-                        IntermediateBlockContainer::Deferred {
-                            contents,
-                            propagated_data,
-                            is_list_item,
-                        },
-                    )
-                },
-                _ => BlockLevelCreator::Independent {
-                    display_inside,
-                    contents: Contents::NonReplaced(contents),
-                },
-            },
-            Contents::Replaced(_) | Contents::Widget(_) => BlockLevelCreator::Independent {
-                display_inside,
-                contents,
-            },
-        };
+        let kind = BlockLevelCreator::new_for_inflow_block_level_element(
+            info,
+            display_inside,
+            contents,
+            propagated_data,
+        );
         let job = BlockLevelJob {
             info: info.clone(),
             box_slot,
@@ -590,7 +613,7 @@ impl<'dom> BlockContainerBuilder<'dom, '_> {
                     contents,
                 ))
             };
-            let old_layout_box = box_slot.take_layout_box_if_undamaged(info.damage);
+            let old_layout_box = box_slot.take_layout_box();
             let inline_level_box =
                 inline_builder.push_absolutely_positioned_box(constructor, old_layout_box);
             box_slot.set(LayoutBox::InlineLevel(inline_level_box));
@@ -627,7 +650,7 @@ impl<'dom> BlockContainerBuilder<'dom, '_> {
                         self.propagated_data,
                     ))
                 };
-                let old_layout_box = box_slot.take_layout_box_if_undamaged(info.damage);
+                let old_layout_box = box_slot.take_layout_box();
                 let inline_level_box = builder.push_float_box(constructor, old_layout_box);
                 box_slot.set(LayoutBox::InlineLevel(inline_level_box));
                 return;
@@ -680,18 +703,13 @@ impl BlockLevelJob<'_> {
     fn finish(self, context: &LayoutContext) -> ArcRefCell<BlockLevelBox> {
         let info = &self.info;
 
-        // If this `BlockLevelBox` is undamaged and it has been laid out before, reuse
-        // the old one, while being sure to clear the layout cache.
-        if !info.damage.has_box_damage() {
-            if let Some(block_level_box) = match self.box_slot.slot.as_ref() {
-                Some(box_slot) => match &*box_slot.borrow() {
-                    Some(LayoutBox::BlockLevel(block_level_box)) => Some(block_level_box.clone()),
-                    _ => None,
-                },
-                None => None,
-            } {
-                return block_level_box;
-            }
+        // If this `BlockLevelBox` exists, it has been laid out before and is
+        // reusable.
+        if let Some(block_level_box) = match &*self.box_slot.slot.borrow() {
+            Some(LayoutBox::BlockLevel(block_level_box)) => Some(block_level_box.clone()),
+            _ => None,
+        } {
+            return block_level_box;
         }
 
         let block_level_box = match self.kind {
@@ -756,8 +774,11 @@ impl BlockLevelJob<'_> {
                     contains_floats: false,
                 };
                 ArcRefCell::new(BlockLevelBox::OutsideMarker(OutsideMarker {
-                    base: LayoutBoxBase::new(info.into(), info.style.clone()),
-                    block_formatting_context,
+                    context: IndependentFormattingContext::new(
+                        LayoutBoxBase::new(info.into(), info.style.clone()),
+                        IndependentFormattingContextContents::Flow(block_formatting_context),
+                        self.propagated_data,
+                    ),
                     list_item_style,
                 }))
             },

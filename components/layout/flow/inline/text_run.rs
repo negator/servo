@@ -4,17 +4,16 @@
 
 use std::mem;
 use std::ops::Range;
+use std::sync::Arc;
 
 use app_units::Au;
 use base::text::is_bidi_control;
 use fonts::{
-    FontContext, FontRef, GlyphRun, LAST_RESORT_GLYPH_ADVANCE, ShapingFlags, ShapingOptions,
+    FontContext, FontRef, GlyphStore, LAST_RESORT_GLYPH_ADVANCE, ShapingFlags, ShapingOptions,
 };
-use fonts_traits::ByteIndex;
 use log::warn;
 use malloc_size_of_derive::MallocSizeOf;
-use range::Range as ServoRange;
-use servo_arc::Arc;
+use servo_arc::Arc as ServoArc;
 use style::computed_values::text_rendering::T as TextRendering;
 use style::computed_values::white_space_collapse::T as WhiteSpaceCollapse;
 use style::computed_values::word_break::T as WordBreak;
@@ -28,6 +27,8 @@ use xi_unicode::linebreak_property;
 use super::line_breaker::LineBreaker;
 use super::{InlineFormattingContextLayout, SharedInlineStyles};
 use crate::context::LayoutContext;
+use crate::dom::WeakLayoutBox;
+use crate::flow::inline::line::TextRunOffsets;
 use crate::fragment_tree::BaseFragmentInfo;
 
 // These constants are the xi-unicode line breaking classes that are defined in
@@ -67,21 +68,32 @@ pub(crate) struct TextRunSegment {
     /// The range of bytes in the parent [`super::InlineFormattingContext`]'s text content.
     pub range: Range<usize>,
 
+    /// The range of characters in the parent [`super::InlineFormattingContext`]'s text content.
+    pub character_range: Range<usize>,
+
     /// Whether or not the linebreaker said that we should allow a line break at the start of this
     /// segment.
     pub break_at_start: bool,
 
     /// The shaped runs within this segment.
-    pub runs: Vec<GlyphRun>,
+    #[conditional_malloc_size_of]
+    pub runs: Vec<Arc<GlyphStore>>,
 }
 
 impl TextRunSegment {
-    fn new(font: FontRef, script: Script, bidi_level: Level, start_offset: usize) -> Self {
+    fn new(
+        font: FontRef,
+        script: Script,
+        bidi_level: Level,
+        start_offset: usize,
+        start_character_offset: usize,
+    ) -> Self {
         Self {
             font,
             script,
             bidi_level,
             range: start_offset..start_offset,
+            character_range: start_character_offset..start_character_offset,
             runs: Vec::new(),
             break_at_start: false,
         }
@@ -132,7 +144,7 @@ impl TextRunSegment {
             soft_wrap_policy = SegmentStartSoftWrapPolicy::Force;
         }
 
-        let mut byte_processed = ByteIndex(0);
+        let mut character_range_start = self.character_range.start;
         for (run_index, run) in self.runs.iter().enumerate() {
             ifc.possibly_flush_deferred_forced_line_break();
 
@@ -140,7 +152,7 @@ impl TextRunSegment {
             // see any content. We don't line break immediately, because we'd like to finish processing
             // any ongoing inline boxes before ending the line.
             if run.is_single_preserved_newline() {
-                byte_processed = byte_processed + run.range.length();
+                character_range_start += run.character_count();
                 ifc.defer_forced_line_break();
                 continue;
             }
@@ -149,17 +161,25 @@ impl TextRunSegment {
             if run_index != 0 || soft_wrap_policy == SegmentStartSoftWrapPolicy::Force {
                 ifc.process_soft_wrap_opportunity();
             }
+
+            let new_character_range_end = character_range_start + run.character_count();
+            let offsets = ifc
+                .ifc
+                .shared_selection
+                .clone()
+                .map(|shared_selection| TextRunOffsets {
+                    shared_selection,
+                    character_range: character_range_start..new_character_range_end,
+                });
+
             ifc.push_glyph_store_to_unbreakable_segment(
-                run.glyph_store.clone(),
+                run.clone(),
                 text_run,
                 &self.font,
                 self.bidi_level,
-                ServoRange::<ByteIndex>::new(
-                    byte_processed + ByteIndex(self.range.start as isize),
-                    run.range.length(),
-                ),
+                offsets,
             );
-            byte_processed = byte_processed + run.range.length();
+            character_range_start = new_character_range_end;
         }
     }
 
@@ -169,15 +189,10 @@ impl TextRunSegment {
         formatting_context_text: &str,
         options: &ShapingOptions,
     ) {
-        self.runs.push(GlyphRun {
-            glyph_store: self
-                .font
+        self.runs.push(
+            self.font
                 .shape_text(&formatting_context_text[range.clone()], options),
-            range: ServoRange::new(
-                ByteIndex(range.start as isize),
-                ByteIndex(range.len() as isize),
-            ),
-        });
+        );
     }
 
     /// Shape the text of this [`TextRunSegment`], first finding "words" for the shaper by processing
@@ -330,6 +345,10 @@ pub(crate) struct TextRun {
     /// original text node in the DOM for the text.
     pub base_fragment_info: BaseFragmentInfo,
 
+    /// A weak reference to the parent of this layout box. This becomes valid as soon
+    /// as the *parent* of this box is added to the tree.
+    pub parent_box: Option<WeakLayoutBox>,
+
     /// The [`crate::SharedStyle`] from this [`TextRun`]s parent element. This is
     /// shared so that incremental layout can simply update the parent element and
     /// this [`TextRun`] will be updated automatically.
@@ -339,13 +358,14 @@ pub(crate) struct TextRun {
     /// [`super::InlineFormattingContext`] that owns this [`TextRun`]. These are UTF-8 offsets.
     pub text_range: Range<usize>,
 
+    /// The range of characters in this text in [`super::InlineFormattingContext::text_content`]
+    /// of the [`super::InlineFormattingContext`] that owns this [`TextRun`]. These are *not*
+    /// UTF-8 offsets.
+    pub character_range: Range<usize>,
+
     /// The text of this [`TextRun`] with a font selected, broken into unbreakable
     /// segments, and shaped.
     pub shaped_text: Vec<TextRunSegment>,
-
-    /// The selection range for the DOM text node that originated this [`TextRun`]. This
-    /// comes directly from the DOM.
-    pub selection_range: Option<ServoRange<ByteIndex>>,
 }
 
 impl TextRun {
@@ -353,14 +373,15 @@ impl TextRun {
         base_fragment_info: BaseFragmentInfo,
         inline_styles: SharedInlineStyles,
         text_range: Range<usize>,
-        selection_range: Option<ServoRange<ByteIndex>>,
+        character_range: Range<usize>,
     ) -> Self {
         Self {
             base_fragment_info,
+            parent_box: None,
             inline_styles,
             text_range,
+            character_range,
             shaped_text: Vec::new(),
-            selection_range,
         }
     }
 
@@ -384,9 +405,6 @@ impl TextRun {
         };
 
         let mut flags = ShapingFlags::empty();
-        if letter_spacing.is_some() {
-            flags.insert(ShapingFlags::IGNORE_LIGATURES_SHAPING_FLAG);
-        }
         if inherited_text_style.text_rendering == TextRendering::Optimizespeed {
             flags.insert(ShapingFlags::IGNORE_LIGATURES_SHAPING_FLAG);
             flags.insert(ShapingFlags::DISABLE_KERNING_SHAPING_FLAG)
@@ -417,6 +435,19 @@ impl TextRun {
                 if segment.bidi_level.is_rtl() {
                     flags.insert(ShapingFlags::RTL_FLAG);
                 }
+
+                // From https://www.w3.org/TR/css-text-3/#cursive-script:
+                // Cursive scripts do not admit gaps between their letters for either
+                // justification or letter-spacing.
+                let letter_spacing = if is_cursive_script(segment.script) {
+                    None
+                } else {
+                    letter_spacing
+                };
+                if letter_spacing.is_some() {
+                    flags.insert(ShapingFlags::IGNORE_LIGATURES_SHAPING_FLAG);
+                };
+
                 let shaping_options = ShapingOptions {
                     letter_spacing,
                     word_spacing,
@@ -446,7 +477,7 @@ impl TextRun {
         layout_context: &LayoutContext,
         formatting_context_text: &str,
         bidi_info: &BidiInfo,
-        parent_style: &Arc<ComputedValues>,
+        parent_style: &ServoArc<ComputedValues>,
     ) -> Vec<TextRunSegment> {
         let font_group = layout_context
             .font_context
@@ -454,10 +485,19 @@ impl TextRun {
         let mut current: Option<TextRunSegment> = None;
         let mut results = Vec::new();
 
+        let lang = parent_style.get_font()._x_lang.clone();
         let text_run_text = &formatting_context_text[self.text_range.clone()];
         let char_iterator = TwoCharsAtATimeIterator::new(text_run_text.chars());
+
+        // The next current character index within the entire inline formatting context's text.
+        let mut next_character_index = self.character_range.start;
+        // The next bytes index of the charcter within the entire inline formatting context's text.
         let mut next_byte_index = self.text_range.start;
+
         for (character, next_character) in char_iterator {
+            let current_character_index = next_character_index;
+            next_character_index += 1;
+
             let current_byte_index = next_byte_index;
             next_byte_index += character.len_utf8();
 
@@ -470,22 +510,12 @@ impl TextRun {
             // at the bottom of the list.
             let script = Script::from(character);
             let bidi_level = bidi_info.levels[current_byte_index];
-            let current_font = current.as_ref().and_then(|text_run_segment| {
-                if text_run_segment.bidi_level == bidi_level && text_run_segment.script == script {
-                    Some(text_run_segment.font.clone())
-                } else {
-                    None
-                }
-            });
-
-            let lang = parent_style.get_font()._x_lang.clone();
 
             let Some(font) = font_group.find_by_codepoint(
                 &layout_context.font_context,
                 character,
                 next_character,
-                current_font,
-                Some(lang.0.as_ref().to_string()),
+                lang.clone(),
             ) else {
                 continue;
             };
@@ -501,29 +531,43 @@ impl TextRun {
             // characters in the run were control characters we may be creating the first
             // segment in the middle of the run (ie the start should be the start of this
             // text run's text).
-            let start_byte_index = match current {
-                Some(_) => current_byte_index,
-                None => self.text_range.start,
+            let (start_byte_index, start_character_index) = match current {
+                Some(_) => (current_byte_index, current_character_index),
+                None => (self.text_range.start, self.character_range.start),
             };
-            let new = TextRunSegment::new(font, script, bidi_level, start_byte_index);
+            let new = TextRunSegment::new(
+                font,
+                script,
+                bidi_level,
+                start_byte_index,
+                start_character_index,
+            );
             if let Some(mut finished) = current.replace(new) {
                 // The end of the previous segment is the start of the next one.
                 finished.range.end = current_byte_index;
+                finished.character_range.end = current_character_index;
                 results.push(finished);
             }
         }
 
-        // Either we have a current segment or we only had control character and whitespace. In both
+        // Either we have a current segment or we only had control characters and whitespace. In both
         // of those cases, just use the first font.
         if current.is_none() {
             current = font_group.first(&layout_context.font_context).map(|font| {
-                TextRunSegment::new(font, Script::Common, Level::ltr(), self.text_range.start)
+                TextRunSegment::new(
+                    font,
+                    Script::Common,
+                    Level::ltr(),
+                    self.text_range.start,
+                    self.character_range.start,
+                )
             })
         }
 
         // Extend the last segment to the end of the string and add it to the results.
         if let Some(mut last_segment) = current.take() {
             last_segment.range.end = self.text_range.end;
+            last_segment.character_range.end = self.character_range.end;
             results.push(last_segment);
         }
 
@@ -550,6 +594,23 @@ impl TextRun {
             soft_wrap_policy = SegmentStartSoftWrapPolicy::FollowLinebreaker;
         }
     }
+}
+
+/// From <https://www.w3.org/TR/css-text-3/#cursive-script>:
+/// Cursive scripts do not admit gaps between their letters for either justification
+/// or letter-spacing. The following Unicode scripts are included: Arabic, Hanifi
+/// Rohingya, Mandaic, Mongolian, N’Ko, Phags Pa, Syriac
+fn is_cursive_script(script: Script) -> bool {
+    matches!(
+        script,
+        Script::Arabic |
+            Script::Hanifi_Rohingya |
+            Script::Mandaic |
+            Script::Mongolian |
+            Script::Nko |
+            Script::Phags_Pa |
+            Script::Syriac
+    )
 }
 
 /// Whether or not this character should be able to change the font during segmentation.  Certain

@@ -17,8 +17,10 @@ use js::rust::wrappers::{Construct1, JS_GetProperty, SameValue};
 use js::rust::{HandleObject, MutableHandleValue};
 use rustc_hash::FxBuildHasher;
 use script_bindings::conversions::{SafeFromJSValConvertible, SafeToJSValConvertible};
+use script_bindings::settings_stack::{run_a_callback, run_a_script};
 
 use super::bindings::trace::HashMapTracedValues;
+use crate::DomTypeHolder;
 use crate::dom::bindings::callback::{CallbackContainer, ExceptionHandling};
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::CustomElementRegistryBinding::{
@@ -34,7 +36,6 @@ use crate::dom::bindings::error::{
 use crate::dom::bindings::inheritance::{Castable, NodeTypeId};
 use crate::dom::bindings::reflector::{DomGlobal, DomObject, Reflector, reflect_dom_object};
 use crate::dom::bindings::root::{AsHandleValue, Dom, DomRoot};
-use crate::dom::bindings::settings_stack::{AutoEntryScript, AutoIncumbentScript};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
 use crate::dom::domexception::{DOMErrorName, DOMException};
@@ -188,7 +189,7 @@ impl CustomElementRegistry {
             // Step 10.2
             if !prototype.is_object() {
                 return Err(Error::Type(
-                    "constructor.prototype is not an object".to_owned(),
+                    c"constructor.prototype is not an object".to_owned(),
                 ));
             }
         }
@@ -267,7 +268,7 @@ impl CustomElementRegistry {
         );
         match conversion {
             Ok(ConversionResult::Success(attributes)) => Ok(attributes),
-            Ok(ConversionResult::Failure(error)) => Err(Error::Type(error.into())),
+            Ok(ConversionResult::Failure(error)) => Err(Error::Type(error.into_owned())),
             _ => Err(Error::JSFailed),
         }
     }
@@ -305,7 +306,7 @@ impl CustomElementRegistry {
         );
         match conversion {
             Ok(ConversionResult::Success(flag)) => Ok(flag),
-            Ok(ConversionResult::Failure(error)) => Err(Error::Type(error.into())),
+            Ok(ConversionResult::Failure(error)) => Err(Error::Type(error.into_owned())),
             _ => Err(Error::JSFailed),
         }
     }
@@ -343,7 +344,7 @@ impl CustomElementRegistry {
         );
         match conversion {
             Ok(ConversionResult::Success(attributes)) => Ok(attributes),
-            Ok(ConversionResult::Failure(error)) => Err(Error::Type(error.into())),
+            Ok(ConversionResult::Failure(error)) => Err(Error::Type(error.into_owned())),
             _ => Err(Error::JSFailed),
         }
     }
@@ -372,7 +373,9 @@ fn get_callback(
         // Step 10.4.2
         if !callback.is_undefined() {
             if !callback.is_object() || !IsCallable(callback.to_object()) {
-                return Err(Error::Type("Lifecycle callback is not callable".to_owned()));
+                return Err(Error::Type(
+                    c"Lifecycle callback is not callable".to_owned(),
+                ));
             }
             Ok(Some(Function::new(cx, callback.to_object())))
         } else {
@@ -383,7 +386,6 @@ fn get_callback(
 
 impl CustomElementRegistryMethods<crate::DomTypeHolder> for CustomElementRegistry {
     #[expect(unsafe_code)]
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     /// <https://html.spec.whatwg.org/multipage/#dom-customelementregistry-define>
     fn Define(
         &self,
@@ -407,7 +409,7 @@ impl CustomElementRegistryMethods<crate::DomTypeHolder> for CustomElementRegistr
 
         if unsafe { !IsConstructor(unwrapped_constructor.get()) } {
             return Err(Error::Type(
-                "Second argument of CustomElementRegistry.define is not a constructor".to_owned(),
+                c"Second argument of CustomElementRegistry.define is not a constructor".to_owned(),
             ));
         }
 
@@ -791,12 +793,18 @@ impl CustomElementDefinition {
             let _ac = JSAutoRealm::new(*cx, self.constructor.callback());
             // Step 5.3.1. Set result to the result of constructing C, with no arguments.
             // https://webidl.spec.whatwg.org/#construct-a-callback-function
-            let _script_guard = AutoEntryScript::new(window.upcast());
-            let _callback_guard = AutoIncumbentScript::new(window.upcast());
-            let args = HandleValueArray::empty();
-            if unsafe { !Construct1(*cx, constructor.handle(), &args, element.handle_mut()) } {
-                return Err(Error::JSFailed);
-            }
+            run_a_script::<DomTypeHolder, _>(window.upcast(), || {
+                run_a_callback::<DomTypeHolder, _>(window.upcast(), || {
+                    let args = HandleValueArray::empty();
+                    if unsafe {
+                        !Construct1(*cx, constructor.handle(), &args, element.handle_mut())
+                    } {
+                        Err(Error::JSFailed)
+                    } else {
+                        Ok(())
+                    }
+                })
+            })?;
         }
 
         rooted!(in(*cx) let element_val = ObjectValue(element.get()));
@@ -805,7 +813,7 @@ impl CustomElementDefinition {
                 Ok(ConversionResult::Success(element)) => element,
                 Ok(ConversionResult::Failure(..)) => {
                     return Err(Error::Type(
-                        "Constructor did not return a DOM node".to_owned(),
+                        c"Constructor did not return a DOM node".to_owned(),
                     ));
                 },
                 _ => return Err(Error::JSFailed),
@@ -992,20 +1000,22 @@ fn run_upgrade_constructor(
 
         // Step 9.3. Let constructResult be the result of constructing C, with no arguments.
         // https://webidl.spec.whatwg.org/#construct-a-callback-function
-        {
-            let _script_guard = AutoEntryScript::new(window.upcast());
-            let _callback_guard = AutoIncumbentScript::new(window.upcast());
-            if unsafe {
-                !Construct1(
-                    *cx,
-                    constructor_val.handle(),
-                    &args,
-                    construct_result.handle_mut(),
-                )
-            } {
-                return Err(Error::JSFailed);
-            }
-        }
+        run_a_script::<DomTypeHolder, _>(window.upcast(), || {
+            run_a_callback::<DomTypeHolder, _>(window.upcast(), || {
+                if unsafe {
+                    !Construct1(
+                        *cx,
+                        constructor_val.handle(),
+                        &args,
+                        construct_result.handle_mut(),
+                    )
+                } {
+                    Err(Error::JSFailed)
+                } else {
+                    Ok(())
+                }
+            })
+        })?;
 
         let mut same = false;
         rooted!(in(*cx) let construct_result_val = ObjectValue(construct_result.get()));
@@ -1023,7 +1033,7 @@ fn run_upgrade_constructor(
         }
         if !same {
             return Err(Error::Type(
-                "Returned element is not SameValue as the upgraded element".to_string(),
+                c"Returned element is not SameValue as the upgraded element".to_owned(),
             ));
         }
     }
@@ -1172,7 +1182,7 @@ impl CustomElementReactionStack {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#enqueue-a-custom-element-callback-reaction>
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     pub(crate) fn enqueue_callback_reaction(
         &self,
         element: &Element,

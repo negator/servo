@@ -11,6 +11,7 @@ use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
 use deny_public_fields::DenyPublicFields;
+use devtools_traits::EventListenerInfo;
 use dom_struct::dom_struct;
 use js::jsapi::JS::CompileFunction;
 use js::jsapi::{JS_GetFunctionObject, SupportUnscopables};
@@ -18,6 +19,7 @@ use js::jsval::JSVal;
 use js::rust::{CompileOptionsWrapper, HandleObject, transform_u16_to_source_text};
 use libc::c_char;
 use rustc_hash::FxBuildHasher;
+use script_bindings::cformat;
 use servo_url::ServoUrl;
 use style::str::HTML_SPACE_CHARACTERS;
 use stylo_atoms::Atom;
@@ -73,7 +75,7 @@ use crate::script_runtime::CanGc;
 /// <https://html.spec.whatwg.org/multipage/#globaleventhandlers> and
 /// <https://html.spec.whatwg.org/multipage/#windoweventhandlers> as well as
 /// specific attributes for elements
-static CONTENT_EVENT_HANDLER_NAMES: [&str; 108] = [
+static CONTENT_EVENT_HANDLER_NAMES: [&str; 118] = [
     "onabort",
     "onauxclick",
     "onbeforeinput",
@@ -162,6 +164,17 @@ static CONTENT_EVENT_HANDLER_NAMES: [&str; 108] = [
     // https://w3c.github.io/selection-api/#extensions-to-globaleventhandlers-interface
     "onselectstart",
     "onselectionchange",
+    // https://w3c.github.io/pointerevents/#extensions-to-the-globaleventhandlers-interface
+    "onpointercancel",
+    "onpointerdown",
+    "onpointerup",
+    "onpointermove",
+    "onpointerout",
+    "onpointerover",
+    "onpointerenter",
+    "onpointerleave",
+    "ongotpointercapture",
+    "onlostpointercapture",
     // https://html.spec.whatwg.org/multipage/#windoweventhandlers
     "onafterprint",
     "onbeforeprint",
@@ -315,11 +328,11 @@ impl CompiledEventListener {
         event: &Event,
         exception_handle: ExceptionHandling,
         can_gc: CanGc,
-    ) {
+    ) -> Fallible<()> {
         // Step 3
         match *self {
             CompiledEventListener::Listener(ref listener) => {
-                let _ = listener.HandleEvent_(object, event, exception_handle, can_gc);
+                listener.HandleEvent_(object, event, exception_handle, can_gc)
             },
             CompiledEventListener::Handler(ref handler) => {
                 match *handler {
@@ -349,12 +362,12 @@ impl CompiledEventListener {
                                         event.upcast::<Event>().PreventDefault();
                                     }
                                 }
-                                return;
+                                return return_value;
                             }
                         }
 
                         rooted!(in(*GlobalScope::get_cx()) let mut rooted_return_value: JSVal);
-                        let _ = handler.Call_(
+                        handler.Call_(
                             object,
                             EventOrString::Event(DomRoot::from_ref(event)),
                             None,
@@ -364,58 +377,63 @@ impl CompiledEventListener {
                             rooted_return_value.handle_mut(),
                             exception_handle,
                             can_gc,
-                        );
+                        )
                     },
 
                     CommonEventHandler::BeforeUnloadEventHandler(ref handler) => {
                         if let Some(event) = event.downcast::<BeforeUnloadEvent>() {
                             // Step 5
-                            if let Ok(value) = handler.Call_(
+                            match handler.Call_(
                                 object,
                                 event.upcast::<Event>(),
                                 exception_handle,
                                 can_gc,
                             ) {
-                                let rv = event.ReturnValue();
-                                if let Some(v) = value {
-                                    if rv.is_empty() {
-                                        event.SetReturnValue(v);
+                                Ok(value) => {
+                                    let rv = event.ReturnValue();
+                                    if let Some(v) = value {
+                                        if rv.is_empty() {
+                                            event.SetReturnValue(v);
+                                        }
+                                        event.upcast::<Event>().PreventDefault();
                                     }
-                                    event.upcast::<Event>().PreventDefault();
-                                }
+                                    Ok(())
+                                },
+                                Err(err) => Err(err),
                             }
                         } else {
                             // Step 5, "Otherwise" clause
-                            let _ = handler.Call_(
-                                object,
-                                event.upcast::<Event>(),
-                                exception_handle,
-                                can_gc,
-                            );
+                            handler
+                                .Call_(object, event.upcast::<Event>(), exception_handle, can_gc)
+                                .map(|_| ())
                         }
                     },
 
                     CommonEventHandler::EventHandler(ref handler) => {
                         let cx = GlobalScope::get_cx();
                         rooted!(in(*cx) let mut rooted_return_value: JSVal);
-                        if let Ok(()) = handler.Call_(
+                        match handler.Call_(
                             object,
                             event,
                             rooted_return_value.handle_mut(),
                             exception_handle,
                             can_gc,
                         ) {
-                            let value = rooted_return_value.handle();
+                            Ok(()) => {
+                                let value = rooted_return_value.handle();
 
-                            // Step 5
-                            let should_cancel = value.is_boolean() && !value.to_boolean();
+                                // Step 5
+                                let should_cancel = value.is_boolean() && !value.to_boolean();
 
-                            if should_cancel {
-                                // FIXME: spec says to set the cancelled flag directly
-                                // here, not just to prevent default;
-                                // can that ever make a difference?
-                                event.PreventDefault();
-                            }
+                                if should_cancel {
+                                    // FIXME: spec says to set the cancelled flag directly
+                                    // here, not just to prevent default;
+                                    // can that ever make a difference?
+                                    event.PreventDefault();
+                                }
+                                Ok(())
+                            },
+                            Err(err) => Err(err),
                         }
                     },
                 }
@@ -759,9 +777,8 @@ impl EventTarget {
         let args = if is_error { ERROR_ARG_NAMES } else { ARG_NAMES };
 
         let cx = GlobalScope::get_cx();
-        let options = unsafe {
-            CompileOptionsWrapper::new_raw(*cx, &handler.url.to_string(), handler.line as u32)
-        };
+        let url = cformat!("{}", handler.url);
+        let options = unsafe { CompileOptionsWrapper::new_raw(*cx, url, handler.line as u32) };
 
         // Step 3.9, subsection Scope steps 1-6
         let scopechain = js::rust::EnvironmentChain::new(*cx, SupportUnscopables::Yes);
@@ -1097,6 +1114,22 @@ impl EventTarget {
     /// <https://html.spec.whatwg.org/multipage/#event-handler-content-attributes>
     pub(crate) fn is_content_event_handler(name: &str) -> bool {
         CONTENT_EVENT_HANDLER_NAMES.contains(&name)
+    }
+
+    pub(crate) fn summarize_event_listeners_for_devtools(&self) -> Vec<EventListenerInfo> {
+        let handlers = self.handlers.borrow();
+        let mut listener_infos = Vec::with_capacity(handlers.0.len());
+        for (event_type, event_listeners) in &handlers.0 {
+            for event_listener in event_listeners.iter() {
+                let event_listener_entry = event_listener.borrow();
+                listener_infos.push(EventListenerInfo {
+                    event_type: event_type.to_string(),
+                    capturing: event_listener_entry.phase() == ListenerPhase::Capturing,
+                });
+            }
+        }
+
+        listener_infos
     }
 }
 

@@ -53,6 +53,7 @@ use crate::dom::permissions::Permissions;
 use crate::dom::pluginarray::PluginArray;
 use crate::dom::serviceworkercontainer::ServiceWorkerContainer;
 use crate::dom::servointernals::ServoInternals;
+use crate::dom::types::UserActivation;
 #[cfg(feature = "webgpu")]
 use crate::dom::webgpu::gpu::GPU;
 use crate::dom::window::Window;
@@ -128,6 +129,7 @@ pub(crate) struct Navigator {
     #[cfg(feature = "gamepad")]
     has_gamepad_gesture: Cell<bool>,
     servo_internals: MutNullableDom<ServoInternals>,
+    user_activation: MutNullableDom<UserActivation>,
 }
 
 impl Navigator {
@@ -153,6 +155,7 @@ impl Navigator {
             #[cfg(feature = "gamepad")]
             has_gamepad_gesture: Cell::new(false),
             servo_internals: Default::default(),
+            user_activation: Default::default(),
         }
     }
 
@@ -386,6 +389,11 @@ impl NavigatorMethods<crate::DomTypeHolder> for Navigator {
         false
     }
 
+    /// <https://html.spec.whatwg.org/multipage/#dom-navigator-pdfviewerenabled>
+    fn PdfViewerEnabled(&self) -> bool {
+        false
+    }
+
     /// <https://w3c.github.io/ServiceWorker/#navigator-service-worker-attribute>
     fn ServiceWorker(&self) -> DomRoot<ServiceWorkerContainer> {
         self.service_worker
@@ -476,10 +484,10 @@ impl NavigatorMethods<crate::DomTypeHolder> for Navigator {
         // If the algorithm returns an error, or if parsedUrl's scheme is not "http" or "https",
         // throw a "TypeError" exception and terminate these steps.
         let Ok(url) = ServoUrl::parse_with_base(Some(&base), &url) else {
-            return Err(Error::Type("Cannot parse URL".to_owned()));
+            return Err(Error::Type(c"Cannot parse URL".to_owned()));
         };
         if !matches!(url.scheme(), "http" | "https") {
-            return Err(Error::Type("URL is not http(s)".to_owned()));
+            return Err(Error::Type(c"URL is not http(s)".to_owned()));
         }
         let mut request_body = None;
         // Step 4. Let headerList be an empty list.
@@ -588,6 +596,12 @@ impl NavigatorMethods<crate::DomTypeHolder> for Navigator {
         });
         Ok(())
     }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-navigator-useractivation>
+    fn UserActivation(&self, can_gc: CanGc) -> DomRoot<UserActivation> {
+        self.user_activation
+            .or_init(|| UserActivation::new(&self.global(), can_gc))
+    }
 }
 
 struct BeaconFetchListener {
@@ -616,12 +630,12 @@ impl FetchResponseListener for BeaconFetchListener {
 
     fn process_response_eof(
         self,
+        cx: &mut js::context::JSContext,
         _: RequestId,
-        response: Result<ResourceFetchTiming, NetworkError>,
+        response: Result<(), NetworkError>,
+        timing: ResourceFetchTiming,
     ) {
-        if let Ok(response) = response {
-            submit_timing(&self, &response, CanGc::note());
-        }
+        submit_timing(&self, &response, &timing, CanGc::from_cx(cx));
     }
 
     fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<Violation>) {

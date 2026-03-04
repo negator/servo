@@ -36,6 +36,7 @@ use style::selector_parser::{
 use style::shared_lock::Locked as StyleLocked;
 use style::stylesheets::scope_rule::ImplicitScopeRoot;
 use style::values::computed::{Display, Image};
+use style::values::generics::counters::{Content, ContentItem, GenericContentItems};
 use style::values::specified::align::AlignFlags;
 use style::values::specified::box_::{DisplayInside, DisplayOutside};
 use style::values::{AtomIdent, AtomString};
@@ -56,6 +57,7 @@ use crate::layout_dom::{ServoLayoutNode, ServoShadowRoot, ServoThreadSafeLayoutN
 
 /// A wrapper around elements that ensures layout can only ever access safe properties.
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
+#[repr(transparent)]
 pub struct ServoLayoutElement<'dom> {
     /// The wrapped private DOM Element.
     element: LayoutDom<'dom, Element>,
@@ -74,6 +76,14 @@ impl fmt::Debug for ServoLayoutElement<'_> {
 impl<'dom> ServoLayoutElement<'dom> {
     pub(super) fn from_layout_js(el: LayoutDom<'dom, Element>) -> Self {
         ServoLayoutElement { element: el }
+    }
+
+    /// Returns the interior of this element as a `LayoutDom`.
+    ///
+    /// This method must never be exposed to layout as it returns
+    /// a `LayoutDom`.
+    pub(crate) fn to_layout_js(self) -> LayoutDom<'dom, Element> {
+        self.element
     }
 
     pub(super) fn is_html_element(&self) -> bool {
@@ -171,6 +181,14 @@ where
                 Some(*slot)
             },
         }
+    }
+}
+
+impl<'dom> style::dom::AttributeProvider for ServoLayoutElement<'dom> {
+    fn get_attr(&self, attr: &style::LocalName) -> Option<String> {
+        self.element
+            .get_attr_val_for_layout(&ns!(), attr)
+            .map(String::from)
     }
 }
 
@@ -679,6 +697,22 @@ impl<'dom> style::dom::TElement for ServoLayoutElement<'dom> {
                 return true;
             }
 
+            // If we're not a pseudo, `content` can still cause layout damage if its value is
+            // <content-replacement> (a.k.a. a single <image>).
+            fn replacement<Image>(content: &Content<Image>) -> Option<&Image> {
+                match content {
+                    Content::Items(GenericContentItems { items, .. }) => match items.as_slice() {
+                        [ContentItem::Image(image)] => Some(image),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            }
+            if replacement(&old.get_counters().content) != replacement(&new.get_counters().content)
+            {
+                return true;
+            }
+
             false
         };
 
@@ -706,9 +740,9 @@ impl<'dom> style::dom::TElement for ServoLayoutElement<'dom> {
         };
 
         if box_tree_needs_rebuild() {
-            RestyleDamage::from_bits_retain(LayoutDamage::REBUILD_BOX.bits())
+            RestyleDamage::from_bits_retain(LayoutDamage::BOX_DAMAGE.bits())
         } else if text_shaping_needs_recollect() {
-            RestyleDamage::from_bits_retain(LayoutDamage::RECOLLECT_BOX_TREE_CHILDREN.bits())
+            RestyleDamage::from_bits_retain(LayoutDamage::DESCENDANT_HAS_BOX_DAMAGE.bits())
         } else {
             // This element needs to be laid out again, but does not have any damage to
             // its box. In the future, we will distinguish between types of damage to the
@@ -874,6 +908,7 @@ impl<'dom> ::selectors::Element for ServoLayoutElement<'dom> {
             NonTSPseudoClass::MozMeterOptimum |
             NonTSPseudoClass::MozMeterSubOptimum |
             NonTSPseudoClass::MozMeterSubSubOptimum |
+            NonTSPseudoClass::Open |
             NonTSPseudoClass::Optional |
             NonTSPseudoClass::OutOfRange |
             NonTSPseudoClass::PlaceholderShown |
@@ -1109,7 +1144,7 @@ impl<'dom> ThreadSafeLayoutElement<'dom> for ServoThreadSafeLayoutElement<'dom> 
 ///
 /// Lazy pseudo-elements in Servo only allows selectors using safe properties,
 /// i.e., local_name, attributes, so they can only be used for **private**
-/// pseudo-elements (like `::-servo-details-content`).
+/// pseudo-elements (like `::details-content`).
 ///
 /// Probably a few more of this functions can be implemented (like `has_class`, etc.),
 /// but they have no use right now.

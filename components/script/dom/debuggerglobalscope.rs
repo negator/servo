@@ -2,41 +2,53 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::borrow::Cow;
 use std::cell::RefCell;
 
-use base::generic_channel::{GenericCallback, GenericSender};
+use base::generic_channel::{GenericCallback, GenericSender, channel};
 use base::id::{Index, PipelineId, PipelineNamespaceId};
 use constellation_traits::ScriptToConstellationChan;
-use devtools_traits::{DevtoolScriptControlMsg, ScriptToDevtoolsControlMsg, SourceInfo, WorkerId};
+use devtools_traits::{
+    DevtoolScriptControlMsg, EvaluateJSReply, EvaluateJSReplyValue, ScriptToDevtoolsControlMsg,
+    SourceInfo, WorkerId,
+};
 use dom_struct::dom_struct;
+use embedder_traits::ScriptToEmbedderChan;
 use embedder_traits::resources::{self, Resource};
-use embedder_traits::{JavaScriptEvaluationError, ScriptToEmbedderChan};
+use js::context::JSContext;
 use js::jsval::UndefinedValue;
-use js::rust::wrappers::JS_DefineDebuggerObject;
+use js::rust::wrappers2::JS_DefineDebuggerObject;
 use net_traits::ResourceThreads;
 use profile_traits::{mem, time};
+use script_bindings::codegen::GenericBindings::DebuggerEvalEventBinding::EvalResultValue;
 use script_bindings::codegen::GenericBindings::DebuggerGetPossibleBreakpointsEventBinding::RecommendedBreakpointLocation;
 use script_bindings::codegen::GenericBindings::DebuggerGlobalScopeBinding::{
-    DebuggerGlobalScopeMethods, NotifyNewSource,
+    DebuggerGlobalScopeMethods, NotifyNewSource, PipelineIdInit,
 };
-use script_bindings::realms::InRealm;
 use script_bindings::reflector::DomObject;
+use script_bindings::str::DOMString;
 use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
 use storage_traits::StorageThreads;
 
 use crate::dom::bindings::codegen::Bindings::DebuggerGlobalScopeBinding;
-use crate::dom::bindings::error::report_pending_exception;
+use crate::dom::bindings::codegen::Bindings::DebuggerInterruptEventBinding::{
+    FrameInfo, FrameOffset, PauseReason,
+};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::utils::define_all_exposed_interfaces;
+use crate::dom::debuggerclearbreakpointevent::DebuggerClearBreakpointEvent;
+use crate::dom::debuggerinterruptevent::DebuggerInterruptEvent;
+use crate::dom::debuggerresumeevent::DebuggerResumeEvent;
+use crate::dom::debuggersetbreakpointevent::DebuggerSetBreakpointEvent;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::types::{DebuggerAddDebuggeeEvent, DebuggerGetPossibleBreakpointsEvent, Event};
-#[cfg(feature = "testbinding")]
+use crate::dom::types::{
+    DebuggerAddDebuggeeEvent, DebuggerEvalEvent, DebuggerGetPossibleBreakpointsEvent, Event,
+};
 #[cfg(feature = "webgpu")]
 use crate::dom::webgpu::identityhub::IdentityHub;
-use crate::realms::enter_realm;
-use crate::script_runtime::{CanGc, IntroductionType, JSContext};
+use crate::realms::{enter_auto_realm, enter_realm};
+use crate::script_runtime::{CanGc, IntroductionType};
+use crate::script_thread::with_script_thread;
 
 #[dom_struct]
 /// Global scope for interacting with the devtools Debugger API.
@@ -49,6 +61,8 @@ pub(crate) struct DebuggerGlobalScope {
     #[no_trace]
     get_possible_breakpoints_result_sender:
         RefCell<Option<GenericSender<Vec<devtools_traits::RecommendedBreakpointLocation>>>>,
+    #[no_trace]
+    eval_result_sender: RefCell<Option<GenericSender<EvaluateJSReply>>>,
 }
 
 impl DebuggerGlobalScope {
@@ -71,7 +85,7 @@ impl DebuggerGlobalScope {
         resource_threads: ResourceThreads,
         storage_threads: StorageThreads,
         #[cfg(feature = "webgpu")] gpu_id_hub: std::sync::Arc<IdentityHub>,
-        can_gc: CanGc,
+        cx: &mut JSContext,
     ) -> DomRoot<Self> {
         let global = Box::new(Self {
             global_scope: GlobalScope::new_inherited(
@@ -95,51 +109,37 @@ impl DebuggerGlobalScope {
             ),
             devtools_to_script_sender,
             get_possible_breakpoints_result_sender: RefCell::new(None),
+            eval_result_sender: RefCell::new(None),
         });
-        let global =
-            DebuggerGlobalScopeBinding::Wrap::<crate::DomTypeHolder>(GlobalScope::get_cx(), global);
+        let global = DebuggerGlobalScopeBinding::Wrap::<crate::DomTypeHolder>(cx, global);
 
-        let realm = enter_realm(&*global);
-        define_all_exposed_interfaces(global.upcast(), InRealm::entered(&realm), can_gc);
+        let mut realm = enter_auto_realm(cx, &*global);
+        let mut realm = realm.current_realm();
+        define_all_exposed_interfaces(&mut realm, global.upcast());
         assert!(unsafe {
-            // Invariants: `cx` must be a non-null, valid JSContext pointer,
-            // and `obj` must be a handle to a JS global object.
-            JS_DefineDebuggerObject(
-                *Self::get_cx(),
-                global.global_scope.reflector().get_jsobject(),
-            )
+            // Invariants: `obj` must be a handle to a JS global object.
+            JS_DefineDebuggerObject(&mut realm, global.global_scope.reflector().get_jsobject())
         });
 
         global
-    }
-
-    /// Get the JS context.
-    pub(crate) fn get_cx() -> JSContext {
-        GlobalScope::get_cx()
     }
 
     pub(crate) fn as_global_scope(&self) -> &GlobalScope {
         self.upcast::<GlobalScope>()
     }
 
-    fn evaluate_js(
-        &self,
-        script: Cow<'_, str>,
-        can_gc: CanGc,
-    ) -> Result<(), JavaScriptEvaluationError> {
-        rooted!(in (*Self::get_cx()) let mut rval = UndefinedValue());
-        self.global_scope
-            .evaluate_js_on_global(script, "", None, rval.handle_mut(), can_gc)
-    }
+    pub(crate) fn execute(&self, cx: &mut JSContext) {
+        let mut realm = enter_auto_realm(cx, self);
+        let cx = &mut realm.current_realm();
 
-    pub(crate) fn execute(&self, can_gc: CanGc) {
-        if self
-            .evaluate_js(resources::read_string(Resource::DebuggerJS).into(), can_gc)
-            .is_err()
-        {
-            let ar = enter_realm(self);
-            report_pending_exception(Self::get_cx(), true, InRealm::Entered(&ar), can_gc);
-        }
+        rooted!(&in(cx) let mut rval = UndefinedValue());
+        let _ = self.global_scope.evaluate_js_on_global(
+            cx,
+            resources::read_string(Resource::DebuggerJS).into(),
+            "",
+            None,
+            rval.handle_mut(),
+        );
     }
 
     pub(crate) fn fire_add_debuggee(
@@ -160,8 +160,39 @@ impl DebuggerGlobalScope {
             can_gc,
         ));
         assert!(
-            DomRoot::upcast::<Event>(event).fire(self.upcast(), can_gc),
+            event.fire(self.upcast(), can_gc),
             "Guaranteed by DebuggerAddDebuggeeEvent::new"
+        );
+    }
+
+    pub(crate) fn fire_eval(
+        &self,
+        can_gc: CanGc,
+        code: DOMString,
+        debuggee_pipeline_id: PipelineId,
+        debuggee_worker_id: Option<WorkerId>,
+        frame_actor_id: Option<String>,
+        result_sender: GenericSender<EvaluateJSReply>,
+    ) {
+        assert!(
+            self.eval_result_sender
+                .replace(Some(result_sender))
+                .is_none()
+        );
+        let _realm = enter_realm(self);
+        let debuggee_pipeline_id =
+            crate::dom::pipelineid::PipelineId::new(self.upcast(), debuggee_pipeline_id, can_gc);
+        let event = DomRoot::upcast::<Event>(DebuggerEvalEvent::new(
+            self.upcast(),
+            code,
+            &debuggee_pipeline_id,
+            debuggee_worker_id.map(|id| id.to_string().into()),
+            frame_actor_id.map(|id| id.into()),
+            can_gc,
+        ));
+        assert!(
+            event.fire(self.upcast(), can_gc),
+            "Guaranteed by DebuggerEvalEvent::new"
         );
     }
 
@@ -183,8 +214,74 @@ impl DebuggerGlobalScope {
             can_gc,
         ));
         assert!(
-            DomRoot::upcast::<Event>(event).fire(self.upcast(), can_gc),
+            event.fire(self.upcast(), can_gc),
             "Guaranteed by DebuggerGetPossibleBreakpointsEvent::new"
+        );
+    }
+
+    pub(crate) fn fire_set_breakpoint(
+        &self,
+        can_gc: CanGc,
+        spidermonkey_id: u32,
+        script_id: u32,
+        offset: u32,
+    ) {
+        let event = DomRoot::upcast::<Event>(DebuggerSetBreakpointEvent::new(
+            self.upcast(),
+            spidermonkey_id,
+            script_id,
+            offset,
+            can_gc,
+        ));
+        assert!(
+            event.fire(self.upcast(), can_gc),
+            "Guaranteed by DebuggerSetBreakpointEvent::new"
+        );
+    }
+
+    pub(crate) fn fire_interrupt(&self, can_gc: CanGc) {
+        let event = DomRoot::upcast::<Event>(DebuggerInterruptEvent::new(self.upcast(), can_gc));
+        assert!(
+            event.fire(self.upcast(), can_gc),
+            "Guaranteed by DebuggerInterruptEvent::new"
+        );
+    }
+
+    pub(crate) fn fire_resume(
+        &self,
+        resume_limit_type: Option<String>,
+        frame_actor_id: Option<String>,
+        can_gc: CanGc,
+    ) {
+        let event = DomRoot::upcast::<Event>(DebuggerResumeEvent::new(
+            self.upcast(),
+            resume_limit_type.map(DOMString::from),
+            frame_actor_id.map(DOMString::from),
+            can_gc,
+        ));
+        assert!(
+            event.fire(self.upcast(), can_gc),
+            "Guaranteed by DebuggerResumeEvent::new"
+        );
+    }
+
+    pub(crate) fn fire_clear_breakpoint(
+        &self,
+        can_gc: CanGc,
+        spidermonkey_id: u32,
+        script_id: u32,
+        offset: u32,
+    ) {
+        let event = DomRoot::upcast::<Event>(DebuggerClearBreakpointEvent::new(
+            self.upcast(),
+            spidermonkey_id,
+            script_id,
+            offset,
+            can_gc,
+        ));
+        assert!(
+            event.fire(self.upcast(), can_gc),
+            "Guaranteed by DebuggerClearBreakpointEvent::new"
         );
     }
 }
@@ -299,6 +396,7 @@ impl DebuggerGlobalScopeMethods<crate::DomTypeHolder> for DebuggerGlobalScope {
             result
                 .into_iter()
                 .map(|entry| devtools_traits::RecommendedBreakpointLocation {
+                    script_id: entry.scriptId,
                     offset: entry.offset,
                     line_number: entry.lineNumber,
                     column_number: entry.columnNumber,
@@ -306,5 +404,124 @@ impl DebuggerGlobalScopeMethods<crate::DomTypeHolder> for DebuggerGlobalScope {
                 })
                 .collect(),
         );
+    }
+
+    /// Handle the result from debugger.js executeInGlobal() call.
+    ///
+    /// The result contains completion value information from the SpiderMonkey Debugger API:
+    /// <https://firefox-source-docs.mozilla.org/js/Debugger/Conventions.html#completion-values>
+    fn EvalResult(&self, _event: &DebuggerEvalEvent, result: &EvalResultValue) {
+        let sender = self
+            .eval_result_sender
+            .take()
+            .expect("Guaranteed by Self::fire_eval()");
+
+        let has_exception = result.hasException.flatten().unwrap_or(false);
+
+        let value = match &*result.valueType.str() {
+            "undefined" => EvaluateJSReplyValue::VoidValue,
+            "null" => EvaluateJSReplyValue::NullValue,
+            "boolean" => {
+                EvaluateJSReplyValue::BooleanValue(result.booleanValue.flatten().unwrap_or(false))
+            },
+            "number" => {
+                let num = result.numberValue.flatten().map(|f| *f).unwrap_or(0.0);
+                EvaluateJSReplyValue::NumberValue(num)
+            },
+            "string" => EvaluateJSReplyValue::StringValue(
+                result
+                    .stringValue
+                    .as_ref()
+                    .and_then(|opt| opt.as_ref())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default(),
+            ),
+            "object" => {
+                let class = result
+                    .objectClass
+                    .as_ref()
+                    .and_then(|opt| opt.as_ref())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "Object".to_string());
+                let name = result
+                    .name
+                    .as_ref()
+                    .and_then(|opt| opt.as_ref())
+                    .map(|s| s.to_string());
+                EvaluateJSReplyValue::ActorValue {
+                    class,
+                    uuid: uuid::Uuid::new_v4().to_string(),
+                    name,
+                }
+            },
+            _ => unreachable!(),
+        };
+
+        let reply = EvaluateJSReply {
+            value,
+            has_exception,
+        };
+
+        let _ = sender.send(reply);
+    }
+
+    fn PauseAndRespond(
+        &self,
+        pipeline_id: &PipelineIdInit,
+        frame_offset: &FrameOffset,
+        pause_reason: &PauseReason,
+    ) {
+        let pipeline_id = PipelineId {
+            namespace_id: PipelineNamespaceId(pipeline_id.namespaceId),
+            index: Index::new(pipeline_id.index).expect("`pipelineId.index` must not be zero"),
+        };
+
+        let frame_offset = devtools_traits::FrameOffset {
+            actor: frame_offset.frameActorId.clone().into(),
+            column: frame_offset.column,
+            line: frame_offset.line,
+        };
+
+        let pause_reason = devtools_traits::PauseReason {
+            type_: pause_reason.type_.clone().into(),
+            on_next: pause_reason.onNext,
+        };
+
+        if let Some(chan) = self.upcast::<GlobalScope>().devtools_chan() {
+            let msg =
+                ScriptToDevtoolsControlMsg::DebuggerPause(pipeline_id, frame_offset, pause_reason);
+            let _ = chan.send(msg);
+        }
+
+        with_script_thread(|script_thread| {
+            script_thread.enter_debugger_pause_loop();
+        });
+    }
+
+    fn RegisterFrameActor(
+        &self,
+        pipeline_id: &PipelineIdInit,
+        result: &FrameInfo,
+    ) -> Option<DOMString> {
+        let pipeline_id = PipelineId {
+            namespace_id: PipelineNamespaceId(pipeline_id.namespaceId),
+            index: Index::new(pipeline_id.index).expect("`pipelineId.index` must not be zero"),
+        };
+
+        let chan = self.upcast::<GlobalScope>().devtools_chan()?;
+        let (tx, rx) = channel::<String>().unwrap();
+
+        let frame = devtools_traits::FrameInfo {
+            display_name: result.displayName.clone().into(),
+            on_stack: result.onStack,
+            oldest: result.oldest,
+            terminated: result.terminated,
+            type_: result.type_.clone().into(),
+            url: result.url.clone().into(),
+        };
+        let msg = ScriptToDevtoolsControlMsg::CreateFrameActor(tx, pipeline_id, frame);
+        let _ = chan.send(msg);
+
+        rx.recv().ok().map(DOMString::from)
     }
 }

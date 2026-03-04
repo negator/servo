@@ -9,7 +9,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_recursion::async_recursion;
 use base::cross_process_instant::CrossProcessInstant;
-use base::generic_channel;
 use base::generic_channel::GenericSharedMemory;
 use base::id::{BrowsingContextId, HistoryStateId, PipelineId};
 use crossbeam_channel::Sender;
@@ -17,7 +16,7 @@ use devtools_traits::{
     ChromeToDevtoolsControlMsg, DevtoolsControlMsg, HttpRequest as DevtoolsHttpRequest,
     HttpResponse as DevtoolsHttpResponse, NetworkEvent, SecurityInfoUpdate,
 };
-use embedder_traits::{AuthenticationResponse, EmbedderMsg, EmbedderProxy};
+use embedder_traits::{AuthenticationResponse, GenericEmbedderProxy};
 use futures::{TryFutureExt, TryStreamExt, future};
 use headers::authorization::Basic;
 use headers::{
@@ -55,7 +54,9 @@ use net_traits::request::{
     is_cors_non_wildcard_request_header_name, is_cors_safelisted_method,
     is_cors_safelisted_request_header,
 };
-use net_traits::response::{CacheState, HttpsState, Response, ResponseBody, ResponseType};
+use net_traits::response::{
+    CacheState, HttpsState, RedirectTaint, Response, ResponseBody, ResponseType,
+};
 use net_traits::{
     CookieSource, DOCUMENT_ACCEPT_HEADER_VALUE, DebugVec, FetchMetadata, NetworkError,
     RedirectEndValue, RedirectStartValue, ReferrerPolicy, ResourceAttribute, ResourceFetchTiming,
@@ -80,6 +81,7 @@ use crate::connector::{
 use crate::cookie::ServoCookie;
 use crate::cookie_storage::CookieStorage;
 use crate::decoder::Decoder;
+use crate::embedder::NetToEmbedderMsg;
 use crate::fetch::cors_cache::CorsCache;
 use crate::fetch::fetch_params::FetchParams;
 use crate::fetch::headers::{SecFetchDest, SecFetchMode, SecFetchSite, SecFetchUser};
@@ -110,7 +112,7 @@ pub struct HttpState {
     pub history_states: RwLock<FxHashMap<HistoryStateId, Vec<u8>>>,
     pub client: ServoClient,
     pub override_manager: CertificateErrorOverrideManager,
-    pub embedder_proxy: Mutex<EmbedderProxy>,
+    pub embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
 }
 
 impl HttpState {
@@ -129,7 +131,7 @@ impl HttpState {
         ]
     }
 
-    fn request_authentication(
+    async fn request_authentication(
         &self,
         request: &Request,
         response: &Response,
@@ -143,15 +145,15 @@ impl HttpState {
             return None;
         }
 
-        let embedder_proxy = self.embedder_proxy.lock();
-        let (ipc_sender, ipc_receiver) = generic_channel::channel().unwrap();
-        embedder_proxy.send(EmbedderMsg::RequestAuthentication(
-            webview_id,
-            request.url(),
-            for_proxy,
-            ipc_sender,
-        ));
-        ipc_receiver.recv().ok()?
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.embedder_proxy
+            .send(NetToEmbedderMsg::RequestAuthentication(
+                webview_id,
+                request.url(),
+                for_proxy,
+                sender,
+            ));
+        receiver.await.ok()?
     }
 }
 
@@ -482,7 +484,7 @@ pub fn send_response_values_to_devtools(
     body: Option<Vec<u8>>,
     cache_state: CacheState,
     request: &Request,
-    devtools_chan: Option<StdArc<Mutex<Sender<DevtoolsControlMsg>>>>,
+    devtools_chan: Option<Sender<DevtoolsControlMsg>>,
 ) {
     if let (Some(devtools_chan), Some(pipeline_id), Some(webview_id)) = (
         devtools_chan,
@@ -505,9 +507,7 @@ pub fn send_response_values_to_devtools(
         let msg =
             ChromeToDevtoolsControlMsg::NetworkEvent(request.id.0.to_string(), net_event_response);
 
-        let _ = devtools_chan
-            .lock()
-            .send(DevtoolsControlMsg::FromChrome(msg));
+        let _ = devtools_chan.send(DevtoolsControlMsg::FromChrome(msg));
     }
 }
 
@@ -537,9 +537,7 @@ pub fn send_security_info_to_devtools(
 
         let msg = ChromeToDevtoolsControlMsg::NetworkEvent(request.id.0.to_string(), update);
 
-        let _ = devtools_chan
-            .lock()
-            .send(DevtoolsControlMsg::FromChrome(msg));
+        let _ = devtools_chan.send(DevtoolsControlMsg::FromChrome(msg));
     }
 }
 
@@ -574,7 +572,7 @@ pub fn send_early_httprequest_to_devtools(request: &Request, context: &FetchCont
             NetworkEvent::HttpRequest(devtools_request),
         );
 
-        send_request_to_devtools(msg, &devtools_chan.lock());
+        send_request_to_devtools(msg, devtools_chan);
     }
 }
 
@@ -995,45 +993,40 @@ pub async fn http_fetch(
 
     // TODO: Step 5: cross-origin resource policy check
 
-    // Step 6
+    // Step 6. If internalResponse’s status is a redirect status:
     if response
         .actual_response()
         .status
         .try_code()
         .is_some_and(is_redirect_status)
     {
-        // Substep 1.
+        // Step 6.1. If internalResponse’s status is not 303, request’s body is non-null,
+        // and the connection uses HTTP/2, then user agents may, and are even encouraged to,
+        // transmit an RST_STREAM frame.
         if response.actual_response().status != StatusCode::SEE_OTHER {
             // TODO: send RST_STREAM frame
         }
 
-        // Substep 2-3.
-        let mut location = response
-            .actual_response()
-            .headers
-            .get(header::LOCATION)
-            .and_then(|v| {
-                HeaderValue::to_str(v)
-                    .map(|l| {
-                        ServoUrl::parse_with_base(response.actual_response().url(), l)
-                            .map_err(|err| err.to_string())
-                    })
-                    .ok()
-            });
-
-        // Substep 4.
-        if let Some(Ok(ref mut location)) = location {
-            if location.fragment().is_none() {
-                let current_url = request.current_url();
-                location.set_fragment(current_url.fragment());
-            }
-        }
-        response.actual_response_mut().location_url = location;
-
-        // Substep 5.
+        // Step 6.2. Switch on request’s redirect mode:
         response = match request.redirect_mode {
+            // Step 6.2."error".1. Set response to a network error.
             RedirectMode::Error => Response::network_error(NetworkError::RedirectError),
-            RedirectMode::Manual => response.to_filtered(ResponseType::OpaqueRedirect),
+            RedirectMode::Manual => {
+                // Step 6.2."manual".1. If request’s mode is "navigate", then set fetchParams’s controller’s
+                // next manual redirect steps to run HTTP-redirect fetch given fetchParams and response.
+                if request.mode == RequestMode::Navigate {
+                    // TODO: We don't implement Fetch controller. Instead, we update the location url
+                    // of the response here and don't call `http_redirect_fetch`. That's get called later.
+                    // Once we have a fetch controller here, we should update the code as specced.
+                    let location_url =
+                        location_url_for_response(&response, request.current_url().fragment());
+                    response.actual_response_mut().location_url = location_url;
+                    response
+                } else {
+                    // Step 6.2."manual".2. Otherwise, set response to an opaque-redirect filtered response whose internal response is internalResponse.
+                    response.to_filtered(ResponseType::OpaqueRedirect)
+                }
+            },
             RedirectMode::Follow => {
                 // set back to default
                 response.return_internal = true;
@@ -1086,12 +1079,58 @@ impl Drop for RedirectEndTimer {
     }
 }
 
+/// <https://fetch.spec.whatwg.org/#request-body-header-name>
+static REQUEST_BODY_HEADER_NAMES: &[HeaderName] = &[
+    CONTENT_ENCODING,
+    CONTENT_LANGUAGE,
+    CONTENT_LOCATION,
+    CONTENT_TYPE,
+];
+
+/// <https://fetch.spec.whatwg.org/#concept-response-location-url>
+fn location_url_for_response(
+    response: &Response,
+    request_fragment: Option<&str>,
+) -> Option<Result<ServoUrl, String>> {
+    // Step 1. If response’s status is not a redirect status, then return null.
+    assert!(
+        response
+            .actual_response()
+            .status
+            .try_code()
+            .is_some_and(is_redirect_status)
+    );
+    // Step 2. Let location be the result of extracting header list values given `Location` and response’s header list.
+    let mut location = response
+        .actual_response()
+        .headers
+        .get(header::LOCATION)
+        .and_then(|header_value| {
+            HeaderValue::to_str(header_value)
+                .map(|location_string| {
+                    // Step 3. If location is a header value, then set location to the result of parsing location with response’s URL.
+                    ServoUrl::parse_with_base(response.actual_response().url(), location_string)
+                        .map_err(|error| error.to_string())
+                })
+                .ok()
+        });
+
+    // Step 4. If location is a URL whose fragment is null, then set location’s fragment to requestFragment.
+    if let Some(Ok(ref mut location)) = location {
+        if location.fragment().is_none() {
+            location.set_fragment(request_fragment);
+        }
+    }
+    // Step 5. Return location.
+    location
+}
+
 /// [HTTP redirect fetch](https://fetch.spec.whatwg.org#http-redirect-fetch)
 #[async_recursion]
 pub async fn http_redirect_fetch(
     fetch_params: &mut FetchParams,
     cache: &mut CorsCache,
-    response: Response,
+    mut response: Response,
     cors_flag: bool,
     target: Target<'async_recursion>,
     done_chan: &mut DoneChannel,
@@ -1099,23 +1138,27 @@ pub async fn http_redirect_fetch(
 ) -> Response {
     let mut redirect_end_timer = RedirectEndTimer(Some(context.timing.clone()));
 
-    // Step 1: Let request be fetchParams’s request.
+    // Step 1. Let request be fetchParams’s request.
     let request = &mut fetch_params.request;
 
+    // Step 2. Let internalResponse be response, if response is not a filtered response; otherwise response’s internal response.
     assert!(response.return_internal);
 
-    let location_url = response.actual_response().location_url.clone();
+    // Step 3. Let locationURL be internalResponse’s location URL given request’s current URL’s fragment.
+    let location_url = location_url_for_response(&response, request.current_url().fragment());
+    response.actual_response_mut().location_url = location_url.clone();
+
     let location_url = match location_url {
-        // Step 2
+        // Step 4. If locationURL is null, then return response.
         None => return response,
-        // Step 3
+        // Step 5. If locationURL is failure, then return a network error.
         Some(Err(err)) => {
             return Response::network_error(NetworkError::ResourceLoadError(
                 "Location URL parse failure: ".to_owned() + &err,
             ));
         },
-        // Step 4
-        Some(Ok(ref url)) if !matches!(url.scheme(), "http" | "https") => {
+        // Step 6. If locationURL’s scheme is not an HTTP(S) scheme, then return a network error.
+        Some(Ok(url)) if !matches!(url.scheme(), "http" | "https") => {
             return Response::network_error(NetworkError::UnsupportedScheme);
         },
         Some(Ok(url)) => url,
@@ -1156,7 +1199,8 @@ pub async fn http_redirect_fetch(
     // Step 8: Increase request’s redirect count by 1.
     request.redirect_count += 1;
 
-    // Step 9
+    // Step 9. If request’s mode is "cors", locationURL includes credentials,
+    // and request’s origin is not same origin with locationURL’s origin, then return a network error.
     let same_origin = match request.origin {
         Origin::Origin(ref origin) => *origin == location_url.origin(),
         Origin::Client => panic!(
@@ -1171,12 +1215,11 @@ pub async fn http_redirect_fetch(
         return Response::network_error(NetworkError::CorsCredentials);
     }
 
-    // Step 9
     if cors_flag && location_url.origin() != request.current_url().origin() {
         request.origin = Origin::Origin(ImmutableOrigin::new_opaque());
     }
 
-    // Step 10
+    // Step 10. If request’s response tainting is "cors" and locationURL includes credentials, then return a network error.
     if cors_flag && has_credentials {
         return Response::network_error(NetworkError::CorsCredentials);
     }
@@ -1189,29 +1232,26 @@ pub async fn http_redirect_fetch(
         return Response::network_error(NetworkError::ConnectionFailure);
     }
 
-    // Step 12
+    // Step 12. If one of the following is true
     if response
         .actual_response()
         .status
         .try_code()
         .is_some_and(|code| {
+            // internalResponse’s status is 301 or 302 and request’s method is `POST`
             ((code == StatusCode::MOVED_PERMANENTLY || code == StatusCode::FOUND) &&
                 request.method == Method::POST) ||
+                // internalResponse’s status is 303 and request’s method is not `GET` or `HEAD`
                 (code == StatusCode::SEE_OTHER &&
                     request.method != Method::HEAD &&
                     request.method != Method::GET)
         })
     {
-        // Step 12.1
+        // Step 12.1. Set request’s method to `GET` and request’s body to null.
         request.method = Method::GET;
         request.body = None;
-        // Step 12.2
-        for name in &[
-            CONTENT_ENCODING,
-            CONTENT_LANGUAGE,
-            CONTENT_LOCATION,
-            CONTENT_TYPE,
-        ] {
+        // Step 12.2. For each headerName of request-body-header name, delete headerName from request’s header list.
+        for name in REQUEST_BODY_HEADER_NAMES {
             request.headers.remove(name);
         }
     }
@@ -1595,8 +1635,7 @@ async fn http_network_or_cache_fetch(
                 // since the network response will be replaced by the revalidated stored one.
                 *done_chan = None;
                 if let Some(guard) = cache_guard.try_as_mut() {
-                    response =
-                        refresh(http_request, forward_response.clone(), done_chan, guard).await;
+                    response = refresh(http_request, forward_response.clone(), done_chan, guard);
                 }
 
                 if let Some(response) = &mut response {
@@ -1614,7 +1653,7 @@ async fn http_network_or_cache_fetch(
                 if http_request.cache_mode != CacheMode::NoStore {
                     // Step 10.5.2 Store httpRequest and forwardResponse in httpCache, as per the
                     //             "Storing Responses in Caches" chapter of HTTP Caching.
-                    cache_guard.insert(http_request, forward_response).await;
+                    cache_guard.insert(http_request, forward_response);
                 }
             }
             false
@@ -1673,7 +1712,11 @@ async fn http_network_or_cache_fetch(
 
         // Step 14.3 If request’s use-URL-credentials flag is unset or isAuthenticationFetch is true, then:
         if !request.use_url_credentials || authentication_fetch_flag {
-            let Some(credentials) = context.state.request_authentication(request, &response) else {
+            let Some(credentials) = context
+                .state
+                .request_authentication(request, &response)
+                .await
+            else {
                 return response;
             };
 
@@ -1727,7 +1770,11 @@ async fn http_network_or_cache_fetch(
 
         // Step 15.4 Prompt the end user as appropriate in request’s window
         // window and store the result as a proxy-authentication entry.
-        let Some(credentials) = context.state.request_authentication(request, &response) else {
+        let Some(credentials) = context
+            .state
+            .request_authentication(request, &response)
+            .await
+        else {
             return response;
         };
 
@@ -2178,9 +2225,8 @@ async fn http_network_fetch(
     let res_body2 = res_body.clone();
 
     if let Some(ref sender) = devtools_sender {
-        let sender = sender.lock();
         if let Some(m) = msg {
-            send_request_to_devtools(m, &sender);
+            send_request_to_devtools(m, sender);
         }
     }
 
@@ -2198,14 +2244,14 @@ async fn http_network_fetch(
 
     spawn_task(
         res.into_body()
-            .map_err(|e| {
-                warn!("Error streaming response body: {:?}", e);
-            })
             .try_fold(res_body, move |res_body, chunk| {
                 if cancellation_listener.cancelled() {
                     *res_body.lock() = ResponseBody::Done(vec![]);
                     let _ = done_sender.send(Data::Cancelled);
-                    return future::ready(Err(()));
+                    return future::ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "Fetch aborted",
+                    )));
                 }
                 if let ResponseBody::Receiving(ref mut body) = *res_body.lock() {
                     let bytes = chunk;
@@ -2237,7 +2283,14 @@ async fn http_network_fetch(
                 let _ = done_sender2.send(Data::Done);
                 future::ready(Ok(()))
             })
-            .map_err(move |_| {
+            .map_err(move |error| {
+                if let std::io::ErrorKind::InvalidData = error.kind() {
+                    debug!("Content decompression error for {:?}", url2);
+                    let _ = done_sender3.send(Data::Error(NetworkError::DecompressionError));
+                    let mut body = res_body2.lock();
+
+                    *body = ResponseBody::Done(vec![]);
+                }
                 debug!("finished response for {:?}", url2);
                 let mut body = res_body2.lock();
                 let completed_body = match *body {
@@ -2516,9 +2569,8 @@ fn cors_check(request: &Request, response: &Response) -> Result<(), ()> {
     }
 
     // Step 4. If the result of byte-serializing a request origin with request is not origin, then return failure.
-    match request.origin {
-        Origin::Origin(ref o) if *o.ascii_serialization() == *origin => {},
-        _ => return Err(()),
+    if serialize_request_origin(request).to_string() != origin {
+        return Err(());
     }
 
     // Step 5. If request’s credentials mode is not "include", then return success.
@@ -2564,38 +2616,6 @@ fn is_redirect_status(status: StatusCode) -> bool {
     )
 }
 
-/// <https://fetch.spec.whatwg.org/#concept-request-tainted-origin>
-fn request_has_redirect_tainted_origin(request: &Request) -> bool {
-    // Step 1. Assert: request’s origin is not "client".
-    let Origin::Origin(request_origin) = &request.origin else {
-        panic!("origin cannot be \"client\" at this point in time");
-    };
-
-    // Step 2. Let lastURL be null.
-    let mut last_url = None;
-
-    // Step 3. For each url of request’s URL list:
-    for url in &request.url_list {
-        // Step 3.1 If lastURL is null, then set lastURL to url and continue.
-        let Some(last_url) = &mut last_url else {
-            last_url = Some(url);
-            continue;
-        };
-
-        // Step 3.2 If url’s origin is not same origin with lastURL’s origin and
-        //          request’s origin is not same origin with lastURL’s origin, then return true.
-        if url.origin() != last_url.origin() && *request_origin != last_url.origin() {
-            return true;
-        }
-
-        // Step 3.3 Set lastURL to url.
-        *last_url = url;
-    }
-
-    // Step 4. Return false.
-    false
-}
-
 /// <https://fetch.spec.whatwg.org/#serializing-a-request-origin>
 fn serialize_request_origin(request: &Request) -> headers::Origin {
     // Step 1. Assert: request’s origin is not "client".
@@ -2603,8 +2623,8 @@ fn serialize_request_origin(request: &Request) -> headers::Origin {
         panic!("origin cannot be \"client\" at this point in time");
     };
 
-    // Step 2. If request has a redirect-tainted origin, then return "null".
-    if request_has_redirect_tainted_origin(request) {
+    // Step 2. If request’s redirect-taint is not "same-origin", then return "null".
+    if request.redirect_taint_for_request() != RedirectTaint::SameOrigin {
         return headers::Origin::NULL;
     }
 

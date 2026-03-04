@@ -47,7 +47,7 @@ pub(crate) struct AudioContext {
 }
 
 impl AudioContext {
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     /// <https://webaudio.github.io/web-audio-api/#AudioContext-constructors>
     fn new_inherited(
         options: &AudioContextOptions,
@@ -82,7 +82,7 @@ impl AudioContext {
         })
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     fn new(
         window: &Window,
         proto: Option<HandleObject>,
@@ -159,7 +159,7 @@ impl AudioContextMethods<crate::DomTypeHolder> for AudioContext {
         // Steps 4 and 5.
         let trusted_promise = TrustedPromise::new(promise.clone());
         match self.context.audio_context_impl().lock().unwrap().suspend() {
-            Ok(_) => {
+            Some(_) => {
                 let base_context = Trusted::new(&self.context);
                 let context = Trusted::new(self);
                 self.global().task_manager().dom_manipulation_task_source().queue(
@@ -178,7 +178,7 @@ impl AudioContextMethods<crate::DomTypeHolder> for AudioContext {
                     })
                 );
             },
-            Err(_) => {
+            None => {
                 // The spec does not define the error case and `suspend` should
                 // never fail, but we handle the case here for completion.
                 self.global()
@@ -186,7 +186,7 @@ impl AudioContextMethods<crate::DomTypeHolder> for AudioContext {
                     .dom_manipulation_task_source()
                     .queue(task!(suspend_error: move || {
                         let promise = trusted_promise.root();
-                        promise.reject_error(Error::Type("Something went wrong".to_owned()), CanGc::note());
+                        promise.reject_error(Error::Type(c"Something went wrong".to_owned()), CanGc::note());
                     }));
             },
         };
@@ -215,7 +215,7 @@ impl AudioContextMethods<crate::DomTypeHolder> for AudioContext {
         // Steps 4 and 5.
         let trusted_promise = TrustedPromise::new(promise.clone());
         match self.context.audio_context_impl().lock().unwrap().close() {
-            Ok(_) => {
+            Some(_) => {
                 let base_context = Trusted::new(&self.context);
                 let context = Trusted::new(self);
                 self.global().task_manager().dom_manipulation_task_source().queue(
@@ -234,7 +234,7 @@ impl AudioContextMethods<crate::DomTypeHolder> for AudioContext {
                     })
                 );
             },
-            Err(_) => {
+            None => {
                 // The spec does not define the error case and `suspend` should
                 // never fail, but we handle the case here for completion.
                 self.global()
@@ -242,7 +242,7 @@ impl AudioContextMethods<crate::DomTypeHolder> for AudioContext {
                     .dom_manipulation_task_source()
                     .queue(task!(suspend_error: move || {
                         let promise = trusted_promise.root();
-                        promise.reject_error(Error::Type("Something went wrong".to_owned()), CanGc::note());
+                        promise.reject_error(Error::Type(c"Something went wrong".to_owned()), CanGc::note());
                     }));
             },
         };
@@ -254,12 +254,12 @@ impl AudioContextMethods<crate::DomTypeHolder> for AudioContext {
     /// <https://webaudio.github.io/web-audio-api/#dom-audiocontext-createmediaelementsource>
     fn CreateMediaElementSource(
         &self,
+        cx: &mut js::context::JSContext,
         media_element: &HTMLMediaElement,
-        can_gc: CanGc,
     ) -> Fallible<DomRoot<MediaElementAudioSourceNode>> {
         let global = self.global();
         let window = global.as_window();
-        MediaElementAudioSourceNode::new(window, self, media_element, can_gc)
+        MediaElementAudioSourceNode::new(window, self, media_element, cx)
     }
 
     /// <https://webaudio.github.io/web-audio-api/#dom-audiocontext-createmediastreamsource>

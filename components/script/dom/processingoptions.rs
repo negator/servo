@@ -25,13 +25,11 @@ use nom_rfc8288::complete::link_lenient as parse_link_header;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use strum::IntoStaticStr;
 
-use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::csp::{GlobalCspReporting, Violation};
 use crate::dom::document::Document;
-use crate::dom::element::Element;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::medialist::MediaList;
 use crate::dom::node::NodeTraits;
@@ -486,14 +484,16 @@ impl FetchResponseListener for LinkFetchContext {
     /// and step 3.1 of <https://html.spec.whatwg.org/multipage/#link-type-preload:fetch-and-process-the-linked-resource-2>
     fn process_response_eof(
         mut self,
+        cx: &mut js::context::JSContext,
         _: RequestId,
-        response_result: Result<ResourceFetchTiming, NetworkError>,
+        response_result: Result<(), NetworkError>,
+        timing: ResourceFetchTiming,
     ) {
         // Steps for https://html.spec.whatwg.org/multipage/#preload
         if let LinkFetchContextType::Preload(key) = &self.type_ {
-            let response = if let Ok(resource_timing) = &response_result {
+            let response = if response_result.is_ok() {
                 // Step 11.1. If bodyBytes is a byte sequence, then set response's body to bodyBytes as a body.
-                let response = Response::new(self.url.clone(), resource_timing.clone());
+                let response = Response::new(self.url.clone(), timing.clone());
                 *response.body.lock() = ResponseBody::Done(std::mem::take(&mut self.response_body));
                 response
             } else {
@@ -518,9 +518,7 @@ impl FetchResponseListener for LinkFetchContext {
             );
         }
 
-        if let Ok(ref response) = response_result {
-            submit_timing(&self, response, CanGc::note());
-        }
+        submit_timing(&self, &response_result, &timing, CanGc::from_cx(cx));
 
         // Step 11.6. If processResponse is given, then call processResponse with response.
         //
@@ -531,18 +529,13 @@ impl FetchResponseListener for LinkFetchContext {
         // Part of Prefetch
         if let Some(link) = self.link.as_ref() {
             link.root()
-                .fire_event_after_response(response_result, CanGc::note());
+                .fire_event_after_response(response_result, CanGc::from_cx(cx));
         }
     }
 
     fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<Violation>) {
         let global = &self.resource_timing_global();
-        let source_position = self.link.as_ref().map(|link| {
-            let link = link.root();
-            link.upcast::<Element>()
-                .compute_source_position(link.line_number())
-        });
-        global.report_csp_violations(violations, None, source_position);
+        global.report_csp_violations(violations, None, None);
     }
 }
 

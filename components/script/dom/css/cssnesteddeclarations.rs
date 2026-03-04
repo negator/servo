@@ -22,11 +22,11 @@ use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct CSSNestedDeclarations {
-    cssrule: CSSRule,
+    css_rule: CSSRule,
     #[ignore_malloc_size_of = "Stylo"]
     #[no_trace]
     nesteddeclarationsrule: RefCell<Arc<Locked<NestedDeclarationsRule>>>,
-    style_decl: MutNullableDom<CSSStyleDeclaration>,
+    style_declaration: MutNullableDom<CSSStyleDeclaration>,
 }
 
 impl CSSNestedDeclarations {
@@ -35,13 +35,12 @@ impl CSSNestedDeclarations {
         nesteddeclarationsrule: Arc<Locked<NestedDeclarationsRule>>,
     ) -> Self {
         Self {
-            cssrule: CSSRule::new_inherited(parent_stylesheet),
+            css_rule: CSSRule::new_inherited(parent_stylesheet),
             nesteddeclarationsrule: RefCell::new(nesteddeclarationsrule),
-            style_decl: Default::default(),
+            style_declaration: Default::default(),
         }
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub(crate) fn new(
         window: &Window,
         parent_stylesheet: &CSSStyleSheet,
@@ -63,7 +62,7 @@ impl CSSNestedDeclarations {
         nesteddeclarationsrule: Arc<Locked<NestedDeclarationsRule>>,
         guard: &SharedRwLockReadGuard,
     ) {
-        if let Some(ref style_decl) = self.style_decl.get() {
+        if let Some(ref style_decl) = self.style_declaration.get() {
             style_decl
                 .update_property_declaration_block(&nesteddeclarationsrule.read_with(guard).block);
         }
@@ -77,7 +76,7 @@ impl SpecificCSSRule for CSSNestedDeclarations {
     }
 
     fn get_css(&self) -> DOMString {
-        let guard = self.cssrule.shared_lock().read();
+        let guard = self.css_rule.shared_lock().read();
         self.nesteddeclarationsrule
             .borrow()
             .read_with(&guard)
@@ -89,8 +88,8 @@ impl SpecificCSSRule for CSSNestedDeclarations {
 impl CSSNestedDeclarationsMethods<crate::DomTypeHolder> for CSSNestedDeclarations {
     /// <https://drafts.csswg.org/css-nesting/#dom-cssnesteddeclarations-style>
     fn Style(&self, can_gc: CanGc) -> DomRoot<CSSStyleDeclaration> {
-        self.style_decl.or_init(|| {
-            let guard = self.cssrule.shared_lock().read();
+        self.style_declaration.or_init(|| {
+            let guard = self.css_rule.shared_lock().read();
             CSSStyleDeclaration::new(
                 self.global().as_window(),
                 CSSStyleOwner::CSSRule(

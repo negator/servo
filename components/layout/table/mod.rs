@@ -84,15 +84,18 @@ use style::properties::style_structs::Font;
 use style::selector_parser::PseudoElement;
 
 use super::flow::BlockFormattingContext;
-use crate::SharedStyle;
-use crate::cell::ArcRefCell;
+use crate::cell::{ArcRefCell, WeakRefCell};
+use crate::dom::WeakLayoutBox;
 use crate::flow::BlockContainer;
-use crate::formatting_contexts::IndependentFormattingContext;
+use crate::formatting_contexts::{
+    IndependentFormattingContext, IndependentFormattingContextContents,
+};
 use crate::fragment_tree::BaseFragmentInfo;
 use crate::geom::PhysicalVec;
 use crate::layout_box_base::LayoutBoxBase;
 use crate::style_ext::BorderStyleColor;
 use crate::table::layout::TableLayout;
+use crate::{PropagatedBoxTreeData, SharedStyle};
 
 pub type TableSize = Size2D<usize, UnknownUnit>;
 
@@ -213,11 +216,9 @@ pub type TableSlotOffset = Vector2D<usize, UnknownUnit>;
 
 #[derive(Debug, MallocSizeOf)]
 pub struct TableSlotCell {
-    /// The [`LayoutBoxBase`] of this table cell.
-    base: LayoutBoxBase,
-
-    /// The contents of this cell, with its own layout.
-    contents: BlockFormattingContext,
+    /// The independent formatting context that the cell establishes for its contents.
+    /// Currently, this should always be a block formatting context.
+    pub(crate) context: IndependentFormattingContext,
 
     /// Number of columns that the cell is to span. Must be greater than zero.
     colspan: usize,
@@ -229,15 +230,18 @@ pub struct TableSlotCell {
 
 impl TableSlotCell {
     pub fn mock_for_testing(id: usize, colspan: usize, rowspan: usize) -> Self {
+        let base = LayoutBoxBase::new(
+            BaseFragmentInfo::new_for_testing(id),
+            ComputedValues::initial_values_with_font_override(Font::initial_values()).to_arc(),
+        );
+        let contents = IndependentFormattingContextContents::Flow(BlockFormattingContext {
+            contents: BlockContainer::BlockLevelBoxes(Vec::new()),
+            contains_floats: false,
+        });
+        let propagated_data =
+            PropagatedBoxTreeData::default().disallowing_percentage_table_columns();
         Self {
-            base: LayoutBoxBase::new(
-                BaseFragmentInfo::new_for_testing(id),
-                ComputedValues::initial_values_with_font_override(Font::initial_values()).to_arc(),
-            ),
-            contents: BlockFormattingContext {
-                contents: BlockContainer::BlockLevelBoxes(Vec::new()),
-                contains_floats: false,
-            },
+            context: IndependentFormattingContext::new(base, contents, propagated_data),
             colspan,
             rowspan,
         }
@@ -245,11 +249,11 @@ impl TableSlotCell {
 
     /// Get the node id of this cell's [`BaseFragmentInfo`]. This is used for unit tests.
     pub fn node_id(&self) -> usize {
-        self.base.base_fragment_info.tag.map_or(0, |tag| tag.node.0)
-    }
-
-    fn repair_style(&mut self, new_style: &Arc<ComputedValues>) {
-        self.base.repair_style(new_style);
+        self.context
+            .base
+            .base_fragment_info
+            .tag
+            .map_or(0, |tag| tag.node.0)
     }
 }
 
@@ -359,7 +363,7 @@ impl TableTrackGroup {
 #[derive(Debug, MallocSizeOf)]
 pub struct TableCaption {
     /// The contents of this cell, with its own layout.
-    context: IndependentFormattingContext,
+    pub(crate) context: IndependentFormattingContext,
 }
 
 /// A calculated collapsed border.
@@ -386,7 +390,7 @@ pub(crate) struct TableLayoutStyle<'a> {
 /// Table parts that are stored in the DOM. This is used in order to map from
 /// the DOM to the box tree and will eventually be important for incremental
 /// layout.
-#[derive(MallocSizeOf)]
+#[derive(Debug, MallocSizeOf)]
 pub(crate) enum TableLevelBox {
     Caption(ArcRefCell<TableCaption>),
     Cell(ArcRefCell<TableSlotCell>),
@@ -398,7 +402,7 @@ impl TableLevelBox {
     pub(crate) fn with_base<T>(&self, callback: impl FnOnce(&LayoutBoxBase) -> T) -> T {
         match self {
             TableLevelBox::Caption(caption) => callback(&caption.borrow().context.base),
-            TableLevelBox::Cell(cell) => callback(&cell.borrow().base),
+            TableLevelBox::Cell(cell) => callback(&cell.borrow().context.base),
             TableLevelBox::TrackGroup(track_group) => callback(&track_group.borrow().base),
             TableLevelBox::Track(track) => callback(&track.borrow().base),
         }
@@ -407,7 +411,7 @@ impl TableLevelBox {
     pub(crate) fn with_base_mut<T>(&mut self, callback: impl FnOnce(&mut LayoutBoxBase) -> T) -> T {
         match self {
             TableLevelBox::Caption(caption) => callback(&mut caption.borrow_mut().context.base),
-            TableLevelBox::Cell(cell) => callback(&mut cell.borrow_mut().base),
+            TableLevelBox::Cell(cell) => callback(&mut cell.borrow_mut().context.base),
             TableLevelBox::TrackGroup(track_group) => callback(&mut track_group.borrow_mut().base),
             TableLevelBox::Track(track) => callback(&mut track.borrow_mut().base),
         }
@@ -424,11 +428,53 @@ impl TableLevelBox {
                 .borrow_mut()
                 .context
                 .repair_style(context, node, new_style),
-            TableLevelBox::Cell(cell) => cell.borrow_mut().repair_style(new_style),
+            TableLevelBox::Cell(cell) => cell
+                .borrow_mut()
+                .context
+                .repair_style(context, node, new_style),
             TableLevelBox::TrackGroup(track_group) => {
                 track_group.borrow_mut().repair_style(new_style);
             },
             TableLevelBox::Track(track) => track.borrow_mut().repair_style(new_style),
         }
+    }
+
+    pub(crate) fn attached_to_tree(&self, layout_box: WeakLayoutBox) {
+        match self {
+            Self::Caption(caption) => caption.borrow().context.attached_to_tree(layout_box),
+            Self::Cell(cell) => cell.borrow().context.attached_to_tree(layout_box),
+            Self::TrackGroup(_) | Self::Track(_) => {
+                // The parentage of tracks within a track group, and cells within a row, is handled
+                // when the entire table is attached to the tree.
+            },
+        }
+    }
+
+    pub(crate) fn downgrade(&self) -> WeakTableLevelBox {
+        match self {
+            Self::Caption(caption) => WeakTableLevelBox::Caption(caption.downgrade()),
+            Self::Cell(cell) => WeakTableLevelBox::Cell(cell.downgrade()),
+            Self::TrackGroup(track_group) => WeakTableLevelBox::TrackGroup(track_group.downgrade()),
+            Self::Track(track) => WeakTableLevelBox::Track(track.downgrade()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, MallocSizeOf)]
+pub(crate) enum WeakTableLevelBox {
+    Caption(WeakRefCell<TableCaption>),
+    Cell(WeakRefCell<TableSlotCell>),
+    TrackGroup(WeakRefCell<TableTrackGroup>),
+    Track(WeakRefCell<TableTrack>),
+}
+
+impl WeakTableLevelBox {
+    pub(crate) fn upgrade(&self) -> Option<TableLevelBox> {
+        Some(match self {
+            Self::Caption(caption) => TableLevelBox::Caption(caption.upgrade()?),
+            Self::Cell(cell) => TableLevelBox::Cell(cell.upgrade()?),
+            Self::TrackGroup(track_group) => TableLevelBox::TrackGroup(track_group.upgrade()?),
+            Self::Track(track) => TableLevelBox::Track(track.upgrade()?),
+        })
     }
 }

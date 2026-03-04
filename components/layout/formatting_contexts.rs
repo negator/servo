@@ -13,6 +13,7 @@ use style::properties::ComputedValues;
 use style::selector_parser::PseudoElement;
 
 use crate::context::LayoutContext;
+use crate::dom::WeakLayoutBox;
 use crate::dom_traversal::{Contents, NodeAndStyleInfo, NonReplacedContents};
 use crate::flexbox::FlexContainer;
 use crate::flow::BlockFormattingContext;
@@ -25,11 +26,12 @@ use crate::replaced::ReplacedContents;
 use crate::sizing::{
     self, ComputeInlineContentSizes, ContentSizes, InlineContentSizesResult, LazySize,
 };
-use crate::style_ext::{AspectRatio, DisplayInside, LayoutStyle};
+use crate::style_ext::{AspectRatio, Display, DisplayInside, LayoutStyle};
 use crate::table::Table;
 use crate::taffy::TaffyContainer;
 use crate::{
-    ConstraintSpace, ContainingBlock, IndefiniteContainingBlock, LogicalVec2, PropagatedBoxTreeData,
+    ArcRefCell, ConstraintSpace, ContainingBlock, IndefiniteContainingBlock, LogicalVec2,
+    PropagatedBoxTreeData,
 };
 
 /// <https://drafts.csswg.org/css-display/#independent-formatting-context>
@@ -39,12 +41,18 @@ pub(crate) struct IndependentFormattingContext {
     // Private so that code outside of this module cannot match variants.
     // It should go through methods instead.
     contents: IndependentFormattingContextContents,
+    /// Data that was originally propagated down to this [`IndependentFormattingContext`]
+    /// during creation. This is used during incremental layout.
+    pub propagated_data: PropagatedBoxTreeData,
 }
 
 #[derive(Debug, MallocSizeOf)]
 pub(crate) enum IndependentFormattingContextContents {
     // Additionally to the replaced contents, replaced boxes may have an inner widget.
-    Replaced(ReplacedContents, Option<BlockFormattingContext>),
+    Replaced(
+        ReplacedContents,
+        Option<ArcRefCell<IndependentFormattingContext>>,
+    ),
     Flow(BlockFormattingContext),
     Flex(FlexContainer),
     Grid(TaffyContainer),
@@ -70,11 +78,45 @@ impl Baselines {
 }
 
 impl IndependentFormattingContext {
-    pub(crate) fn new(base: LayoutBoxBase, contents: IndependentFormattingContextContents) -> Self {
-        Self { base, contents }
+    pub(crate) fn new(
+        base: LayoutBoxBase,
+        contents: IndependentFormattingContextContents,
+        propagated_data: PropagatedBoxTreeData,
+    ) -> Self {
+        Self {
+            base,
+            contents,
+            propagated_data,
+        }
     }
 
-    pub fn construct(
+    pub(crate) fn rebuild(
+        &mut self,
+        layout_context: &LayoutContext,
+        node_and_style_info: &NodeAndStyleInfo,
+    ) {
+        let contents = Contents::for_element(node_and_style_info.node, layout_context);
+        let display = match Display::from(node_and_style_info.style.get_box().display) {
+            Display::None | Display::Contents => {
+                unreachable!("Should never try to rebuild IndependentFormattingContext with no box")
+            },
+            Display::GeneratingBox(display) => display.used_value_for_contents(&contents),
+        };
+        self.contents = Self::construct_contents(
+            layout_context,
+            node_and_style_info,
+            &mut self.base.base_fragment_info,
+            display.display_inside(),
+            contents,
+            self.propagated_data,
+        );
+
+        self.base.clear_fragments_and_fragment_cache();
+        *self.base.cached_inline_content_size.borrow_mut() = None;
+        self.base.repair_style(&node_and_style_info.style);
+    }
+
+    pub(crate) fn construct(
         context: &LayoutContext,
         node_and_style_info: &NodeAndStyleInfo,
         display_inside: DisplayInside,
@@ -82,14 +124,36 @@ impl IndependentFormattingContext {
         propagated_data: PropagatedBoxTreeData,
     ) -> Self {
         let mut base_fragment_info: BaseFragmentInfo = node_and_style_info.into();
+        let contents = Self::construct_contents(
+            context,
+            node_and_style_info,
+            &mut base_fragment_info,
+            display_inside,
+            contents,
+            propagated_data,
+        );
+        Self {
+            base: LayoutBoxBase::new(base_fragment_info, node_and_style_info.style.clone()),
+            contents,
+            propagated_data,
+        }
+    }
 
+    fn construct_contents(
+        context: &LayoutContext,
+        node_and_style_info: &NodeAndStyleInfo,
+        base_fragment_info: &mut BaseFragmentInfo,
+        display_inside: DisplayInside,
+        contents: Contents,
+        propagated_data: PropagatedBoxTreeData,
+    ) -> IndependentFormattingContextContents {
         let non_replaced_contents = match contents {
             Contents::Replaced(contents) => {
                 base_fragment_info.flags.insert(FragmentFlags::IS_REPLACED);
                 // Some replaced elements can have inner widgets, e.g. `<video controls>`.
-                let widget = node_and_style_info
-                    .node
-                    .as_element()
+                let widget = Some(node_and_style_info.node)
+                    .filter(|node| node.pseudo_element_chain().is_empty())
+                    .and_then(|node| node.as_element())
                     .and_then(|element| element.shadow_root())
                     .is_some_and(|shadow_root| shadow_root.is_ua_widget())
                     .then(|| {
@@ -97,18 +161,24 @@ impl IndependentFormattingContext {
                             .with_pseudo_element(context, PseudoElement::ServoAnonymousBox)
                             .expect("Should always be able to construct info for anonymous boxes.");
                         // Use a block formatting context for the widget, since the display inside is always flow.
-                        BlockFormattingContext::construct(
-                            context,
-                            &widget_info,
-                            NonReplacedContents::OfElement,
+                        let widget_contents = IndependentFormattingContextContents::Flow(
+                            BlockFormattingContext::construct(
+                                context,
+                                &widget_info,
+                                NonReplacedContents::OfElement,
+                                propagated_data,
+                                false, /* is_list_item */
+                            ),
+                        );
+                        let widget_base =
+                            LayoutBoxBase::new((&widget_info).into(), widget_info.style);
+                        ArcRefCell::new(IndependentFormattingContext::new(
+                            widget_base,
+                            widget_contents,
                             propagated_data,
-                            false, /* is_list_item */
-                        )
+                        ))
                     });
-                return Self {
-                    base: LayoutBoxBase::new(base_fragment_info, node_and_style_info.style.clone()),
-                    contents: IndependentFormattingContextContents::Replaced(contents, widget),
-                };
+                return IndependentFormattingContextContents::Replaced(contents, widget);
             },
             Contents::Widget(non_replaced_contents) => {
                 base_fragment_info.flags.insert(FragmentFlags::IS_WIDGET);
@@ -116,7 +186,8 @@ impl IndependentFormattingContext {
             },
             Contents::NonReplaced(non_replaced_contents) => non_replaced_contents,
         };
-        let contents = match display_inside {
+
+        match display_inside {
             DisplayInside::Flow { is_list_item } | DisplayInside::FlowRoot { is_list_item } => {
                 IndependentFormattingContextContents::Flow(BlockFormattingContext::construct(
                     context,
@@ -160,10 +231,6 @@ impl IndependentFormattingContext {
                     propagated_data,
                 ))
             },
-        };
-        Self {
-            base: LayoutBoxBase::new(base_fragment_info, node_and_style_info.style.clone()),
-            contents,
         }
     }
 
@@ -207,8 +274,14 @@ impl IndependentFormattingContext {
                 // For replaced elements with no ratio, the returned value doesn't matter.
                 let ratio = preferred_aspect_ratio?;
                 let writing_mode = self.style().writing_mode;
-                let inline_size = contents.fallback_inline_size(writing_mode);
-                let block_size = ratio.compute_dependent_size(Direction::Block, inline_size);
+                let natural_sizes = contents.logical_natural_sizes(writing_mode);
+                let block_size = match (natural_sizes.block, natural_sizes.inline) {
+                    (Some(block_size), None) => block_size,
+                    _ => {
+                        let inline_size = contents.fallback_inline_size(writing_mode);
+                        ratio.compute_dependent_size(Direction::Block, inline_size)
+                    },
+                };
                 Some(block_size.into())
             },
             _ => None,
@@ -246,11 +319,14 @@ impl IndependentFormattingContext {
         match &mut self.contents {
             IndependentFormattingContextContents::Replaced(_, widget) => {
                 if let Some(widget) = widget {
-                    widget.repair_style(node, new_style);
+                    let node = node
+                        .with_pseudo(PseudoElement::ServoAnonymousBox)
+                        .expect("Should always be able to construct info for anonymous boxes.");
+                    widget.borrow_mut().repair_style(context, &node, new_style);
                 }
             },
             IndependentFormattingContextContents::Flow(block_formatting_context) => {
-                block_formatting_context.repair_style(node, new_style);
+                block_formatting_context.repair_style(context, node, new_style);
             },
             IndependentFormattingContextContents::Flex(flex_container) => {
                 flex_container.repair_style(new_style)
@@ -304,10 +380,13 @@ impl IndependentFormattingContext {
                     lazy_block_size,
                 );
                 if let Some(widget) = widget {
-                    let mut widget_layout = widget.layout(
+                    let mut widget_layout = widget.borrow().layout(
                         layout_context,
                         positioning_context,
                         containing_block_for_children,
+                        containing_block_for_children,
+                        None,
+                        &LazySize::intrinsic(),
                     );
                     replaced_layout
                         .fragments
@@ -415,6 +494,28 @@ impl IndependentFormattingContext {
             },
             // TODO: support preferred aspect ratios on non-replaced boxes.
             _ => None,
+        }
+    }
+
+    pub(crate) fn attached_to_tree(&self, layout_box: WeakLayoutBox) {
+        match &self.contents {
+            IndependentFormattingContextContents::Replaced(_, widget) => {
+                if let Some(widget) = widget {
+                    widget.borrow_mut().base.parent_box.replace(layout_box);
+                }
+            },
+            IndependentFormattingContextContents::Flow(contents) => {
+                contents.attached_to_tree(layout_box)
+            },
+            IndependentFormattingContextContents::Flex(contents) => {
+                contents.attached_to_tree(layout_box)
+            },
+            IndependentFormattingContextContents::Grid(contents) => {
+                contents.attached_to_tree(layout_box)
+            },
+            IndependentFormattingContextContents::Table(contents) => {
+                contents.attached_to_tree(layout_box)
+            },
         }
     }
 }

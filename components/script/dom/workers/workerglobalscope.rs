@@ -19,7 +19,6 @@ use dom_struct::dom_struct;
 use encoding_rs::UTF_8;
 use fonts::FontContext;
 use headers::{HeaderMapExt, ReferrerPolicy as ReferrerPolicyHeader};
-use js::jsapi::JS_AddInterruptCallback;
 use js::realm::CurrentRealm;
 use js::rust::{HandleValue, MutableHandleValue, ParentRuntime};
 use mime::Mime;
@@ -60,7 +59,8 @@ use crate::dom::csp::{GlobalCspReporting, Violation, parse_csp_list_from_metadat
 use crate::dom::dedicatedworkerglobalscope::{
     AutoWorkerReset, DedicatedWorkerGlobalScope, interrupt_callback,
 };
-use crate::dom::globalscope::{ClassicScript, ErrorReporting, GlobalScope, RethrowErrors};
+use crate::dom::global_scope_script_execution::{ClassicScript, ErrorReporting, RethrowErrors};
+use crate::dom::globalscope::GlobalScope;
 use crate::dom::htmlscriptelement::SCRIPT_JS_MIMES;
 use crate::dom::idbfactory::IDBFactory;
 use crate::dom::performance::performance::Performance;
@@ -81,7 +81,7 @@ use crate::fetch::{CspViolationsProcessor, Fetch, RequestWithGlobalScope, load_w
 use crate::messaging::{CommonScriptMsg, ScriptEventLoopReceiver, ScriptEventLoopSender};
 use crate::microtask::{Microtask, MicrotaskQueue, UserMicrotask};
 use crate::network_listener::{FetchResponseListener, ResourceTimingListener, submit_timing};
-use crate::realms::{InRealm, enter_realm};
+use crate::realms::{InRealm, enter_auto_realm};
 use crate::script_module::ScriptFetchOptions;
 use crate::script_runtime::{CanGc, IntroductionType, JSContext, JSContextHelper, Runtime};
 use crate::task::TaskCanceller;
@@ -158,8 +158,10 @@ impl FetchResponseListener for ScriptFetchContext {
 
     fn process_response_eof(
         mut self,
+        cx: &mut js::context::JSContext,
         _request_id: RequestId,
-        response: Result<ResourceFetchTiming, NetworkError>,
+        response: Result<(), NetworkError>,
+        timing: ResourceFetchTiming,
     ) {
         let scope = self.scope.root();
 
@@ -169,7 +171,7 @@ impl FetchResponseListener for ScriptFetchContext {
             .is_err() ||
             self.response.is_none()
         {
-            scope.on_complete(None, self.worker.clone(), CanGc::note());
+            scope.on_complete(None, self.worker.clone(), cx);
             return;
         }
         let metadata = self.response.take().unwrap();
@@ -202,7 +204,7 @@ impl FetchResponseListener for ScriptFetchContext {
         // Step 2 If any of the following are true: bodyBytes is null or failure; or response's status is not an ok status,
         if !metadata.status.is_success() {
             // then run onComplete given null, and abort these steps.
-            scope.on_complete(None, self.worker.clone(), CanGc::note());
+            scope.on_complete(None, self.worker.clone(), cx);
             return;
         }
 
@@ -217,12 +219,12 @@ impl FetchResponseListener for ScriptFetchContext {
 
         if is_http_scheme && not_a_javascript_mime_type {
             // then run onComplete given null, and abort these steps.
-            scope.on_complete(None, self.worker.clone(), CanGc::note());
+            scope.on_complete(None, self.worker.clone(), cx);
             return;
         }
 
         // Step 4 Let sourceText be the result of UTF-8 decoding bodyBytes.
-        let (source, _, _) = UTF_8.decode(&self.body_bytes);
+        let (source, _) = UTF_8.decode_with_bom_removal(&self.body_bytes);
 
         // Step 5 Let script be the result of creating a classic script using
         // sourceText, settingsObject, response's URL, and the default script fetch options.
@@ -237,11 +239,9 @@ impl FetchResponseListener for ScriptFetchContext {
         );
 
         // Step 6 Run onComplete given script.
-        scope.on_complete(Some(script), self.worker.clone(), CanGc::note());
+        scope.on_complete(Some(script), self.worker.clone(), cx);
 
-        if let Ok(response) = response {
-            submit_timing(&self, &response, CanGc::note());
-        }
+        submit_timing(&self, &response, &timing, CanGc::from_cx(cx));
     }
 
     fn process_csp_violations(
@@ -308,7 +308,6 @@ pub(crate) struct WorkerGlobalScope {
     #[no_trace]
     navigation_start: CrossProcessInstant,
     performance: MutNullableDom<Performance>,
-    indexeddb: MutNullableDom<IDBFactory>,
     trusted_types: MutNullableDom<TrustedTypePolicyFactory>,
 
     /// A [`TimerScheduler`] used to schedule timers for this [`WorkerGlobalScope`].
@@ -386,7 +385,6 @@ impl WorkerGlobalScope {
             _devtools_sender: init.from_devtools_sender,
             navigation_start: CrossProcessInstant::now(),
             performance: Default::default(),
-            indexeddb: Default::default(),
             timer_scheduler: RefCell::default(),
             insecure_requests_policy,
             trusted_types: Default::default(),
@@ -401,14 +399,13 @@ impl WorkerGlobalScope {
     }
 
     /// Perform a microtask checkpoint.
-    pub(crate) fn perform_a_microtask_checkpoint(&self, can_gc: CanGc) {
+    pub(crate) fn perform_a_microtask_checkpoint(&self, cx: &mut js::context::JSContext) {
         // Only perform the checkpoint if we're not shutting down.
         if !self.is_closing() {
             self.microtask_queue.checkpoint(
-                GlobalScope::get_cx(),
+                cx,
                 |_| Some(DomRoot::from_ref(&self.globalscope)),
                 vec![DomRoot::from_ref(&self.globalscope)],
-                can_gc,
             );
         }
     }
@@ -586,7 +583,7 @@ impl WorkerGlobalScope {
         &self,
         script: Option<ClassicScript>,
         worker: TrustedWorkerAddress,
-        can_gc: CanGc,
+        cx: &mut js::context::JSContext,
     ) {
         let dedicated_worker_scope = self
             .downcast::<DedicatedWorkerGlobalScope>()
@@ -608,7 +605,7 @@ impl WorkerGlobalScope {
 
         unsafe {
             // Handle interrupt requests
-            JS_AddInterruptCallback(*self.get_cx(), Some(interrupt_callback));
+            js::rust::wrappers2::JS_AddInterruptCallback(cx, Some(interrupt_callback));
         }
 
         if self.is_closing() {
@@ -617,17 +614,16 @@ impl WorkerGlobalScope {
 
         {
             let _ar = AutoWorkerReset::new(dedicated_worker_scope, worker);
-            let realm = enter_realm(self);
-            define_all_exposed_interfaces(
-                dedicated_worker_scope.upcast(),
-                InRealm::entered(&realm),
-                can_gc,
-            );
+            let mut realm = enter_auto_realm(cx, self);
+            let mut realm = realm.current_realm();
+            define_all_exposed_interfaces(&mut realm, dedicated_worker_scope.upcast());
             self.execution_ready.store(true, Ordering::Relaxed);
-            _ = self
-                .globalscope
-                .run_a_classic_script(script, RethrowErrors::No, can_gc);
-            dedicated_worker_scope.fire_queued_messages(can_gc);
+            _ = self.globalscope.run_a_classic_script(
+                script,
+                RethrowErrors::No,
+                CanGc::from_cx(&mut realm),
+            );
+            dedicated_worker_scope.fire_queued_messages(CanGc::from_cx(&mut realm));
         }
     }
 }
@@ -640,10 +636,7 @@ impl WorkerGlobalScopeMethods<crate::DomTypeHolder> for WorkerGlobalScope {
 
     /// <https://w3c.github.io/IndexedDB/#factory-interface>
     fn IndexedDB(&self) -> DomRoot<IDBFactory> {
-        self.indexeddb.or_init(|| {
-            let global_scope = self.upcast::<GlobalScope>();
-            IDBFactory::new(global_scope, CanGc::note())
-        })
+        self.upcast::<GlobalScope>().get_indexeddb()
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-workerglobalscope-location>
@@ -655,14 +648,14 @@ impl WorkerGlobalScopeMethods<crate::DomTypeHolder> for WorkerGlobalScope {
     /// <https://html.spec.whatwg.org/multipage/#dom-workerglobalscope-importscripts>
     fn ImportScripts(
         &self,
+        cx: &mut js::context::JSContext,
         url_strings: Vec<TrustedScriptURLOrUSVString>,
-        can_gc: CanGc,
     ) -> ErrorResult {
         // https://html.spec.whatwg.org/multipage/#import-scripts-into-worker-global-scope
         // Step 1: If worker global scope's type is "module", throw a TypeError exception.
         if self.worker_type == WorkerType::Module {
             return Err(Error::Type(
-                "importScripts() is not allowed in module workers".to_string(),
+                c"importScripts() is not allowed in module workers".to_owned(),
             ));
         }
 
@@ -678,7 +671,7 @@ impl WorkerGlobalScopeMethods<crate::DomTypeHolder> for WorkerGlobalScope {
                 url,
                 "WorkerGlobalScope",
                 "importScripts",
-                can_gc,
+                CanGc::from_cx(cx),
             )?;
             let url = self.worker_url.borrow().join(&url.str());
             match url {
@@ -708,7 +701,7 @@ impl WorkerGlobalScopeMethods<crate::DomTypeHolder> for WorkerGlobalScope {
                 &WorkerCspProcessor {
                     global_scope: DomRoot::from_ref(global_scope),
                 },
-                can_gc,
+                cx,
             ) {
                 Err(_) => return Err(Error::Network(None)),
                 Ok((metadata, bytes, muted_errors)) => {
@@ -732,7 +725,7 @@ impl WorkerGlobalScopeMethods<crate::DomTypeHolder> for WorkerGlobalScope {
             };
 
             // Step 8. Let sourceText be the result of UTF-8 decoding bodyBytes.
-            let (source, _, _) = UTF_8.decode(&bytes);
+            let (source, _) = UTF_8.decode_with_bom_removal(&bytes);
 
             // Step 9. Let mutedErrors be true if response was CORS-cross-origin, and false otherwise.
             // Note: done inside load_whole_resource
@@ -750,9 +743,11 @@ impl WorkerGlobalScopeMethods<crate::DomTypeHolder> for WorkerGlobalScope {
             );
 
             // Run the classic script script, with rethrow errors set to true.
-            let result = self
-                .globalscope
-                .run_a_classic_script(script, RethrowErrors::Yes, can_gc);
+            let result = self.globalscope.run_a_classic_script(
+                script,
+                RethrowErrors::Yes,
+                CanGc::from_cx(cx),
+            );
 
             if let Err(error) = result {
                 if self.is_closing() {
@@ -928,7 +923,6 @@ impl WorkerGlobalScopeMethods<crate::DomTypeHolder> for WorkerGlobalScope {
         )
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     /// <https://fetch.spec.whatwg.org/#dom-global-fetch>
     fn Fetch(
         &self,
@@ -1028,7 +1022,7 @@ impl WorkerGlobalScope {
         self.upcast::<GlobalScope>()
             .task_manager()
             .cancel_all_tasks_and_ignore_future_tasks();
-        if let Some(factory) = self.indexeddb.get() {
+        if let Some(factory) = self.upcast::<GlobalScope>().get_existing_indexeddb() {
             factory.abort_pending_upgrades();
         }
     }

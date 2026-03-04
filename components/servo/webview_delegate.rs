@@ -7,7 +7,6 @@ use std::rc::Rc;
 
 use base::generic_channel::GenericSender;
 use base::id::PipelineId;
-use compositing_traits::rendering_context::RenderingContext;
 use constellation_traits::EmbedderToConstellationMessage;
 #[cfg(feature = "gamepad")]
 use embedder_traits::GamepadHapticEffectType;
@@ -20,11 +19,14 @@ use embedder_traits::{
     SimpleDialogRequest, TraversalId, WebResourceRequest, WebResourceResponse,
     WebResourceResponseMsg,
 };
+use paint_api::rendering_context::RenderingContext;
+use tokio::sync::mpsc::UnboundedSender as TokioSender;
+use tokio::sync::oneshot::Sender;
 use url::Url;
 use webrender_api::units::{DeviceIntPoint, DeviceIntRect, DeviceIntSize};
 
 use crate::proxies::ConstellationProxy;
-use crate::responders::{IpcResponder, ServoErrorSender};
+use crate::responders::{IpcResponder, OneshotSender, ServoErrorSender};
 use crate::{RegisterOrUnregister, Servo, WebView, WebViewBuilder};
 
 /// A request to navigate a [`WebView`] or one of its inner frames. This can be handled
@@ -138,13 +140,16 @@ impl AuthenticationRequest {
     pub(crate) fn new(
         url: Url,
         for_proxy: bool,
-        response_sender: GenericSender<Option<AuthenticationResponse>>,
+        response_sender: Sender<Option<AuthenticationResponse>>,
         error_sender: ServoErrorSender,
     ) -> Self {
         Self {
             url,
             for_proxy,
-            responder: IpcResponder::new(response_sender, None),
+            responder: IpcResponder::new_same_process(
+                Box::new(OneshotSender::from(response_sender)),
+                None,
+            ),
             error_sender,
         }
     }
@@ -180,12 +185,15 @@ pub struct WebResourceLoad {
 impl WebResourceLoad {
     pub(crate) fn new(
         web_resource_request: WebResourceRequest,
-        response_sender: GenericSender<WebResourceResponseMsg>,
+        response_sender: TokioSender<WebResourceResponseMsg>,
         error_sender: ServoErrorSender,
     ) -> Self {
         Self {
             request: web_resource_request,
-            responder: IpcResponder::new(response_sender, WebResourceResponseMsg::DoNotIntercept),
+            responder: IpcResponder::new_same_process(
+                Box::new(response_sender),
+                WebResourceResponseMsg::DoNotIntercept,
+            ),
             error_sender,
         }
     }
@@ -202,7 +210,7 @@ impl WebResourceLoad {
         }
         InterceptedWebResourceLoad {
             request: self.request.clone(),
-            response_sender: self.responder.into_inner(),
+            response_sender: self.responder,
             finished: false,
             error_sender: self.error_sender,
         }
@@ -216,7 +224,7 @@ impl WebResourceLoad {
 /// this interception will automatically be finished when dropped.
 pub struct InterceptedWebResourceLoad {
     pub request: WebResourceRequest,
-    pub(crate) response_sender: GenericSender<WebResourceResponseMsg>,
+    pub(crate) response_sender: IpcResponder<WebResourceResponseMsg>,
     pub(crate) finished: bool,
     pub(crate) error_sender: ServoErrorSender,
 }
@@ -224,7 +232,7 @@ pub struct InterceptedWebResourceLoad {
 impl InterceptedWebResourceLoad {
     /// Send a chunk of response body data. It's possible to make subsequent calls to
     /// this method when streaming body data.
-    pub fn send_body_data(&self, data: Vec<u8>) {
+    pub fn send_body_data(&mut self, data: Vec<u8>) {
         if let Err(error) = self
             .response_sender
             .send(WebResourceResponseMsg::SendBodyData(data))
@@ -492,8 +500,7 @@ impl Drop for ColorPicker {
 pub struct FilePicker {
     pub(crate) id: EmbedderControlId,
     pub(crate) file_picker_request: FilePickerRequest,
-    pub(crate) response_sender: GenericSender<Option<Vec<PathBuf>>>,
-    pub(crate) response_sent: bool,
+    pub(crate) response_sender: Option<Sender<Option<Vec<PathBuf>>>>,
 }
 
 impl FilePicker {
@@ -522,23 +529,25 @@ impl FilePicker {
 
     /// Resolve the prompt with the options that have been selected by calling [select] previously.
     pub fn submit(mut self) {
-        let _ = self.response_sender.send(Some(std::mem::take(
-            &mut self.file_picker_request.current_paths,
-        )));
-        self.response_sent = true;
+        if let Some(sender) = self.response_sender.take() {
+            let _ = sender.send(Some(std::mem::take(
+                &mut self.file_picker_request.current_paths,
+            )));
+        }
     }
 
     /// Tell Servo that the file picker was dismissed with no selection.
     pub fn dismiss(mut self) {
-        let _ = self.response_sender.send(None);
-        self.response_sent = true;
+        if let Some(sender) = self.response_sender.take() {
+            let _ = sender.send(None);
+        }
     }
 }
 
 impl Drop for FilePicker {
     fn drop(&mut self) {
-        if !self.response_sent {
-            let _ = self.response_sender.send(None);
+        if let Some(sender) = self.response_sender.take() {
+            let _ = sender.send(None);
         }
     }
 }
@@ -551,6 +560,7 @@ pub struct InputMethodControl {
     pub(crate) insertion_point: Option<u32>,
     pub(crate) position: DeviceIntRect,
     pub(crate) multiline: bool,
+    pub(crate) allow_virtual_keyboard: bool,
 }
 
 impl InputMethodControl {
@@ -581,6 +591,13 @@ impl InputMethodControl {
     /// Whether or not this field is a multiline field.
     pub fn multiline(&self) -> bool {
         self.multiline
+    }
+
+    /// Whether the virtual keyboard should be shown for this input method event.
+    /// This is currently true for input method events that happen after the user has
+    /// interacted with page contents via an input event.
+    pub fn allow_virtual_keyboard(&self) -> bool {
+        self.allow_virtual_keyboard
     }
 }
 
@@ -974,6 +991,14 @@ pub trait WebViewDelegate {
     /// A console message was logged by content in this [`WebView`].
     /// <https://developer.mozilla.org/en-US/docs/Web/API/Console_API>
     fn show_console_message(&self, _webview: WebView, _level: ConsoleLogLevel, _message: String) {}
+
+    /// There are new accessibility tree updates from this [`WebView`].
+    fn notify_accessibility_tree_update(
+        &self,
+        _webview: WebView,
+        _tree_update: accesskit::TreeUpdate,
+    ) {
+    }
 }
 
 pub(crate) struct DefaultWebViewDelegate;
@@ -1051,15 +1076,13 @@ mod test {
 
     #[test]
     fn test_authentication_request() {
-        use base::generic_channel;
-
         use crate::responders::ServoErrorChannel;
 
         let url = Url::parse("https://example.com").expect("Guaranteed by argument");
 
         // Explicit response yields that response and nothing else
         let errors = ServoErrorChannel::default();
-        let (sender, receiver) = generic_channel::channel().expect("Failed to create IPC channel");
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
         let request = AuthenticationRequest::new(url.clone(), false, sender, errors.sender());
         request.authenticate("diffie".to_owned(), "hunter2".to_owned());
         assert_eq!(
@@ -1074,7 +1097,7 @@ mod test {
 
         // No response yields None response and nothing else
         let errors = ServoErrorChannel::default();
-        let (sender, receiver) = generic_channel::channel().expect("Failed to create IPC channel");
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
         let request = AuthenticationRequest::new(url.clone(), false, sender, errors.sender());
         drop(request);
         assert_eq!(receiver.try_recv().ok(), Some(None));
@@ -1083,7 +1106,7 @@ mod test {
 
         // Explicit response when receiver disconnected yields error
         let errors = ServoErrorChannel::default();
-        let (sender, receiver) = generic_channel::channel().expect("Failed to create IPC channel");
+        let (sender, receiver) = tokio::sync::oneshot::channel();
         let request = AuthenticationRequest::new(url.clone(), false, sender, errors.sender());
         drop(receiver);
         request.authenticate("diffie".to_owned(), "hunter2".to_owned());
@@ -1091,7 +1114,7 @@ mod test {
 
         // No response when receiver disconnected yields no error
         let errors = ServoErrorChannel::default();
-        let (sender, receiver) = generic_channel::channel().expect("Failed to create IPC channel");
+        let (sender, receiver) = tokio::sync::oneshot::channel();
         let request = AuthenticationRequest::new(url.clone(), false, sender, errors.sender());
         drop(receiver);
         drop(request);
@@ -1100,7 +1123,6 @@ mod test {
 
     #[test]
     fn test_web_resource_load() {
-        use base::generic_channel;
         use http::{HeaderMap, Method, StatusCode};
 
         use crate::responders::ServoErrorChannel;
@@ -1121,7 +1143,7 @@ mod test {
 
         // Explicit intercept with explicit cancel yields Start and Cancel and nothing else
         let errors = ServoErrorChannel::default();
-        let (sender, receiver) = generic_channel::channel().expect("Failed to create IPC channel");
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let request = WebResourceLoad::new(web_resource_request(), sender, errors.sender());
         request.intercept(web_resource_response()).cancel();
         assert!(matches!(
@@ -1137,7 +1159,7 @@ mod test {
 
         // Explicit intercept with no further action yields Start and FinishLoad and nothing else
         let errors = ServoErrorChannel::default();
-        let (sender, receiver) = generic_channel::channel().expect("Failed to create IPC channel");
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let request = WebResourceLoad::new(web_resource_request(), sender, errors.sender());
         drop(request.intercept(web_resource_response()));
         assert!(matches!(
@@ -1153,7 +1175,7 @@ mod test {
 
         // No response yields DoNotIntercept and nothing else
         let errors = ServoErrorChannel::default();
-        let (sender, receiver) = generic_channel::channel().expect("Failed to create IPC channel");
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let request = WebResourceLoad::new(web_resource_request(), sender, errors.sender());
         drop(request);
         assert!(matches!(
@@ -1165,7 +1187,7 @@ mod test {
 
         // Explicit intercept with explicit cancel when receiver disconnected yields error
         let errors = ServoErrorChannel::default();
-        let (sender, receiver) = generic_channel::channel().expect("Failed to create IPC channel");
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let request = WebResourceLoad::new(web_resource_request(), sender, errors.sender());
         drop(receiver);
         request.intercept(web_resource_response()).cancel();
@@ -1173,7 +1195,7 @@ mod test {
 
         // Explicit intercept with no further action when receiver disconnected yields error
         let errors = ServoErrorChannel::default();
-        let (sender, receiver) = generic_channel::channel().expect("Failed to create IPC channel");
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let request = WebResourceLoad::new(web_resource_request(), sender, errors.sender());
         drop(receiver);
         drop(request.intercept(web_resource_response()));
@@ -1181,7 +1203,7 @@ mod test {
 
         // No response when receiver disconnected yields no error
         let errors = ServoErrorChannel::default();
-        let (sender, receiver) = generic_channel::channel().expect("Failed to create IPC channel");
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let request = WebResourceLoad::new(web_resource_request(), sender, errors.sender());
         drop(receiver);
         drop(request);

@@ -8,13 +8,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use compositing_traits::rendering_context::{RenderingContext, SoftwareRenderingContext};
 use dpi::PhysicalSize;
 use embedder_traits::EventLoopWaker;
+use paint_api::rendering_context::{RenderingContext, SoftwareRenderingContext};
 use servo::{
-    EmbedderControl, JSValue, JavaScriptEvaluationError, LoadStatus, Preferences, Servo,
-    ServoBuilder, SimpleDialog, WebView, WebViewDelegate,
+    EmbedderControl, InputEvent, JSValue, JavaScriptEvaluationError, LoadStatus, MouseButton,
+    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Preferences, Servo, ServoBuilder,
+    SimpleDialog, WebView, WebViewDelegate,
 };
+use webrender_api::units::DevicePoint;
 
 pub struct ServoTest {
     pub servo: Servo,
@@ -22,6 +24,7 @@ pub struct ServoTest {
 }
 
 impl ServoTest {
+    #[allow(dead_code)] // Used by some tests and not others
     pub(crate) fn new() -> Self {
         Self::new_with_builder(|builder| builder)
     }
@@ -52,9 +55,10 @@ impl ServoTest {
         }
 
         let user_event_triggered = Arc::new(AtomicBool::new(false));
-        // Set the proxy to null as the tests will all be on localhost, hence, proxy might interfer.
+        // Set the proxy to null as the tests will all be on localhost, hence, proxy might interfere.
         let mut preferences = Preferences::default();
         preferences.network_http_proxy_uri = String::new();
+        preferences.network_https_proxy_uri = String::new();
 
         let builder = ServoBuilder::default()
             .preferences(preferences)
@@ -145,7 +149,27 @@ impl WebViewDelegate for WebViewDelegateImpl {
     }
 }
 
-#[allow(dead_code)] // Used by some tests and not others
+// Used by some unit tests only. Since they compile into different binaries,
+// it will be flagged as unused for certain unit tests.
+#[allow(dead_code)]
+pub(crate) fn click_at_point(webview: &WebView, point: DevicePoint) {
+    let point = point.into();
+    webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point)));
+    webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+        MouseButtonAction::Down,
+        MouseButton::Left,
+        point,
+    )));
+    webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+        MouseButtonAction::Up,
+        MouseButton::Left,
+        point,
+    )));
+}
+
+// Used by some unit tests only. Since they compile into different binaries,
+// it will be flagged as unused for certain unit tests.
+#[allow(dead_code)]
 pub(crate) fn evaluate_javascript(
     servo_test: &ServoTest,
     webview: WebView,
@@ -166,4 +190,33 @@ pub(crate) fn evaluate_javascript(
     (*saved_result.borrow())
         .clone()
         .expect("Should have waited until value available")
+}
+
+// Used by some unit tests only. Since they compile into different binaries,
+// it will be flagged as unused for certain unit tests.
+#[allow(dead_code)]
+pub(crate) fn show_webview_and_wait_for_rendering_to_be_ready(
+    servo_test: &ServoTest,
+    webview: &WebView,
+    delegate: &Rc<WebViewDelegateImpl>,
+) {
+    let load_webview = webview.clone();
+    servo_test.spin(move || load_webview.load_status() != LoadStatus::Complete);
+
+    delegate.reset();
+
+    // Trigger a change to the display of the document, so that we get at least one
+    // new frame after load is complete.
+    let _ = evaluate_javascript(
+        &servo_test,
+        webview.clone(),
+        "requestAnimationFrame(() => { \
+           document.body.style.background = 'red'; \
+           document.body.style.background = 'green'; \
+        });",
+    );
+
+    // Wait for at least one frame after the load completes.
+    let captured_delegate = delegate.clone();
+    servo_test.spin(move || !captured_delegate.new_frame_ready.get());
 }

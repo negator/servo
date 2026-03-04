@@ -13,7 +13,8 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use devtools_traits::DevtoolScriptControlMsg;
 use dom_struct::dom_struct;
 use fonts::FontContext;
-use js::jsapi::{Heap, JSContext, JSObject};
+use js::context::JSContext;
+use js::jsapi::{Heap, JSContext as RawJSContext, JSObject};
 use js::jsval::UndefinedValue;
 use js::rust::{CustomAutoRooter, CustomAutoRooterGuard, HandleValue};
 use net_traits::image_cache::ImageCache;
@@ -143,19 +144,32 @@ impl QueuedTaskConversion for DedicatedWorkerScriptMsg {
             WorkerScriptMsg::Common(script_msg) => script_msg,
             _ => return None,
         };
-        let (category, boxed, pipeline_id, task_source) = match script_msg {
+        let (event_category, task, pipeline_id, task_source) = match script_msg {
             CommonScriptMsg::Task(category, boxed, pipeline_id, task_source) => {
                 (category, boxed, pipeline_id, task_source)
             },
             _ => return None,
         };
-        Some((Some(worker), category, boxed, pipeline_id, task_source))
+        Some(QueuedTask {
+            worker: Some(worker),
+            event_category,
+            task,
+            pipeline_id,
+            task_source,
+        })
     }
 
     fn from_queued_task(queued_task: QueuedTask) -> Self {
-        let (worker, category, boxed, pipeline_id, task_source) = queued_task;
-        let script_msg = CommonScriptMsg::Task(category, boxed, pipeline_id, task_source);
-        DedicatedWorkerScriptMsg::CommonWorker(worker.unwrap(), WorkerScriptMsg::Common(script_msg))
+        let script_msg = CommonScriptMsg::Task(
+            queued_task.event_category,
+            queued_task.task,
+            queued_task.pipeline_id,
+            queued_task.task_source,
+        );
+        DedicatedWorkerScriptMsg::CommonWorker(
+            queued_task.worker.unwrap(),
+            WorkerScriptMsg::Common(script_msg),
+        )
     }
 
     fn inactive_msg() -> Self {
@@ -194,7 +208,6 @@ pub(crate) struct DedicatedWorkerGlobalScope {
     browsing_context: Option<BrowsingContextId>,
     /// A receiver of control messages,
     /// currently only used to signal shutdown.
-    #[ignore_malloc_size_of = "Channels are hard"]
     #[no_trace]
     control_receiver: Receiver<DedicatedWorkerControlMsg>,
     #[no_trace]
@@ -210,7 +223,7 @@ impl WorkerEventLoopMethods for DedicatedWorkerGlobalScope {
         &self.task_queue
     }
 
-    fn handle_event(&self, event: MixedMessage, cx: &mut js::context::JSContext) -> bool {
+    fn handle_event(&self, event: MixedMessage, cx: &mut JSContext) -> bool {
         self.handle_mixed_message(event, cx)
     }
 
@@ -309,6 +322,7 @@ impl DedicatedWorkerGlobalScope {
         control_receiver: Receiver<DedicatedWorkerControlMsg>,
         insecure_requests_policy: InsecureRequestsPolicy,
         font_context: Option<Arc<FontContext>>,
+        cx: &mut js::context::JSContext,
     ) -> DomRoot<DedicatedWorkerGlobalScope> {
         let scope = Box::new(DedicatedWorkerGlobalScope::new_inherited(
             init,
@@ -330,10 +344,7 @@ impl DedicatedWorkerGlobalScope {
             insecure_requests_policy,
             font_context,
         ));
-        DedicatedWorkerGlobalScopeBinding::Wrap::<crate::DomTypeHolder>(
-            GlobalScope::get_cx(),
-            scope,
-        )
+        DedicatedWorkerGlobalScopeBinding::Wrap::<crate::DomTypeHolder>(cx, scope)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#run-a-worker>
@@ -437,9 +448,9 @@ impl DedicatedWorkerGlobalScope {
                     init.storage_threads.clone(),
                     #[cfg(feature = "webgpu")]
                     gpu_id_hub.clone(),
-                    CanGc::from_cx(cx),
+                    cx,
                 );
-                debugger_global.execute(CanGc::from_cx(cx));
+                debugger_global.execute(cx);
 
                 let context_for_interrupt = runtime.thread_safe_js_context();
                 let _ = context_sender.send(context_for_interrupt);
@@ -482,6 +493,7 @@ impl DedicatedWorkerGlobalScope {
                     control_receiver,
                     insecure_requests_policy,
                     font_context,
+                    cx,
                 );
                 debugger_global.fire_add_debuggee(
                     CanGc::from_cx(cx),
@@ -614,7 +626,7 @@ impl DedicatedWorkerGlobalScope {
         }
     }
 
-    fn handle_script_event(&self, msg: WorkerScriptMsg, cx: &mut js::context::JSContext) {
+    fn handle_script_event(&self, msg: WorkerScriptMsg, cx: &mut JSContext) {
         match msg {
             WorkerScriptMsg::DOMMessage(message_data) => {
                 if self.upcast::<WorkerGlobalScope>().is_execution_ready() {
@@ -629,7 +641,7 @@ impl DedicatedWorkerGlobalScope {
         }
     }
 
-    fn handle_mixed_message(&self, msg: MixedMessage, cx: &mut js::context::JSContext) -> bool {
+    fn handle_mixed_message(&self, msg: MixedMessage, cx: &mut JSContext) -> bool {
         if self.upcast::<WorkerGlobalScope>().is_closing() {
             return false;
         }
@@ -637,10 +649,11 @@ impl DedicatedWorkerGlobalScope {
         match msg {
             MixedMessage::Devtools(msg) => match msg {
                 DevtoolScriptControlMsg::EvaluateJS(_pipe_id, string, sender) => {
-                    devtools::handle_evaluate_js(self.upcast(), string, sender, CanGc::from_cx(cx))
+                    devtools::handle_evaluate_js(self.upcast(), string, sender, cx)
                 },
                 DevtoolScriptControlMsg::WantsLiveNotifications(_pipe_id, bool_val) => {
-                    devtools::handle_wants_live_notifications(self.upcast(), bool_val)
+                    self.upcast::<GlobalScope>()
+                        .set_devtools_wants_updates(bool_val);
                 },
                 _ => debug!("got an unusable devtools control message inside the worker!"),
             },
@@ -699,16 +712,16 @@ impl DedicatedWorkerGlobalScope {
     /// <https://html.spec.whatwg.org/multipage/#dom-dedicatedworkerglobalscope-postmessage>
     fn post_message_impl(
         &self,
-        cx: SafeJSContext,
+        cx: &mut JSContext,
         message: HandleValue,
         transfer: CustomAutoRooterGuard<Vec<*mut JSObject>>,
     ) -> ErrorResult {
-        let data = structuredclone::write(cx, message, Some(transfer))?;
+        let data = structuredclone::write(cx.into(), message, Some(transfer))?;
         let worker = self.worker.borrow().as_ref().unwrap().clone();
         let global_scope = self.upcast::<GlobalScope>();
         let pipeline_id = global_scope.pipeline_id();
-        let task = Box::new(task!(post_worker_message: move || {
-            Worker::handle_message(worker, data, CanGc::note());
+        let task = Box::new(task!(post_worker_message: move |cx| {
+            Worker::handle_message(worker, data, cx);
         }));
         self.parent_event_loop_sender
             .send(CommonScriptMsg::Task(
@@ -749,14 +762,18 @@ impl DedicatedWorkerGlobalScope {
 }
 
 #[expect(unsafe_code)]
-pub(crate) unsafe extern "C" fn interrupt_callback(cx: *mut JSContext) -> bool {
+pub(crate) unsafe extern "C" fn interrupt_callback(cx: *mut RawJSContext) -> bool {
     let in_realm_proof = AlreadyInRealm::assert_for_cx(unsafe { SafeJSContext::from_ptr(cx) });
     let global = unsafe { GlobalScope::from_context(cx, InRealm::Already(&in_realm_proof)) };
-    let worker =
-        DomRoot::downcast::<WorkerGlobalScope>(global).expect("global is not a worker scope");
-    assert!(worker.is::<DedicatedWorkerGlobalScope>());
+
+    // If we are running the debugger script, just exit immediately.
+    let Some(worker) = global.downcast::<WorkerGlobalScope>() else {
+        assert!(global.is::<DebuggerGlobalScope>());
+        return false;
+    };
 
     // A false response causes the script to terminate
+    assert!(worker.is::<DedicatedWorkerGlobalScope>());
     !worker.is_closing()
 }
 
@@ -769,7 +786,7 @@ impl DedicatedWorkerGlobalScopeMethods<crate::DomTypeHolder> for DedicatedWorker
     /// <https://html.spec.whatwg.org/multipage/#dom-dedicatedworkerglobalscope-postmessage>
     fn PostMessage(
         &self,
-        cx: SafeJSContext,
+        cx: &mut JSContext,
         message: HandleValue,
         transfer: CustomAutoRooterGuard<Vec<*mut JSObject>>,
     ) -> ErrorResult {
@@ -779,7 +796,7 @@ impl DedicatedWorkerGlobalScopeMethods<crate::DomTypeHolder> for DedicatedWorker
     /// <https://html.spec.whatwg.org/multipage/#dom-dedicatedworkerglobalscope-postmessage>
     fn PostMessage_(
         &self,
-        cx: SafeJSContext,
+        cx: &mut JSContext,
         message: HandleValue,
         options: RootedTraceableBox<StructuredSerializeOptions>,
     ) -> ErrorResult {
@@ -790,7 +807,8 @@ impl DedicatedWorkerGlobalScopeMethods<crate::DomTypeHolder> for DedicatedWorker
                 .map(|js: &RootedTraceableBox<Heap<*mut JSObject>>| js.get())
                 .collect(),
         );
-        let guard = CustomAutoRooterGuard::new(*cx, &mut rooted);
+        #[expect(unsafe_code)]
+        let guard = unsafe { CustomAutoRooterGuard::new(cx.raw_cx(), &mut rooted) };
         self.post_message_impl(cx, message, guard)
     }
 

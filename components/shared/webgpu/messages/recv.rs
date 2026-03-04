@@ -7,9 +7,10 @@
 
 use arrayvec::ArrayVec;
 use base::Epoch;
-use base::generic_channel::GenericSharedMemory;
+use base::generic_channel::{
+    GenericCallback, GenericOneshotSender, GenericSender, GenericSharedMemory,
+};
 use base::id::PipelineId;
-use ipc_channel::ipc::IpcSender;
 use pixels::SharedSnapshot;
 use serde::{Deserialize, Serialize};
 use webrender_api::ImageKey;
@@ -68,7 +69,7 @@ pub enum WebGPURequest {
         image_key: ImageKey,
     },
     BufferMapAsync {
-        sender: IpcSender<Result<Mapping, BufferAccessError>>,
+        callback: GenericCallback<Result<Mapping, BufferAccessError>>,
         buffer_id: BufferId,
         device_id: DeviceId,
         host_map: HostMap,
@@ -132,7 +133,7 @@ pub enum WebGPURequest {
         descriptor: ComputePipelineDescriptor<'static>,
         implicit_ids: Option<(PipelineLayoutId, Vec<BindGroupLayoutId>)>,
         /// present only on ASYNC versions
-        async_sender: Option<IpcSender<WebGPUComputePipelineResponse>>,
+        async_sender: Option<GenericCallback<WebGPUComputePipelineResponse>>,
     },
     CreatePipelineLayout {
         device_id: DeviceId,
@@ -145,7 +146,7 @@ pub enum WebGPURequest {
         descriptor: RenderPipelineDescriptor<'static>,
         implicit_ids: Option<(PipelineLayoutId, Vec<BindGroupLayoutId>)>,
         /// present only on ASYNC versions
-        async_sender: Option<IpcSender<WebGPURenderPipelineResponse>>,
+        async_sender: Option<GenericCallback<WebGPURenderPipelineResponse>>,
     },
     CreateSampler {
         device_id: DeviceId,
@@ -157,13 +158,13 @@ pub enum WebGPURequest {
         program_id: ShaderModuleId,
         program: String,
         label: Option<String>,
-        sender: IpcSender<Option<ShaderCompilationInfo>>,
+        callback: GenericCallback<Option<ShaderCompilationInfo>>,
     },
     /// Creates context
     CreateContext {
         buffer_ids: ArrayVec<BufferId, PRESENTATION_BUFFER_COUNT>,
         size: DeviceIntSize,
-        sender: IpcSender<WebGPUContextId>,
+        sender: GenericSender<WebGPUContextId>,
     },
     /// Present texture to WebRender
     Present {
@@ -177,7 +178,7 @@ pub enum WebGPURequest {
     GetImage {
         context_id: WebGPUContextId,
         pending_texture: Option<PendingTexture>,
-        sender: IpcSender<SharedSnapshot>,
+        sender: GenericSender<SharedSnapshot>,
     },
     ValidateTextureDescriptor {
         device_id: DeviceId,
@@ -218,7 +219,7 @@ pub enum WebGPURequest {
     DropQuerySet(QuerySetId),
     DropComputePass(ComputePassEncoderId),
     DropRenderPass(RenderPassEncoderId),
-    Exit(IpcSender<()>),
+    Exit(GenericOneshotSender<()>),
     RenderBundleEncoderFinish {
         render_bundle_encoder: RenderBundleEncoder,
         descriptor: RenderBundleDescriptor<'static>,
@@ -226,12 +227,12 @@ pub enum WebGPURequest {
         device_id: DeviceId,
     },
     RequestAdapter {
-        sender: IpcSender<WebGPUAdapterResponse>,
+        sender: GenericCallback<WebGPUAdapterResponse>,
         options: RequestAdapterOptions,
         adapter_id: AdapterId,
     },
     RequestDevice {
-        sender: IpcSender<WebGPUDeviceResponse>,
+        sender: GenericCallback<WebGPUDeviceResponse>,
         adapter_id: WebGPUAdapter,
         descriptor: DeviceDescriptor<Option<String>>,
         device_id: DeviceId,
@@ -320,7 +321,7 @@ pub enum WebGPURequest {
         data: GenericSharedMemory,
     },
     QueueOnSubmittedWorkDone {
-        sender: IpcSender<()>,
+        sender: GenericCallback<()>,
         queue_id: QueueId,
     },
     PushErrorScope {
@@ -333,7 +334,7 @@ pub enum WebGPURequest {
     },
     PopErrorScope {
         device_id: DeviceId,
-        sender: IpcSender<WebGPUPoppedErrorScopeResponse>,
+        callback: GenericCallback<WebGPUPoppedErrorScopeResponse>,
     },
     ComputeGetBindGroupLayout {
         device_id: DeviceId,

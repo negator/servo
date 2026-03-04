@@ -166,7 +166,8 @@ macro_rules! make_enumerated_getter(
         $htmlname:tt,
         $($choices:literal)|+,
         missing => $missing:literal,
-        invalid => $invalid:literal
+        invalid => $invalid:literal,
+        empty => $empty:literal
     ) => (
         fn $attr(&self) -> DOMString {
             use $crate::dom::bindings::inheritance::Castable;
@@ -193,9 +194,15 @@ macro_rules! make_enumerated_getter(
                         }
                     )+
 
-                    // Step 3. If the attribute has an invalid value default state defined, then return that invalid
+                    // Step 3. If the attribute has an empty value default state defined and the attribute's value
+                    // is the empty string, then return that empty value default state.
+                    if value.is_empty() {
+                        return DOMString::from($empty)
+                    }
+
+                    // Step 4. If the attribute has an invalid value default state defined, then return that invalid
                     // value default state.
-                    // Step 4. Return no state.
+                    // Step 5. Return no state.
                     return DOMString::from($invalid);
                 }
             }
@@ -210,7 +217,8 @@ macro_rules! make_enumerated_getter(
             $htmlname,
             $($choices)|+,
             missing => "",
-            invalid => ""
+            invalid => "",
+            empty => ""
         );
     );
     ($attr:ident,
@@ -223,7 +231,8 @@ macro_rules! make_enumerated_getter(
             $htmlname,
             $($choices)|+,
             missing => "",
-            invalid => $invalid
+            invalid => $invalid,
+            empty => $invalid
         );
     );
     ($attr:ident,
@@ -236,7 +245,23 @@ macro_rules! make_enumerated_getter(
             $htmlname,
             $($choices)|+,
             missing => $missing,
-            invalid => ""
+            invalid => "",
+            empty => ""
+        );
+    );
+    ($attr:ident,
+        $htmlname:tt,
+        $($choices:literal)|+,
+        missing => $missing:literal,
+        invalid => $invalid:literal
+    ) => (
+        make_enumerated_getter!(
+            $attr,
+            $htmlname,
+            $($choices)|+,
+            missing => $missing,
+            invalid => $invalid,
+            empty => $invalid
         );
     );
 );
@@ -625,6 +650,14 @@ macro_rules! global_event_handlers(
         event_handler!(pause, GetOnpause, SetOnpause);
         event_handler!(play, GetOnplay, SetOnplay);
         event_handler!(playing, GetOnplaying, SetOnplaying);
+        event_handler!(pointercancel, GetOnpointercancel, SetOnpointercancel);
+        event_handler!(pointerdown, GetOnpointerdown, SetOnpointerdown);
+        event_handler!(pointerenter, GetOnpointerenter, SetOnpointerenter);
+        event_handler!(pointerleave, GetOnpointerleave, SetOnpointerleave);
+        event_handler!(pointermove, GetOnpointermove, SetOnpointermove);
+        event_handler!(pointerout, GetOnpointerout, SetOnpointerout);
+        event_handler!(pointerover, GetOnpointerover, SetOnpointerover);
+        event_handler!(pointerup, GetOnpointerup, SetOnpointerup);
         event_handler!(progress, GetOnprogress, SetOnprogress);
         event_handler!(ratechange, GetOnratechange, SetOnratechange);
         event_handler!(reset, GetOnreset, SetOnreset);
@@ -750,7 +783,7 @@ macro_rules! impl_performance_entry_struct(
                 }
             }
 
-            #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+            #[cfg_attr(crown, expect(crown::unrooted_must_root))]
             pub(crate) fn new(global: &GlobalScope,
                        name: DOMString,
                        start_time: CrossProcessInstant,

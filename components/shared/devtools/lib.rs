@@ -5,6 +5,12 @@
 //! This module contains shared types and messages for use by devtools/script.
 //! The traits are here instead of in script so that the devtools crate can be
 //! modified independently of the rest of Servo.
+//!
+//! Since these types can be sent through the IPC channel and use non
+//! self-describing serializers, the `flatten`, `skip*`, `tag` and `untagged`
+//! serde annotations are not supported. Types like `serde_json::Value` aren't
+//! supported either. For JSON serialization it is preferred to use a wrapper
+//! struct in the devtools crate instead.
 
 #![crate_name = "devtools_traits"]
 #![crate_type = "rlib"]
@@ -20,7 +26,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base::cross_process_instant::CrossProcessInstant;
 use base::generic_channel::GenericSender;
 use base::id::{BrowsingContextId, PipelineId, WebViewId};
-use bitflags::bitflags;
 pub use embedder_traits::ConsoleLogLevel;
 use embedder_traits::Theme;
 use http::{HeaderMap, Method};
@@ -28,6 +33,7 @@ use malloc_size_of_derive::MallocSizeOf;
 use net_traits::http_status::HttpStatus;
 use net_traits::request::Destination;
 use net_traits::{DebugVec, TlsSecurityInfo};
+use profile_traits::mem::ReportsChan;
 use serde::{Deserialize, Serialize};
 use servo_url::ServoUrl;
 use uuid::Uuid;
@@ -57,6 +63,8 @@ pub enum DevtoolsControlMsg {
     FromChrome(ChromeToDevtoolsControlMsg),
     /// Messages from script threads
     FromScript(ScriptToDevtoolsControlMsg),
+    /// Sent when a devtools client thread terminates.
+    ClientExited,
 }
 
 /// Events that the devtools server must act upon.
@@ -71,6 +79,8 @@ pub enum ChromeToDevtoolsControlMsg {
     /// A network event occurred (request, reply, etc.). The actor with the
     /// provided name should be notified.
     NetworkEvent(String, NetworkEvent),
+    /// Perform a memory report.
+    CollectMemoryReport(ReportsChan),
 }
 
 /// The state of a page navigation.
@@ -119,18 +129,44 @@ pub enum ScriptToDevtoolsControlMsg {
     ),
 
     UpdateSourceContent(PipelineId, String),
+
+    DomMutation(PipelineId, DomMutation),
+
+    /// The debugger is paused, sending frame information.
+    DebuggerPause(PipelineId, FrameOffset, PauseReason),
+
+    /// Get frame information from script
+    CreateFrameActor(GenericSender<String>, PipelineId, FrameInfo),
+}
+
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub enum DomMutation {
+    AttributeModified {
+        node: String,
+        attribute_name: String,
+        new_value: Option<String>,
+    },
 }
 
 /// Serialized JS return values
-/// TODO: generalize this beyond the EvaluateJS message?
 #[derive(Debug, Deserialize, Serialize)]
-pub enum EvaluateJSReply {
+pub enum EvaluateJSReplyValue {
     VoidValue,
     NullValue,
     BooleanValue(bool),
     NumberValue(f64),
     StringValue(String),
-    ActorValue { class: String, uuid: String },
+    ActorValue {
+        class: String,
+        uuid: String,
+        name: Option<String>,
+    },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct EvaluateJSReply {
+    pub value: EvaluateJSReplyValue,
+    pub has_exception: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -170,6 +206,8 @@ pub struct NodeInfo {
 
     /// The `DOCTYPE` system identifier if this is a `DocumentType` node, `None` otherwise
     pub doctype_system_identifier: Option<String>,
+
+    pub has_event_listeners: bool,
 }
 
 pub struct StartedTimelineMarker {
@@ -203,14 +241,13 @@ pub struct NodeStyle {
 
 /// The properties of a DOM node as computed by layout.
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "kebab-case")]
 pub struct ComputedNodeLayout {
     pub display: String,
     pub position: String,
     pub z_index: String,
     pub box_sizing: String,
 
-    pub auto_margins: AutoMargins,
     pub margin_top: String,
     pub margin_right: String,
     pub margin_bottom: String,
@@ -230,7 +267,7 @@ pub struct ComputedNodeLayout {
     pub height: f32,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct AutoMargins {
     pub top: bool,
     pub right: bool,
@@ -269,11 +306,13 @@ pub enum DevtoolScriptControlMsg {
     ),
     /// Retrieve the computed CSS style properties for the given node.
     GetComputedStyle(PipelineId, String, GenericSender<Option<Vec<NodeStyle>>>),
+    /// Get information about event listeners on a node.
+    GetEventListenerInfo(PipelineId, String, GenericSender<Vec<EventListenerInfo>>),
     /// Retrieve the computed layout properties of the given node in the given pipeline.
     GetLayout(
         PipelineId,
         String,
-        GenericSender<Option<ComputedNodeLayout>>,
+        GenericSender<Option<(ComputedNodeLayout, AutoMargins)>>,
     ),
     /// Get a unique XPath selector for the node.
     GetXPath(PipelineId, String, GenericSender<String>),
@@ -303,10 +342,20 @@ pub enum DevtoolScriptControlMsg {
     /// Highlight the given DOM node
     HighlightDomNode(PipelineId, Option<String>),
 
+    Eval(
+        String,
+        PipelineId,
+        Option<String>,
+        GenericSender<EvaluateJSReply>,
+    ),
     GetPossibleBreakpoints(u32, GenericSender<Vec<RecommendedBreakpointLocation>>),
+    SetBreakpoint(u32, u32, u32),
+    ClearBreakpoint(u32, u32, u32),
+    Interrupt,
+    Resume(Option<String>, Option<String>),
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, MallocSizeOf)]
 #[serde(rename_all = "camelCase")]
 pub struct AttrModification {
     pub attribute_name: String,
@@ -324,123 +373,88 @@ pub struct RuleModification {
     pub priority: String,
 }
 
-/// A console message as it is sent from script to the constellation
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, MallocSizeOf)]
 #[serde(rename_all = "camelCase")]
-pub struct ConsoleMessage {
-    pub log_level: ConsoleLogLevel,
+pub struct StackFrame {
     pub filename: String,
-    pub line_number: usize,
-    pub column_number: usize,
-    pub arguments: Vec<ConsoleMessageArgument>,
-    pub stacktrace: Option<Vec<StackFrame>>,
+    pub function_name: String,
+    pub column_number: u32,
+    pub line_number: u32,
+    // Not implemented in Servo
+    // source_id
+}
+
+pub fn get_time_stamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, MallocSizeOf)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsoleMessageFields {
+    pub level: ConsoleLogLevel,
+    pub filename: String,
+    pub line_number: u32,
+    pub column_number: u32,
+    pub time_stamp: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub enum ConsoleMessageArgument {
+pub enum ConsoleArgument {
     String(String),
     Integer(i32),
     Number(f64),
+    Boolean(bool),
+    Object(ConsoleArgumentObject),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct StackFrame {
-    pub filename: String,
-
-    #[serde(rename = "functionName")]
-    pub function_name: String,
-
-    #[serde(rename = "columnNumber")]
-    pub column_number: u32,
-
-    #[serde(rename = "lineNumber")]
-    pub line_number: u32,
+pub struct ConsoleArgumentObject {
+    pub class: String,
+    pub own_properties: Vec<ConsoleArgumentPropertyValue>,
 }
 
-bitflags! {
-    #[derive(Deserialize, Serialize)]
-    pub struct CachedConsoleMessageTypes: u8 {
-        const PAGE_ERROR  = 1 << 0;
-        const CONSOLE_API = 1 << 1;
+/// A property on a JS object passed as a console argument.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ConsoleArgumentPropertyValue {
+    pub key: String,
+    pub configurable: bool,
+    pub enumerable: bool,
+    pub writable: bool,
+    pub value: ConsoleArgument,
+}
+
+impl From<String> for ConsoleArgument {
+    fn from(value: String) -> Self {
+        Self::String(value)
     }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PageError {
-    #[serde(rename = "_type")]
-    pub type_: String,
-    pub error_message: String,
-    pub source_name: String,
-    pub line_text: String,
-    pub line_number: u32,
-    pub column_number: u32,
-    pub category: String,
-    pub time_stamp: u64,
-    pub error: bool,
-    pub warning: bool,
-    pub exception: bool,
-    pub strict: bool,
-    pub private: bool,
-}
-
-/// Represents a console message as it is sent to the devtools
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ConsoleLog {
-    pub level: String,
-    pub filename: String,
-    pub line_number: u32,
-    pub column_number: u32,
-    pub time_stamp: u64,
+pub struct ConsoleMessage {
+    pub fields: ConsoleMessageFields,
     pub arguments: Vec<ConsoleArgument>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub stacktrace: Option<Vec<StackFrame>>,
 }
 
-impl From<ConsoleMessage> for ConsoleLog {
-    fn from(value: ConsoleMessage) -> Self {
-        let level = match value.log_level {
-            ConsoleLogLevel::Debug => "debug",
-            ConsoleLogLevel::Info => "info",
-            ConsoleLogLevel::Warn => "warn",
-            ConsoleLogLevel::Error => "error",
-            ConsoleLogLevel::Trace => "trace",
-            ConsoleLogLevel::Log => "log",
-        }
-        .to_owned();
-
-        let time_stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        Self {
-            level,
-            filename: value.filename,
-            line_number: value.line_number as u32,
-            column_number: value.column_number as u32,
-            time_stamp,
-            arguments: value.arguments.into_iter().map(|arg| arg.into()).collect(),
-            stacktrace: value.stacktrace,
-        }
-    }
+#[derive(Clone, Debug, Deserialize, Serialize, MallocSizeOf)]
+#[serde(rename_all = "camelCase")]
+pub struct PageError {
+    pub error_message: String,
+    pub source_name: String,
+    pub line_number: u32,
+    pub column_number: u32,
+    pub time_stamp: u64,
 }
 
-#[derive(Serialize)]
-pub struct ConsoleClearMessage {
-    pub level: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub enum CachedConsoleMessage {
-    PageError(PageError),
-    ConsoleLog(ConsoleLog),
-}
-
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, MallocSizeOf)]
 pub struct HttpRequest {
     pub url: ServoUrl,
+    #[ignore_malloc_size_of = "http type"]
     pub method: Method,
+    #[ignore_malloc_size_of = "http type"]
     pub headers: HeaderMap,
     pub body: Option<DebugVec>,
     pub pipeline_id: PipelineId,
@@ -453,8 +467,9 @@ pub struct HttpRequest {
     pub browsing_context_id: BrowsingContextId,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, MallocSizeOf)]
 pub struct HttpResponse {
+    #[ignore_malloc_size_of = "Http type"]
     pub headers: Option<HeaderMap>,
     pub status: HttpStatus,
     pub body: Option<DebugVec>,
@@ -524,85 +539,13 @@ impl FromStr for WorkerId {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, MallocSizeOf)]
 #[serde(rename_all = "camelCase")]
 pub struct CssDatabaseProperty {
     pub is_inherited: bool,
     pub values: Vec<String>,
     pub supports: Vec<String>,
     pub subproperties: Vec<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(untagged)]
-pub enum ConsoleArgument {
-    String(String),
-    Integer(i32),
-    Number(f64),
-}
-
-impl From<ConsoleMessageArgument> for ConsoleArgument {
-    fn from(value: ConsoleMessageArgument) -> Self {
-        match value {
-            ConsoleMessageArgument::String(string) => Self::String(string),
-            ConsoleMessageArgument::Integer(integer) => Self::Integer(integer),
-            ConsoleMessageArgument::Number(number) => Self::Number(number),
-        }
-    }
-}
-
-impl From<String> for ConsoleMessageArgument {
-    fn from(value: String) -> Self {
-        Self::String(value)
-    }
-}
-
-pub struct ConsoleMessageBuilder {
-    level: ConsoleLogLevel,
-    filename: String,
-    line_number: u32,
-    column_number: u32,
-    arguments: Vec<ConsoleMessageArgument>,
-    stack_trace: Option<Vec<StackFrame>>,
-}
-
-impl ConsoleMessageBuilder {
-    pub fn new(
-        level: ConsoleLogLevel,
-        filename: String,
-        line_number: u32,
-        column_number: u32,
-    ) -> Self {
-        Self {
-            level,
-            filename,
-            line_number,
-            column_number,
-            arguments: vec![],
-            stack_trace: None,
-        }
-    }
-
-    pub fn attach_stack_trace(&mut self, stack_trace: Vec<StackFrame>) -> &mut Self {
-        self.stack_trace = Some(stack_trace);
-        self
-    }
-
-    pub fn add_argument(&mut self, argument: ConsoleMessageArgument) -> &mut Self {
-        self.arguments.push(argument);
-        self
-    }
-
-    pub fn finish(self) -> ConsoleMessage {
-        ConsoleMessage {
-            log_level: self.level,
-            filename: self.filename,
-            line_number: self.line_number as usize,
-            column_number: self.column_number as usize,
-            arguments: self.arguments,
-            stacktrace: self.stack_trace,
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -634,8 +577,42 @@ pub struct SourceInfo {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecommendedBreakpointLocation {
+    pub script_id: u32,
     pub offset: u32,
     pub line_number: u32,
     pub column_number: u32,
     pub is_step_start: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameInfo {
+    pub display_name: String,
+    pub on_stack: bool,
+    pub oldest: bool,
+    pub terminated: bool,
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct EventListenerInfo {
+    pub event_type: String,
+    pub capturing: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PauseReason {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub on_next: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct FrameOffset {
+    pub actor: String,
+    pub column: u32,
+    pub line: u32,
 }

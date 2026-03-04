@@ -4,11 +4,11 @@
 
 //! Liberally derived from the [Firefox JS implementation](http://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/inspector.js).
 
-use std::cell::RefCell;
-
+use atomic_refcell::AtomicRefCell;
 use base::generic_channel::GenericSender;
 use base::id::PipelineId;
 use devtools_traits::DevtoolScriptControlMsg;
+use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 use serde_json::{self, Map, Value};
 
@@ -53,11 +53,12 @@ struct SupportsHighlightersReply {
     value: bool,
 }
 
-pub struct InspectorActor {
-    pub name: String,
-    pub highlighter: String,
-    pub page_style: String,
-    pub walker: String,
+#[derive(MallocSizeOf)]
+pub(crate) struct InspectorActor {
+    name: String,
+    highlighter: String,
+    page_style: String,
+    pub(crate) walker: String,
 }
 
 impl Actor for InspectorActor {
@@ -116,31 +117,31 @@ impl InspectorActor {
     // TODO: Passing the pipeline id here isn't correct. We should query the browsing
     // context for the active pipeline, otherwise reloading or navigating will break the inspector.
     pub fn register(
-        registry: &mut ActorRegistry,
+        registry: &ActorRegistry,
         pipeline: PipelineId,
         script_chan: GenericSender<DevtoolScriptControlMsg>,
     ) -> String {
         let highlighter = HighlighterActor {
-            name: registry.new_name("highlighter"),
+            name: registry.new_name::<HighlighterActor>(),
             script_sender: script_chan.clone(),
             pipeline,
         };
 
         let page_style = PageStyleActor {
-            name: registry.new_name("page-style"),
+            name: registry.new_name::<PageStyleActor>(),
             script_chan: script_chan.clone(),
             pipeline,
         };
 
         let walker = WalkerActor {
-            name: registry.new_name("walker"),
-            mutations: RefCell::new(vec![]),
+            name: registry.new_name::<WalkerActor>(),
+            mutations: AtomicRefCell::new(vec![]),
             script_chan,
             pipeline,
         };
 
         let actor = Self {
-            name: registry.new_name("inspector"),
+            name: registry.new_name::<InspectorActor>(),
             highlighter: highlighter.name(),
             page_style: page_style.name(),
             walker: walker.name(),

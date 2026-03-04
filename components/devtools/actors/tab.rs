@@ -10,6 +10,7 @@
 //! [Firefox JS implementation]: https://searchfox.org/mozilla-central/source/devtools/server/actors/descriptors/tab.js
 
 use devtools_traits::DevtoolScriptControlMsg;
+use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -22,7 +23,7 @@ use crate::{EmptyReplyMsg, StreamId};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TabDescriptorActorMsg {
+pub(crate) struct TabDescriptorActorMsg {
     actor: String,
     /// This correspond to webview_id
     #[serde(rename = "browserId")]
@@ -67,7 +68,8 @@ struct GetWatcherReply {
     watcher: WatcherActorMsg,
 }
 
-pub struct TabDescriptorActor {
+#[derive(MallocSizeOf)]
+pub(crate) struct TabDescriptorActor {
     name: String,
     browsing_context_actor: String,
     is_top_level_global: bool,
@@ -118,7 +120,7 @@ impl Actor for TabDescriptorActor {
             "reloadDescriptor" => {
                 // There is an extra bypassCache parameter that we don't currently use.
                 let ctx_actor = registry.find::<BrowsingContextActor>(&self.browsing_context_actor);
-                let pipeline = ctx_actor.active_pipeline_id.get();
+                let pipeline = ctx_actor.pipeline_id();
                 ctx_actor
                     .script_chan
                     .send(DevtoolScriptControlMsg::Reload(pipeline))
@@ -134,13 +136,13 @@ impl Actor for TabDescriptorActor {
 
 impl TabDescriptorActor {
     pub(crate) fn new(
-        actors: &mut ActorRegistry,
+        actors: &ActorRegistry,
         browsing_context_actor: String,
         is_top_level_global: bool,
     ) -> TabDescriptorActor {
-        let name = actors.new_name("tab-description");
-        let root = actors.find_mut::<RootActor>("root");
-        root.tabs.push(name.clone());
+        let name = actors.new_name::<Self>();
+        let root = actors.find::<RootActor>("root");
+        root.tabs.borrow_mut().push(name.clone());
         TabDescriptorActor {
             name,
             browsing_context_actor,
@@ -168,7 +170,7 @@ impl ActorEncode<TabDescriptorActorMsg> for TabDescriptorActor {
             browser_id: ctx_actor.browser_id.value(),
             browsing_context_id: ctx_actor.browsing_context_id.value(),
             is_zombie_tab: false,
-            outer_window_id: ctx_actor.active_outer_window_id.get().value(),
+            outer_window_id: ctx_actor.outer_window_id().value(),
             selected: false,
             title,
             traits: DescriptorTraits {

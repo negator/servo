@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base::id::{PipelineId, TEST_PIPELINE_ID, TEST_WEBVIEW_ID};
-use compositing_traits::CrossProcessPaintApi;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use net::image_cache::ImageCacheFactoryImpl;
 use net_traits::image_cache::{
@@ -18,6 +17,7 @@ use net_traits::{
     DebugVec, FetchMetadata, FetchResponseMsg, FilteredMetadata, Metadata, NetworkError,
     ResourceFetchTiming, ResourceTimingType,
 };
+use paint_api::{CrossProcessPaintApi, PaintMessage};
 use servo_url::ServoUrl;
 use uuid::Uuid;
 use webrender_api::ImageKey;
@@ -27,8 +27,7 @@ use crate::mock_origin;
 fn create_test_image_cache() -> (Arc<dyn ImageCache>, Receiver<PipelineId>) {
     let (sender, receiver) = unbounded();
     let paint_api = CrossProcessPaintApi::dummy_with_callback(Some(Box::new(move |msg| {
-        if let compositing_traits::PaintMessage::GenerateImageKeysForPipeline(_, pipeline_id) = msg
-        {
+        if let PaintMessage::GenerateImageKeysForPipeline(_, pipeline_id) = msg {
             let _ = sender.send(pipeline_id);
         }
     })));
@@ -243,7 +242,7 @@ fn test_notify_pending_response_complete() {
 
     cache.notify_pending_response(
         id,
-        FetchResponseMsg::ProcessResponseEOF(create_request_id(), Ok(create_timing())),
+        FetchResponseMsg::ProcessResponseEOF(create_request_id(), Ok(()), create_timing()),
     );
 
     loop {
@@ -281,7 +280,11 @@ fn test_notify_pending_response_network_error() {
 
     cache.notify_pending_response(
         id,
-        FetchResponseMsg::ProcessResponseEOF(create_request_id(), Err(NetworkError::InvalidMethod)),
+        FetchResponseMsg::ProcessResponseEOF(
+            create_request_id(),
+            Err(NetworkError::InvalidMethod),
+            create_timing(),
+        ),
     );
 
     let result = cache.get_cached_image_status(url, origin, None);
@@ -317,7 +320,7 @@ fn test_image_listener_on_complete_response() {
 
     cache.notify_pending_response(
         id,
-        FetchResponseMsg::ProcessResponseEOF(create_request_id(), Ok(create_timing())),
+        FetchResponseMsg::ProcessResponseEOF(create_request_id(), Ok(()), create_timing()),
     );
 
     loop {
@@ -355,7 +358,11 @@ fn test_image_listener_on_network_error() {
 
     cache.notify_pending_response(
         id,
-        FetchResponseMsg::ProcessResponseEOF(create_request_id(), Err(NetworkError::InvalidMethod)),
+        FetchResponseMsg::ProcessResponseEOF(
+            create_request_id(),
+            Err(NetworkError::InvalidMethod),
+            create_timing(),
+        ),
     );
 
     match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
@@ -446,7 +453,7 @@ fn test_multiple_listeners_same_image() {
 
     cache.notify_pending_response(
         id,
-        FetchResponseMsg::ProcessResponseEOF(create_request_id(), Ok(create_timing())),
+        FetchResponseMsg::ProcessResponseEOF(create_request_id(), Ok(()), create_timing()),
     );
 
     loop {
@@ -492,7 +499,7 @@ fn test_cached_image_reuse() {
 
     cache.notify_pending_response(
         id,
-        FetchResponseMsg::ProcessResponseEOF(create_request_id(), Ok(create_timing())),
+        FetchResponseMsg::ProcessResponseEOF(create_request_id(), Ok(()), create_timing()),
     );
 
     loop {
@@ -532,7 +539,7 @@ fn test_svg_rasterization() {
 
     cache.notify_pending_response(
         id,
-        FetchResponseMsg::ProcessResponseEOF(create_request_id(), Ok(create_timing())),
+        FetchResponseMsg::ProcessResponseEOF(create_request_id(), Ok(()), create_timing()),
     );
 
     let vec_img = loop {
@@ -552,7 +559,7 @@ fn test_svg_rasterization() {
     };
 
     let size = webrender_api::units::DeviceIntSize::new(100, 100);
-    cache.rasterize_vector_image(vec_img.id, size);
+    cache.rasterize_vector_image(vec_img.id, size, None);
 }
 
 #[test]
@@ -584,7 +591,7 @@ fn test_rasterization_listener() {
 
     cache.notify_pending_response(
         id,
-        FetchResponseMsg::ProcessResponseEOF(create_request_id(), Ok(create_timing())),
+        FetchResponseMsg::ProcessResponseEOF(create_request_id(), Ok(()), create_timing()),
     );
 
     let vec_img = loop {
@@ -613,7 +620,7 @@ fn test_rasterization_listener() {
         }
     });
 
-    cache.rasterize_vector_image(vec_img.id, size);
+    cache.rasterize_vector_image(vec_img.id, size, None);
 
     cache.add_rasterization_complete_listener(TEST_PIPELINE_ID, vec_img.id, size, callback);
 

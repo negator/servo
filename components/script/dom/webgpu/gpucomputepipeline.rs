@@ -2,8 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use base::generic_channel::GenericCallback;
 use dom_struct::dom_struct;
-use ipc_channel::ipc::IpcSender;
 use webgpu_traits::{
     WebGPU, WebGPUBindGroupLayout, WebGPUComputePipeline, WebGPUComputePipelineResponse,
     WebGPURequest,
@@ -24,16 +24,35 @@ use crate::dom::webgpu::gpubindgrouplayout::GPUBindGroupLayout;
 use crate::dom::webgpu::gpudevice::GPUDevice;
 use crate::script_runtime::CanGc;
 
+#[derive(JSTraceable, MallocSizeOf)]
+struct DroppableGPUComputePipeline {
+    #[no_trace]
+    channel: WebGPU,
+    #[no_trace]
+    compute_pipeline: WebGPUComputePipeline,
+}
+
+impl Drop for DroppableGPUComputePipeline {
+    fn drop(&mut self) {
+        if let Err(e) = self
+            .channel
+            .0
+            .send(WebGPURequest::DropComputePipeline(self.compute_pipeline.0))
+        {
+            warn!(
+                "Failed to send WebGPURequest::DropComputePipeline({:?}) ({})",
+                self.compute_pipeline.0, e
+            );
+        };
+    }
+}
+
 #[dom_struct]
 pub(crate) struct GPUComputePipeline {
     reflector_: Reflector,
-    #[ignore_malloc_size_of = "channels are hard"]
-    #[no_trace]
-    channel: WebGPU,
     label: DomRefCell<USVString>,
-    #[no_trace]
-    compute_pipeline: WebGPUComputePipeline,
     device: Dom<GPUDevice>,
+    droppable: DroppableGPUComputePipeline,
 }
 
 impl GPUComputePipeline {
@@ -44,10 +63,12 @@ impl GPUComputePipeline {
     ) -> Self {
         Self {
             reflector_: Reflector::new(),
-            channel: device.channel(),
             label: DomRefCell::new(label),
-            compute_pipeline,
             device: Dom::from_ref(device),
+            droppable: DroppableGPUComputePipeline {
+                channel: device.channel(),
+                compute_pipeline,
+            },
         }
     }
 
@@ -72,14 +93,14 @@ impl GPUComputePipeline {
 
 impl GPUComputePipeline {
     pub(crate) fn id(&self) -> &WebGPUComputePipeline {
-        &self.compute_pipeline
+        &self.droppable.compute_pipeline
     }
 
     /// <https://gpuweb.github.io/gpuweb/#dom-gpudevice-createcomputepipeline>
     pub(crate) fn create(
         device: &GPUDevice,
         descriptor: &GPUComputePipelineDescriptor,
-        async_sender: Option<IpcSender<WebGPUComputePipelineResponse>>,
+        async_sender: Option<GenericCallback<WebGPUComputePipelineResponse>>,
     ) -> WebGPUComputePipeline {
         let compute_pipeline_id = device.global().wgpu_id_hub().create_compute_pipeline_id();
 
@@ -124,11 +145,12 @@ impl GPUComputePipelineMethods<crate::DomTypeHolder> for GPUComputePipeline {
         let id = self.global().wgpu_id_hub().create_bind_group_layout_id();
 
         if let Err(e) = self
+            .droppable
             .channel
             .0
             .send(WebGPURequest::ComputeGetBindGroupLayout {
                 device_id: self.device.id().0,
-                pipeline_id: self.compute_pipeline.0,
+                pipeline_id: self.id().0,
                 index,
                 id,
             })
@@ -138,25 +160,10 @@ impl GPUComputePipelineMethods<crate::DomTypeHolder> for GPUComputePipeline {
 
         Ok(GPUBindGroupLayout::new(
             &self.global(),
-            self.channel.clone(),
+            self.droppable.channel.clone(),
             WebGPUBindGroupLayout(id),
             USVString::default(),
             CanGc::note(),
         ))
-    }
-}
-
-impl Drop for GPUComputePipeline {
-    fn drop(&mut self) {
-        if let Err(e) = self
-            .channel
-            .0
-            .send(WebGPURequest::DropComputePipeline(self.compute_pipeline.0))
-        {
-            warn!(
-                "Failed to send WebGPURequest::DropComputePipeline({:?}) ({})",
-                self.compute_pipeline.0, e
-            );
-        };
     }
 }

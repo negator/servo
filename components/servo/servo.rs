@@ -16,9 +16,6 @@ use base::id::{PipelineNamespace, PipelineNamespaceId};
 use bluetooth::BluetoothThreadFactory;
 #[cfg(feature = "bluetooth")]
 use bluetooth_traits::BluetoothRequest;
-use compositing::{InitialPaintState, Paint};
-pub use compositing_traits::rendering_context::RenderingContext;
-use compositing_traits::{CrossProcessPaintApi, PaintMessage, PaintProxy};
 #[cfg(all(
     not(target_os = "windows"),
     not(target_os = "ios"),
@@ -51,10 +48,14 @@ use layout::LayoutFactoryImpl;
 use layout_api::ScriptThreadFactory;
 use log::{Log, Metadata, Record, debug, warn};
 use media::{GlApi, NativeDisplay, WindowGLContext};
+use net::embedder::NetToEmbedderMsg;
 use net::image_cache::ImageCacheFactoryImpl;
 use net::protocols::ProtocolRegistry;
 use net::resource_thread::new_resource_threads;
 use net_traits::{ResourceThreads, exit_fetch_thread, start_fetch_thread};
+use paint::{InitialPaintState, Paint};
+pub use paint_api::rendering_context::RenderingContext;
+use paint_api::{CrossProcessPaintApi, PaintMessage, PaintProxy};
 use profile::{mem as profile_mem, system_reporter, time as profile_time};
 use profile_traits::mem::{MemoryReportResult, ProfilerMsg, Reporter};
 use profile_traits::{mem, time};
@@ -73,6 +74,8 @@ use storage_traits::StorageThreads;
 use style::global_style_data::StyleThreadPool;
 
 use crate::clipboard_delegate::StringRequest;
+#[cfg(feature = "gamepad")]
+use crate::gamepad_provider::{GamepadHapticEffectRequest, GamepadHapticEffectRequestType};
 use crate::javascript_evaluator::JavaScriptEvaluator;
 use crate::network_manager::NetworkManager;
 use crate::proxies::ConstellationProxy;
@@ -133,11 +136,17 @@ mod media_platform {
     }
 }
 
+enum Message {
+    FromNet(NetToEmbedderMsg),
+    FromUnknown(EmbedderMsg),
+}
+
 struct ServoInner {
     delegate: RefCell<Rc<dyn ServoDelegate>>,
     paint: Rc<RefCell<Paint>>,
     constellation_proxy: ConstellationProxy,
     embedder_receiver: Receiver<EmbedderMsg>,
+    net_embedder_receiver: Receiver<NetToEmbedderMsg>,
     network_manager: Rc<RefCell<NetworkManager>>,
     site_data_manager: Rc<RefCell<SiteDataManager>>,
     /// A struct that tracks ongoing JavaScript evaluations and is responsible for
@@ -186,9 +195,11 @@ impl ServoInner {
         }
 
         // Only handle incoming embedder messages if `Paint` hasn't already started shutting down.
-        while let Ok(message) = self.embedder_receiver.try_recv() {
-            self.handle_embedder_message(message);
-
+        while let Some(message) = self.receive_one_message() {
+            match message {
+                Message::FromUnknown(message) => self.handle_embedder_message(message),
+                Message::FromNet(message) => self.handle_net_embedder_message(message),
+            }
             if self.shutdown_state.get() == ShutdownState::FinishedShuttingDown {
                 break;
             }
@@ -210,6 +221,30 @@ impl ServoInner {
         }
 
         true
+    }
+
+    fn receive_one_message(&self) -> Option<Message> {
+        let mut select = crossbeam_channel::Select::new();
+        let embedder_receiver_index = select.recv(&self.embedder_receiver);
+        let net_embedder_receiver_index = select.recv(&self.net_embedder_receiver);
+        let Ok(operation) = select.try_select() else {
+            return None;
+        };
+        let index = operation.index();
+        if index == embedder_receiver_index {
+            let Ok(message) = operation.recv(&self.embedder_receiver) else {
+                return None;
+            };
+            Some(Message::FromUnknown(message))
+        } else if index == net_embedder_receiver_index {
+            let Ok(message) = operation.recv(&self.net_embedder_receiver) else {
+                return None;
+            };
+            Some(Message::FromNet(message))
+        } else {
+            log::error!("No select operation registered for {index:?}");
+            None
+        }
     }
 
     fn send_new_frame_ready_messages(&self) {
@@ -243,6 +278,70 @@ impl ServoInner {
         debug!("Servo received message that Constellation shutdown is complete");
         self.shutdown_state.set(ShutdownState::FinishedShuttingDown);
         self.paint.borrow_mut().finish_shutting_down();
+    }
+
+    fn handle_net_embedder_message(&self, message: NetToEmbedderMsg) {
+        match message {
+            NetToEmbedderMsg::SelectFiles(control_id, file_picker_request, response_sender) => {
+                if file_picker_request.accept_current_paths_for_testing {
+                    let _ = response_sender.send(Some(file_picker_request.current_paths));
+                    return;
+                }
+                if let Some(webview) = self.get_webview_handle(control_id.webview_id) {
+                    webview.delegate().show_embedder_control(
+                        webview,
+                        EmbedderControl::FilePicker(FilePicker {
+                            id: control_id,
+                            file_picker_request,
+                            response_sender: Some(response_sender),
+                        }),
+                    );
+                }
+            },
+            NetToEmbedderMsg::WebResourceRequested(
+                webview_id,
+                web_resource_request,
+                response_sender,
+            ) => {
+                if let Some(webview) =
+                    webview_id.and_then(|webview_id| self.get_webview_handle(webview_id))
+                {
+                    let web_resource_load = WebResourceLoad::new(
+                        web_resource_request,
+                        response_sender,
+                        self.servo_errors.sender(),
+                    );
+                    webview
+                        .delegate()
+                        .load_web_resource(webview, web_resource_load);
+                } else {
+                    let web_resource_load = WebResourceLoad::new(
+                        web_resource_request,
+                        response_sender,
+                        self.servo_errors.sender(),
+                    );
+                    self.delegate.borrow().load_web_resource(web_resource_load);
+                }
+            },
+            NetToEmbedderMsg::RequestAuthentication(
+                webview_id,
+                url,
+                for_proxy,
+                response_sender,
+            ) => {
+                if let Some(webview) = self.get_webview_handle(webview_id) {
+                    let authentication_request = AuthenticationRequest::new(
+                        url.into_url(),
+                        for_proxy,
+                        response_sender,
+                        self.servo_errors.sender(),
+                    );
+                    webview
+                        .delegate()
+                        .request_authentication(webview, authentication_request);
+                }
+            },
+        }
     }
 
     fn handle_embedder_message(&self, message: EmbedderMsg) {
@@ -423,31 +522,6 @@ impl ServoInner {
                         .notify_fullscreen_state_changed(webview, fullscreen);
                 }
             },
-            EmbedderMsg::WebResourceRequested(
-                webview_id,
-                web_resource_request,
-                response_sender,
-            ) => {
-                if let Some(webview) =
-                    webview_id.and_then(|webview_id| self.get_webview_handle(webview_id))
-                {
-                    let web_resource_load = WebResourceLoad::new(
-                        web_resource_request,
-                        response_sender,
-                        self.servo_errors.sender(),
-                    );
-                    webview
-                        .delegate()
-                        .load_web_resource(webview, web_resource_load);
-                } else {
-                    let web_resource_load = WebResourceLoad::new(
-                        web_resource_request,
-                        response_sender,
-                        self.servo_errors.sender(),
-                    );
-                    self.delegate.borrow().load_web_resource(web_resource_load);
-                }
-            },
             EmbedderMsg::Panic(webview_id, reason, backtrace) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview
@@ -462,36 +536,6 @@ impl ServoInner {
                         items,
                         response_sender,
                     );
-                }
-            },
-            EmbedderMsg::SelectFiles(control_id, file_picker_request, response_sender) => {
-                if file_picker_request.accept_current_paths_for_testing {
-                    let _ = response_sender.send(Some(file_picker_request.current_paths));
-                    return;
-                }
-                if let Some(webview) = self.get_webview_handle(control_id.webview_id) {
-                    webview.delegate().show_embedder_control(
-                        webview,
-                        EmbedderControl::FilePicker(FilePicker {
-                            id: control_id,
-                            file_picker_request,
-                            response_sender,
-                            response_sent: false,
-                        }),
-                    );
-                }
-            },
-            EmbedderMsg::RequestAuthentication(webview_id, url, for_proxy, response_sender) => {
-                if let Some(webview) = self.get_webview_handle(webview_id) {
-                    let authentication_request = AuthenticationRequest::new(
-                        url.into_url(),
-                        for_proxy,
-                        response_sender,
-                        self.servo_errors.sender(),
-                    );
-                    webview
-                        .delegate()
-                        .request_authentication(webview, authentication_request);
                 }
             },
             EmbedderMsg::PromptPermission(webview_id, requested_feature, response_sender) => {
@@ -544,30 +588,35 @@ impl ServoInner {
                 callback,
             ) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
-                    webview.delegate().play_gamepad_haptic_effect(
-                        webview,
+                    let request = GamepadHapticEffectRequest::new(
                         gamepad_index,
-                        gamepad_haptic_effect_type,
+                        GamepadHapticEffectRequestType::Play(gamepad_haptic_effect_type),
                         Box::new(move |success| {
                             callback
                                 .send(success)
                                 .expect("Could not send message via callback")
                         }),
                     );
+                    webview
+                        .gamepad_provider()
+                        .handle_haptic_effect_request(request);
                 }
             },
             #[cfg(feature = "gamepad")]
             EmbedderMsg::StopGamepadHapticEffect(webview_id, gamepad_index, callback) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
-                    webview.delegate().stop_gamepad_haptic_effect(
-                        webview,
+                    let request = GamepadHapticEffectRequest::new(
                         gamepad_index,
+                        GamepadHapticEffectRequestType::Stop,
                         Box::new(move |success| {
                             callback
                                 .send(success)
                                 .expect("Could not send message via callback")
                         }),
                     );
+                    webview
+                        .gamepad_provider()
+                        .handle_haptic_effect_request(request);
                 }
             },
             EmbedderMsg::ShowNotification(webview_id, notification) => {
@@ -638,6 +687,13 @@ impl ServoInner {
                     warn!("Failed to respond to GetScreenMetrics: {error}");
                 }
             },
+            EmbedderMsg::AccessibilityTreeUpdate(webview_id, tree_update) => {
+                if let Some(webview) = self.get_webview_handle(webview_id) {
+                    webview
+                        .delegate()
+                        .notify_accessibility_tree_update(webview, tree_update);
+                }
+            },
         }
     }
 }
@@ -703,6 +759,8 @@ impl Servo {
         let (paint_proxy, paint_receiver) = create_paint_channel(event_loop_waker.clone());
         let (constellation_proxy, embedder_to_constellation_receiver) = ConstellationProxy::new();
         let (embedder_proxy, embedder_receiver) = create_embedder_channel(event_loop_waker.clone());
+        let (net_embedder_proxy, net_embedder_receiver) =
+            create_generic_embedder_channel::<NetToEmbedderMsg>(event_loop_waker.clone());
         let time_profiler_chan = profile_time::Profiler::create(
             &opts.time_profiling,
             opts.time_profiler_trace_path.clone(),
@@ -711,8 +769,8 @@ impl Servo {
 
         let devtools_sender = if pref!(devtools_server_enabled) {
             Some(devtools::start_server(
-                pref!(devtools_server_port) as u16,
                 embedder_proxy.clone(),
+                mem_profiler_chan.clone(),
             ))
         } else {
             None
@@ -752,7 +810,7 @@ impl Servo {
                 devtools_sender.clone(),
                 time_profiler_chan.clone(),
                 mem_profiler_chan.clone(),
-                embedder_proxy.clone(),
+                net_embedder_proxy,
                 opts.config_dir.clone(),
                 opts.certificate_path.clone(),
                 opts.ignore_certificate_errors,
@@ -800,6 +858,7 @@ impl Servo {
             ))),
             constellation_proxy,
             embedder_receiver,
+            net_embedder_receiver,
             shutdown_state,
             webviews: Default::default(),
             servo_errors: ServoErrorChannel::default(),
@@ -843,14 +902,10 @@ impl Servo {
         log::set_max_level(filter);
     }
 
-    pub fn create_memory_report(&self, snd: IpcSender<MemoryReportResult>) {
+    pub fn create_memory_report(&self, snd: GenericCallback<MemoryReportResult>) {
         self.0
             .constellation_proxy
             .send(EmbedderToConstellationMessage::CreateMemoryReport(snd));
-    }
-
-    pub fn constellation_sender(&self) -> Sender<EmbedderToConstellationMessage> {
-        self.0.constellation_proxy.sender()
     }
 
     pub fn execute_webdriver_command(&self, command: WebDriverCommandMsg) {
@@ -871,6 +926,14 @@ impl Servo {
 
     pub fn site_data_manager<'a>(&'a self) -> Ref<'a, SiteDataManager> {
         self.0.site_data_manager.borrow()
+    }
+
+    pub fn set_accessibility_active(&self, active: bool) {
+        self.0
+            .constellation_proxy
+            .send(EmbedderToConstellationMessage::SetAccessibilityActive(
+                active,
+            ));
     }
 
     pub(crate) fn paint<'a>(&'a self) -> Ref<'a, Paint> {
@@ -909,6 +972,19 @@ fn create_embedder_channel(
     )
 }
 
+fn create_generic_embedder_channel<T>(
+    event_loop_waker: Box<dyn EventLoopWaker>,
+) -> (GenericEmbedderProxy<T>, Receiver<T>) {
+    let (sender, receiver) = unbounded();
+    (
+        GenericEmbedderProxy {
+            sender,
+            event_loop_waker,
+        },
+        receiver,
+    )
+}
+
 fn create_paint_channel(
     event_loop_waker: Box<dyn EventLoopWaker>,
 ) -> (PaintProxy, RoutedReceiver<PaintMessage>) {
@@ -916,7 +992,7 @@ fn create_paint_channel(
     let sender_clone = sender.clone();
     let event_loop_waker_clone = event_loop_waker.clone();
     // This callback is equivalent to `PaintProxy::send`
-    let result_callback = move |msg: Result<PaintMessage, ipc_channel::Error>| {
+    let result_callback = move |msg: Result<PaintMessage, ipc_channel::IpcError>| {
         if let Err(err) = sender_clone.send(msg) {
             warn!("Failed to send response ({:?}).", err);
         }

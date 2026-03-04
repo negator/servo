@@ -9,6 +9,7 @@ use dom_struct::dom_struct;
 use embedder_traits::EmbedderControlRequest;
 use embedder_traits::{SelectElementOption, SelectElementOptionOrOptgroup};
 use html5ever::{LocalName, Prefix, QualName, local_name, ns};
+use js::context::JSContext;
 use js::rust::HandleObject;
 use style::attr::AttrValue;
 use stylo_dom::ElementState;
@@ -45,7 +46,7 @@ use crate::dom::html::htmlformelement::{FormControl, FormDatum, FormDatumValue, 
 use crate::dom::html::htmloptgroupelement::HTMLOptGroupElement;
 use crate::dom::html::htmloptionelement::HTMLOptionElement;
 use crate::dom::html::htmloptionscollection::HTMLOptionsCollection;
-use crate::dom::node::{BindContext, ChildrenMutation, Node, NodeTraits, UnbindContext};
+use crate::dom::node::{BindContext, ChildrenMutation, Node, NodeTraits, ShadowIncluding, UnbindContext};
 use crate::dom::nodelist::NodeList;
 use crate::dom::text::Text;
 use crate::dom::types::FocusEvent;
@@ -127,7 +128,6 @@ impl HTMLSelectElement {
         }
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
@@ -400,9 +400,11 @@ impl HTMLSelectElement {
                 EmbedderControlRequest::SelectElement(options, selected_index),
                 None,
             );
+        self.upcast::<Element>().set_open_state(true);
     }
 
     pub(crate) fn handle_menu_response(&self, response: Option<usize>, can_gc: CanGc) {
+        self.upcast::<Element>().set_open_state(false);
         let Some(selected_value) = response else {
             return;
         };
@@ -445,6 +447,25 @@ impl HTMLSelectElement {
     fn may_have_embedder_control(&self) -> bool {
         let el = self.upcast::<Element>();
         !el.disabled_state()
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#select-enabled-selectedcontent>
+    pub(crate) fn get_enabled_selectedcontent(&self) -> Option<DomRoot<Element>> {
+        // Step 1. If select has the multiple attribute, then return null.
+        if self.Multiple() {
+            return None;
+        }
+
+        // Step 2. Let selectedcontent be the first selectedcontent element descendant
+        // of select in tree order if any such element exists; otherwise return null.
+        // TODO: Step 3. If selectedcontent's disabled is true, then return null.
+        // NOTE: We don't actually implement selectedcontent yet
+        // Step 4. Return selectedcontent.
+        self.upcast::<Node>()
+            .traverse_preorder(ShadowIncluding::No)
+            .skip(1)
+            .filter_map(DomRoot::downcast::<Element>)
+            .find(|element| element.local_name() == &local_name!("selectedcontent"))
     }
 }
 
@@ -636,13 +657,13 @@ impl HTMLSelectElementMethods<crate::DomTypeHolder> for HTMLSelectElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-cva-checkvalidity>
-    fn CheckValidity(&self, can_gc: CanGc) -> bool {
-        self.check_validity(can_gc)
+    fn CheckValidity(&self, cx: &mut JSContext) -> bool {
+        self.check_validity(cx)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-cva-reportvalidity>
-    fn ReportValidity(&self, can_gc: CanGc) -> bool {
-        self.report_validity(can_gc)
+    fn ReportValidity(&self, cx: &mut JSContext) -> bool {
+        self.report_validity(cx)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-cva-validationmessage>
@@ -815,7 +836,7 @@ impl Activatable for HTMLSelectElement {
     }
 
     fn is_instance_activatable(&self) -> bool {
-        true
+        !self.upcast::<Element>().disabled_state()
     }
 
     fn activation_behavior(&self, _event: &Event, _target: &EventTarget, _can_gc: CanGc) {

@@ -32,7 +32,7 @@ use crate::dom::bindings::weakref::MutableWeakRef;
 use crate::dom::html::htmlmediaelement::HTMLMediaElement;
 use crate::dom::media::mediametadata::MediaMetadata;
 use crate::dom::window::Window;
-use crate::realms::{InRealm, enter_realm};
+use crate::realms::enter_auto_realm;
 use crate::script_runtime::CanGc;
 
 #[dom_struct]
@@ -55,7 +55,6 @@ pub(crate) struct MediaSession {
 }
 
 impl MediaSession {
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn new_inherited() -> MediaSession {
         MediaSession {
             reflector_: Reflector::new(),
@@ -74,11 +73,18 @@ impl MediaSession {
         self.media_instance.set(Some(media_instance));
     }
 
-    pub(crate) fn handle_action(&self, action: MediaSessionActionType, can_gc: CanGc) {
+    pub(crate) fn handle_action(
+        &self,
+        cx: &mut js::context::JSContext,
+        action: MediaSessionActionType,
+    ) {
         debug!("Handle media session action {:?}", action);
 
         if let Some(handler) = self.action_handlers.borrow().get(&action) {
-            if handler.Call__(ExceptionHandling::Report, can_gc).is_err() {
+            if handler
+                .Call__(ExceptionHandling::Report, CanGc::from_cx(cx))
+                .is_err()
+            {
                 warn!("Error calling MediaSessionActionHandler callback");
             }
             return;
@@ -88,11 +94,12 @@ impl MediaSession {
         if let Some(media) = self.media_instance.root() {
             match action {
                 MediaSessionActionType::Play => {
-                    let realm = enter_realm(self);
-                    media.Play(InRealm::Entered(&realm), can_gc);
+                    let mut realm = enter_auto_realm(cx, self);
+                    let mut realm = realm.current_realm();
+                    media.Play(&mut realm);
                 },
                 MediaSessionActionType::Pause => {
-                    media.Pause(can_gc);
+                    media.Pause(cx);
                 },
                 MediaSessionActionType::SeekBackward => {},
                 MediaSessionActionType::SeekForward => {},
@@ -215,19 +222,19 @@ impl MediaSessionMethods<crate::DomTypeHolder> for MediaSession {
         let duration = if let Some(state_duration) = state.duration {
             // If state’s duration is negative or NaN, throw a TypeError.
             if state_duration < 0.0 || state_duration.is_nan() {
-                return Err(Error::Type("Duration is negative or NaN".to_owned()));
+                return Err(Error::Type(c"Duration is negative or NaN".to_owned()));
             }
             state_duration
         } else {
             // If state’s duration is not present, throw a TypeError.
-            return Err(Error::Type("Duration is not present".to_owned()));
+            return Err(Error::Type(c"Duration is not present".to_owned()));
         };
 
         let position = if let Some(state_position) = state.position {
             // If state’s position is negative or greater than duration, throw a TypeError.
             if *state_position < 0.0 || *state_position > duration {
                 return Err(Error::Type(
-                    "Position is negative or greater than duration".to_owned(),
+                    c"Position is negative or greater than duration".to_owned(),
                 ));
             }
             *state_position
@@ -239,7 +246,7 @@ impl MediaSessionMethods<crate::DomTypeHolder> for MediaSession {
         let playback_rate = if let Some(state_playback_rate) = state.playbackRate {
             // If state’s playbackRate is zero, throw a TypeError.
             if *state_playback_rate == 0.0 {
-                return Err(Error::Type("Playback rate is zero".to_owned()));
+                return Err(Error::Type(c"Playback rate is zero".to_owned()));
             }
             *state_playback_rate
         } else {

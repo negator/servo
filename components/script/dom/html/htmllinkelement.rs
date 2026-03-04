@@ -9,6 +9,7 @@ use std::default::Default;
 use base::generic_channel::GenericSharedMemory;
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Prefix, local_name, ns};
+use js::context::JSContext;
 use js::rust::HandleObject;
 use net_traits::image_cache::{
     Image, ImageCache, ImageCacheResponseCallback, ImageCacheResult, ImageLoadListener,
@@ -106,6 +107,8 @@ pub(crate) struct HTMLLinkElement {
     previous_media_environment_matched: Cell<bool>,
     /// Line number this element was created on
     line_number: u64,
+    /// <https://html.spec.whatwg.org/multipage/#dom-link-blocking>
+    blocking: MutNullableDom<DOMTokenList>,
 }
 
 impl HTMLLinkElement {
@@ -129,10 +132,10 @@ impl HTMLLinkElement {
             previous_type_matched: Cell::new(true),
             previous_media_environment_matched: Cell::new(true),
             line_number: creator.return_line_number(),
+            blocking: Default::default(),
         }
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
@@ -155,18 +158,31 @@ impl HTMLLinkElement {
         self.request_generation_id.get()
     }
 
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
+    fn remove_stylesheet(&self) {
+        if let Some(stylesheet) = self.stylesheet.borrow_mut().take() {
+            let owner = self.stylesheet_list_owner();
+            owner.remove_stylesheet(
+                StylesheetSource::Element(Dom::from_ref(self.upcast())),
+                &stylesheet,
+            );
+            self.clean_stylesheet_ownership();
+            owner.invalidate_stylesheets();
+        }
+    }
+
     // FIXME(emilio): These methods are duplicated with
     // HTMLStyleElement::set_stylesheet.
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
-    pub(crate) fn set_stylesheet(&self, s: Arc<Stylesheet>) {
-        let stylesheets_owner = self.stylesheet_list_owner();
-        if let Some(ref s) = *self.stylesheet.borrow() {
-            stylesheets_owner
-                .remove_stylesheet(StylesheetSource::Element(Dom::from_ref(self.upcast())), s)
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
+    pub(crate) fn set_stylesheet(&self, new_stylesheet: Arc<Stylesheet>) {
+        let owner = self.stylesheet_list_owner();
+        if let Some(old_stylesheet) = self.stylesheet.borrow_mut().replace(new_stylesheet.clone()) {
+            owner.remove_stylesheet(
+                StylesheetSource::Element(Dom::from_ref(self.upcast())),
+                &old_stylesheet,
+            );
         }
-        *self.stylesheet.borrow_mut() = Some(s.clone());
-        self.clean_stylesheet_ownership();
-        stylesheets_owner.add_owned_stylesheet(self.upcast(), s);
+        owner.add_owned_stylesheet(self.upcast(), new_stylesheet);
     }
 
     pub(crate) fn get_stylesheet(&self) -> Option<Arc<Stylesheet>> {
@@ -180,7 +196,7 @@ impl HTMLLinkElement {
                     &self.owner_window(),
                     Some(self.upcast::<Element>()),
                     "text/css".into(),
-                    None, // todo handle location
+                    Some(self.Href().into()),
                     None, // todo handle title
                     sheet,
                     None, // constructor_document
@@ -191,7 +207,11 @@ impl HTMLLinkElement {
     }
 
     pub(crate) fn is_alternate(&self) -> bool {
-        self.relations.get().contains(LinkRelations::ALTERNATE)
+        self.relations.get().contains(LinkRelations::ALTERNATE) &&
+            !self
+                .upcast::<Element>()
+                .get_string_attribute(&local_name!("title"))
+                .is_empty()
     }
 
     pub(crate) fn is_effectively_disabled(&self) -> bool {
@@ -205,10 +225,6 @@ impl HTMLLinkElement {
             cssom_stylesheet.set_owner_node(None);
         }
         self.cssom_stylesheet.set(None);
-    }
-
-    pub(crate) fn line_number(&self) -> u32 {
-        self.line_number as u32
     }
 }
 
@@ -233,7 +249,7 @@ impl VirtualMethods for HTMLLinkElement {
         let local_name = attr.local_name();
         let is_removal = mutation.is_removal();
         if *local_name == local_name!("disabled") {
-            self.handle_disabled_attribute_change(!is_removal);
+            self.handle_disabled_attribute_change(is_removal);
             return;
         }
 
@@ -242,18 +258,37 @@ impl VirtualMethods for HTMLLinkElement {
         }
         match *local_name {
             local_name!("rel") | local_name!("rev") => {
+                let previous_relations = self.relations.get();
                 self.relations
                     .set(LinkRelations::for_element(self.upcast()));
-            },
-            local_name!("href") => {
-                if is_removal {
+
+                // If relations haven't changed, we shouldn't do anything
+                if previous_relations == self.relations.get() {
                     return;
                 }
-                // https://html.spec.whatwg.org/multipage/#link-type-stylesheet
-                // When the href attribute of the link element of an external resource link
-                // that is already browsing-context connected is changed.
+
+                // https://html.spec.whatwg.org/multipage/#link-type-stylesheet:fetch-and-process-the-linked-resource
+                // > When the external resource link is created on a link element that is already browsing-context connected.
                 if self.relations.get().contains(LinkRelations::STYLESHEET) {
-                    self.handle_stylesheet_url(&attr.value());
+                    self.handle_stylesheet_url();
+                } else {
+                    self.remove_stylesheet();
+                }
+            },
+            local_name!("href") => {
+                // https://html.spec.whatwg.org/multipage/#attr-link-href
+                // > If both the href and imagesrcset attributes are absent, then the element does not define a link.
+                if is_removal {
+                    if self.relations.get().contains(LinkRelations::STYLESHEET) {
+                        self.remove_stylesheet();
+                    }
+                    return;
+                }
+                // https://html.spec.whatwg.org/multipage/#link-type-stylesheet:fetch-and-process-the-linked-resource
+                // > When the href attribute of the link element of an external resource link
+                // > that is already browsing-context connected is changed.
+                if self.relations.get().contains(LinkRelations::STYLESHEET) {
+                    self.handle_stylesheet_url();
                 }
 
                 if self.relations.get().contains(LinkRelations::ICON) {
@@ -289,7 +324,7 @@ impl VirtualMethods for HTMLLinkElement {
                 // When the crossorigin attribute of the link element of an external resource link
                 // that is already browsing-context connected is set, changed, or removed.
                 if self.relations.get().contains(LinkRelations::STYLESHEET) {
-                    self.handle_stylesheet_url(&attr.value());
+                    self.handle_stylesheet_url();
                 }
             },
             local_name!("as") => {
@@ -303,7 +338,7 @@ impl VirtualMethods for HTMLLinkElement {
                 }
             },
             local_name!("type") => {
-                // https://html.spec.whatwg.org/multipage/#link-type-stylesheet
+                // https://html.spec.whatwg.org/multipage/#link-type-stylesheet:fetch-and-process-the-linked-resource
                 // When the type attribute of the link element of an external resource link that
                 // is already browsing-context connected is set or changed to a value that does
                 // not or no longer matches the Content-Type metadata of the previous obtained
@@ -311,7 +346,7 @@ impl VirtualMethods for HTMLLinkElement {
                 //
                 // TODO: Match Content-Type metadata to check if it needs to be updated
                 if self.relations.get().contains(LinkRelations::STYLESHEET) {
-                    self.handle_stylesheet_url(&attr.value());
+                    self.handle_stylesheet_url();
                 }
 
                 // https://html.spec.whatwg.org/multipage/#link-type-preload
@@ -373,8 +408,10 @@ impl VirtualMethods for HTMLLinkElement {
 
             if let Some(href) = get_attr(element, &local_name!("href")) {
                 let relations = self.relations.get();
+                // https://html.spec.whatwg.org/multipage/#link-type-stylesheet:fetch-and-process-the-linked-resource
+                // > When the external resource link's link element becomes browsing-context connected.
                 if relations.contains(LinkRelations::STYLESHEET) {
-                    self.handle_stylesheet_url(&href);
+                    self.handle_stylesheet_url();
                 }
 
                 if relations.contains(LinkRelations::ICON) {
@@ -397,11 +434,7 @@ impl VirtualMethods for HTMLLinkElement {
             s.unbind_from_tree(context, can_gc);
         }
 
-        if let Some(s) = self.stylesheet.borrow_mut().take() {
-            self.clean_stylesheet_ownership();
-            self.stylesheet_list_owner()
-                .remove_stylesheet(StylesheetSource::Element(Dom::from_ref(self.upcast())), &s);
-        }
+        self.remove_stylesheet();
     }
 }
 
@@ -497,12 +530,39 @@ impl HTMLLinkElement {
 
     /// <https://html.spec.whatwg.org/multipage/#linked-resource-fetch-setup-steps>
     fn linked_resource_fetch_setup(&self, request: &mut RequestBuilder) -> bool {
+        // https://html.spec.whatwg.org/multipage/#rel-icon:linked-resource-fetch-setup-steps
         if self.relations.get().contains(LinkRelations::ICON) {
             // Step 1. Set request's destination to "image".
             request.destination = Destination::Image;
 
             // Step 2. Return true.
-            return true;
+            //
+            // Fall-through
+        }
+
+        // https://html.spec.whatwg.org/multipage/#link-type-stylesheet:linked-resource-fetch-setup-steps
+        if self.relations.get().contains(LinkRelations::STYLESHEET) {
+            // Step 1. If el's disabled attribute is set, then return false.
+            if self
+                .upcast::<Element>()
+                .has_attribute(&local_name!("disabled"))
+            {
+                return false;
+            }
+            // Step 2. If el contributes a script-blocking style sheet, append el to its node document's script-blocking style sheet set.
+            //
+            // Implemented in `ElementStylesheetLoader::load_with_element`.
+
+            // Step 3. If el's media attribute's value matches the environment and el is potentially render-blocking, then block rendering on el.
+            //
+            // Implemented in `ElementStylesheetLoader::load_with_element`.
+
+            // Step 4. If el is currently render-blocking, then set request's render-blocking to true.
+            // TODO
+
+            // Step 5. Return true.
+            //
+            // Fall-through
         }
 
         true
@@ -548,27 +608,28 @@ impl HTMLLinkElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#concept-link-obtain>
-    fn handle_stylesheet_url(&self, href: &str) {
+    fn handle_stylesheet_url(&self) {
         let document = self.owner_document();
         if document.browsing_context().is_none() {
             return;
         }
 
+        let element = self.upcast::<Element>();
+
         // Step 1.
+        let href = element.get_string_attribute(&local_name!("href"));
         if href.is_empty() {
             return;
         }
 
         // Step 2.
-        let link_url = match document.base_url().join(href) {
+        let link_url = match document.base_url().join(&href.str()) {
             Ok(url) => url,
             Err(e) => {
                 debug!("Parsing url {} failed: {}", href, e);
                 return;
             },
         };
-
-        let element = self.upcast::<Element>();
 
         // Step 3
         let cors_setting = cors_setting_for_element(element);
@@ -596,9 +657,10 @@ impl HTMLLinkElement {
 
         self.request_generation_id
             .set(self.request_generation_id.get().increment());
+        self.pending_loads.set(0);
 
-        let loader = ElementStylesheetLoader::new(self.upcast());
-        loader.load(
+        ElementStylesheetLoader::load_with_element(
+            self.upcast(),
             StylesheetContextSource::LinkElement,
             media,
             link_url,
@@ -608,12 +670,13 @@ impl HTMLLinkElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#attr-link-disabled>
-    fn handle_disabled_attribute_change(&self, disabled: bool) {
-        if !disabled {
+    fn handle_disabled_attribute_change(&self, is_removal: bool) {
+        // > Whenever the disabled attribute is removed, set the link element's explicitly enabled attribute to true.
+        if is_removal {
             self.is_explicitly_enabled.set(true);
         }
         if let Some(stylesheet) = self.get_stylesheet() {
-            if stylesheet.set_disabled(disabled) {
+            if stylesheet.set_disabled(!is_removal) {
                 self.stylesheet_list_owner().invalidate_stylesheets();
             }
         }
@@ -689,7 +752,7 @@ impl HTMLLinkElement {
         let trusted_node = Trusted::new(self);
         let window = self.owner_window();
         let request_generation_id = self.get_request_generation_id();
-        window.register_image_cache_listener(id, move |response| {
+        window.register_image_cache_listener(id, move |response, _| {
             let trusted_node = trusted_node.clone();
             let link_element = trusted_node.root();
             let window = link_element.owner_window();
@@ -757,7 +820,7 @@ impl HTMLLinkElement {
 
                 let image_cache = window.image_cache();
                 if let Some(raster_image) =
-                    image_cache.rasterize_vector_image(vector_image.id, size)
+                    image_cache.rasterize_vector_image(vector_image.id, size, None)
                 {
                     send_rasterized_favicon_to_embedder(&raster_image);
                 } else {
@@ -811,7 +874,7 @@ impl HTMLLinkElement {
     /// <https://html.spec.whatwg.org/multipage/#link-type-preload:fetch-and-process-the-linked-resource-2>
     pub(crate) fn fire_event_after_response(
         &self,
-        response: Result<ResourceFetchTiming, NetworkError>,
+        response: Result<(), NetworkError>,
         can_gc: CanGc,
     ) {
         // Step 3.1 If response is a network error, fire an event named error at el.
@@ -849,6 +912,20 @@ impl StylesheetOwner for HTMLLinkElement {
 
     fn parser_inserted(&self) -> bool {
         self.parser_inserted.get()
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#potentially-render-blocking>
+    fn potentially_render_blocking(&self) -> bool {
+        // An element is potentially render-blocking if its blocking tokens set contains "render",
+        // or if it is implicitly potentially render-blocking, which will be defined at the individual elements.
+        // By default, an element is not implicitly potentially render-blocking.
+        //
+        // https://html.spec.whatwg.org/multipage/#link-type-stylesheet:implicitly-potentially-render-blocking
+        // > A link element of this type is implicitly potentially render-blocking if the element was created by its node document's parser.
+        self.parser_inserted() ||
+            self.blocking
+                .get()
+                .is_some_and(|list| list.Contains("render".into()))
     }
 
     fn referrer_policy(&self) -> ReferrerPolicy {
@@ -973,14 +1050,26 @@ impl HTMLLinkElementMethods<crate::DomTypeHolder> for HTMLLinkElement {
     // https://html.spec.whatwg.org/multipage/#dom-link-target
     make_setter!(SetTarget, "target");
 
+    /// <https://html.spec.whatwg.org/multipage/#attr-link-blocking>
+    fn Blocking(&self, can_gc: CanGc) -> DomRoot<DOMTokenList> {
+        self.blocking.or_init(|| {
+            DOMTokenList::new(
+                self.upcast(),
+                &local_name!("blocking"),
+                Some(vec![Atom::from("render")]),
+                can_gc,
+            )
+        })
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#dom-link-crossorigin>
     fn GetCrossOrigin(&self) -> Option<DOMString> {
         reflect_cross_origin_attribute(self.upcast::<Element>())
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-link-crossorigin>
-    fn SetCrossOrigin(&self, value: Option<DOMString>, can_gc: CanGc) {
-        set_cross_origin_attribute(self.upcast::<Element>(), value, can_gc);
+    fn SetCrossOrigin(&self, cx: &mut JSContext, value: Option<DOMString>) {
+        set_cross_origin_attribute(cx, self.upcast::<Element>(), value);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-link-referrerpolicy>
@@ -1032,25 +1121,21 @@ impl FetchResponseListener for FaviconFetchContext {
 
     fn process_response_eof(
         self,
+        cx: &mut js::context::JSContext,
         request_id: RequestId,
-        response: Result<ResourceFetchTiming, NetworkError>,
+        response: Result<(), NetworkError>,
+        timing: ResourceFetchTiming,
     ) {
         self.image_cache.notify_pending_response(
             self.id,
-            FetchResponseMsg::ProcessResponseEOF(request_id, response.clone()),
+            FetchResponseMsg::ProcessResponseEOF(request_id, response.clone(), timing.clone()),
         );
-        if let Ok(response) = response {
-            submit_timing(&self, &response, CanGc::note());
-        }
+        submit_timing(&self, &response, &timing, CanGc::from_cx(cx));
     }
 
     fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<Violation>) {
         let global = &self.resource_timing_global();
-        let link = self.link.root();
-        let source_position = link
-            .upcast::<Element>()
-            .compute_source_position(link.line_number as u32);
-        global.report_csp_violations(violations, None, Some(source_position));
+        global.report_csp_violations(violations, None, None);
     }
 }
 

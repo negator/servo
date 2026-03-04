@@ -14,7 +14,7 @@ mod timeout;
 mod user_prompt;
 
 use std::borrow::ToOwned;
-use std::cell::{Cell, LazyCell, RefCell};
+use std::cell::LazyCell;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::net::{SocketAddr, SocketAddrV4};
@@ -30,9 +30,9 @@ use cookie::{CookieBuilder, Expiration, SameSite};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, after, select, unbounded};
 use embedder_traits::{
     CustomHandlersAutomationMode, EventLoopWaker, ImeEvent, InputEvent, JSValue,
-    JavaScriptEvaluationError, JavaScriptEvaluationResultSerializationError, MouseButton,
-    NewWindowTypeHint, WebDriverCommandMsg, WebDriverFrameId, WebDriverJSResult,
-    WebDriverLoadStatus, WebDriverScriptCommand,
+    JavaScriptEvaluationError, JavaScriptEvaluationResultSerializationError, NewWindowTypeHint,
+    WebDriverCommandMsg, WebDriverFrameId, WebDriverJSResult, WebDriverLoadStatus,
+    WebDriverScriptCommand,
 };
 use euclid::{Point2D, Rect, Size2D};
 use http::method::Method;
@@ -73,9 +73,11 @@ use webdriver::response::{
 };
 use webdriver::server::{self, Session, SessionTeardownKind, WebDriverHandler};
 
-use crate::actions::{InputSourceState, PointerInputState};
+use crate::actions::{
+    ELEMENT_CLICK_BUTTON, InputSourceState, PendingPointerMove, PointerInputState,
+};
 use crate::session::{PageLoadStrategy, WebDriverSession};
-use crate::timeout::{DEFAULT_PAGE_LOAD_TIMEOUT, SCREENSHOT_TIMEOUT};
+use crate::timeout::{DEFAULT_IMPLICIT_WAIT, DEFAULT_PAGE_LOAD_TIMEOUT, SCREENSHOT_TIMEOUT};
 
 fn extension_routes() -> Vec<(Method, &'static str, ServoExtensionRoute)> {
     vec![
@@ -133,8 +135,9 @@ pub fn start_server(
     port: u16,
     embedder_sender: Sender<WebDriverCommandMsg>,
     event_loop_waker: Box<dyn EventLoopWaker>,
+    default_preferences: Preferences,
 ) {
-    let handler = Handler::new(embedder_sender, event_loop_waker);
+    let handler = Handler::new(embedder_sender, event_loop_waker, default_preferences);
 
     thread::Builder::new()
         .name("WebDriverHttpServer".to_owned())
@@ -178,10 +181,13 @@ struct Handler {
     /// Once these receivers receive a response, we know that the event has been handled.
     ///
     /// TODO: Once we upgrade crossbeam-channel this can be replaced with a `WaitGroup`.
-    pending_input_event_receivers: RefCell<Vec<Receiver<()>>>,
+    pending_input_event_receivers: Vec<Receiver<()>>,
 
-    /// Number of pending actions of which WebDriver is waiting for responses.
-    num_pending_actions: Cell<u32>,
+    /// Moves that are currently in-progress and need to be ticked.
+    pending_pointer_moves: Vec<PendingPointerMove>,
+
+    /// The base set of preferences to treat as default when resetting.
+    default_preferences: Preferences,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -444,6 +450,7 @@ impl Handler {
     fn new(
         embedder_sender: Sender<WebDriverCommandMsg>,
         event_loop_waker: Box<dyn EventLoopWaker>,
+        default_preferences: Preferences,
     ) -> Handler {
         // Create a pair of both an IPC and a threaded channel,
         // keep the IPC sender to clone and pass to the constellation for each load,
@@ -459,8 +466,9 @@ impl Handler {
             session: None,
             embedder_sender,
             event_loop_waker,
+            default_preferences,
             pending_input_event_receivers: Default::default(),
-            num_pending_actions: Cell::new(0),
+            pending_pointer_moves: Default::default(),
         }
     }
 
@@ -486,7 +494,7 @@ impl Handler {
         ));
     }
 
-    fn send_blocking_input_event_to_embedder(&self, input_event: InputEvent) {
+    fn send_blocking_input_event_to_embedder(&mut self, input_event: InputEvent) {
         let (result_sender, result_receiver) = unbounded();
         if self
             .send_message_to_embedder(WebDriverCommandMsg::InputEvent(
@@ -496,9 +504,7 @@ impl Handler {
             ))
             .is_ok()
         {
-            self.pending_input_event_receivers
-                .borrow_mut()
-                .push(result_receiver);
+            self.pending_input_event_receivers.push(result_receiver);
         }
     }
 
@@ -633,7 +639,7 @@ impl Handler {
                 self.session_mut()?.set_webview_id(webview_id);
                 self.session_mut()?
                     .set_browsing_context_id(BrowsingContextId::from(webview_id));
-                let _ = self.wait_document_ready(Some(3000));
+                let _ = self.wait_document_ready(Some(DEFAULT_PAGE_LOAD_TIMEOUT));
             },
         };
 
@@ -1392,7 +1398,9 @@ impl Handler {
         let (implicit_wait, sleep_interval) = {
             let timeouts = self.session()?.session_timeouts();
             (
-                Duration::from_millis(timeouts.implicit_wait.unwrap_or(0)),
+                timeouts
+                    .implicit_wait
+                    .map_or(Duration::MAX, Duration::from_millis),
                 Duration::from_millis(timeouts.sleep_interval),
             )
         };
@@ -1907,7 +1915,7 @@ impl Handler {
         self.handle_any_user_prompts(self.webview_id()?)?;
         let (sender, receiver) = generic_channel::channel().unwrap();
         let cmd = WebDriverScriptCommand::DeleteCookies(sender);
-        self.browsing_context_script_command(cmd, VerifyBrowsingContextIsOpen::Yes)?;
+        self.browsing_context_script_command(cmd, VerifyBrowsingContextIsOpen::No)?;
         wait_for_ipc_response_flatten(receiver)?;
         Ok(WebDriverResponse::Void)
     }
@@ -1919,10 +1927,11 @@ impl Handler {
         // FIXME: The specification says that all of these values can be `null`, but the `webdriver` crate
         // only supports setting `script` as null. When set to null, report these values as being the
         // default ones for now.
+        // Waiting for version bump together with geckodriver.
         let timeouts = TimeoutsResponse {
             script: timeouts.script,
             page_load: timeouts.page_load.unwrap_or(DEFAULT_PAGE_LOAD_TIMEOUT),
-            implicit: timeouts.implicit_wait.unwrap_or(0),
+            implicit: timeouts.implicit_wait.unwrap_or(DEFAULT_IMPLICIT_WAIT),
         };
 
         Ok(WebDriverResponse::Timeouts(timeouts))
@@ -2030,14 +2039,25 @@ impl Handler {
         // Step 1. Let body and arguments be the result of trying to extract the script arguments
         // from a request with argument parameters.
         let (func_body, args_string) = self.extract_script_arguments(parameters)?;
+
         // This is pretty ugly; we really want something that acts like
         // new Function() and then takes the resulting function and executes
         // it with a vec of arguments.
         let script = format!(
-            "(function() {{ {}\n }})({})",
-            func_body,
+            r#"(async function() {{
+                try {{
+                    let result = (async function() {{
+                        {func_body}
+                    }})({});
+                    let value = await result;
+                    window.webdriverCallback(value);
+                }} catch (err) {{
+                    window.webdriverException(err);
+                }}
+            }})();"#,
             args_string.join(", ")
         );
+
         debug!("{}", script);
 
         // Step 2. If session's current browsing context is no longer open,
@@ -2048,14 +2068,16 @@ impl Handler {
         self.handle_any_user_prompts(self.webview_id()?)?;
 
         let (sender, receiver) = generic_channel::channel().unwrap();
-        let cmd = WebDriverScriptCommand::ExecuteScript(script, sender);
+        let cmd = WebDriverScriptCommand::ExecuteScriptWithCallback(script, sender);
+
         self.browsing_context_script_command(cmd, VerifyBrowsingContextIsOpen::No)?;
 
         let timeout_duration = self
             .session()?
             .session_timeouts()
             .script
-            .map(Duration::from_millis);
+            .map_or(Duration::MAX, Duration::from_millis);
+
         let result = wait_for_script_ipc_response_with_timeout(receiver, timeout_duration)?;
 
         self.javascript_evaluation_result_to_webdriver_response(result)
@@ -2073,11 +2095,11 @@ impl Handler {
         let joined_args = args_string.join(", ");
         let script = format!(
             r#"(function() {{
-              let webdriverPromise = new Promise(function(resolve, reject) {{
+                new Promise(function(resolve, reject) {{
                   (async function() {{
                     {function_body}
                   }})({joined_args})
-                    .then((v) => {{}}, (err) => reject(err))
+                    .catch(reject)
               }})
               .then((v) => window.webdriverCallback(v), (r) => window.webdriverException(r))
               .catch((r) => window.webdriverException(r));
@@ -2094,7 +2116,7 @@ impl Handler {
 
         let (sender, receiver) = generic_channel::channel().unwrap();
         self.browsing_context_script_command(
-            WebDriverScriptCommand::ExecuteAsyncScript(script, sender),
+            WebDriverScriptCommand::ExecuteScriptWithCallback(script, sender),
             VerifyBrowsingContextIsOpen::No,
         )?;
 
@@ -2102,7 +2124,7 @@ impl Handler {
             .session()?
             .session_timeouts()
             .script
-            .map(Duration::from_millis);
+            .map_or(Duration::MAX, Duration::from_millis);
         let result = wait_for_script_ipc_response_with_timeout(receiver, timeout_duration)?;
 
         self.javascript_evaluation_result_to_webdriver_response(result)
@@ -2334,14 +2356,14 @@ impl Handler {
         // Step 8.11. Construct pointer down action.
         // Step 8.12. Set a property button to 0 on pointer down action.
         let pointer_down_action = PointerDownAction {
-            button: i16::from(MouseButton::Left) as u64,
+            button: ELEMENT_CLICK_BUTTON,
             ..Default::default()
         };
 
         // Step 8.13. Construct pointer up action.
         // Step 8.14. Set a property button to 0 on pointer up action.
         let pointer_up_action = PointerUpAction {
-            button: i16::from(MouseButton::Left) as u64,
+            button: ELEMENT_CLICK_BUTTON,
             ..Default::default()
         };
 
@@ -2454,10 +2476,11 @@ impl Handler {
 
         let rect = wait_for_ipc_response_flatten(receiver)?;
 
+        // TODO: Consider writing mode. Convert `rect` before requesting screenshot.
         // Step 5
         let encoded = self.take_screenshot(Some(Rect::from_untyped(&rect)))?;
 
-        // Step 6 return success with data encoded string.
+        // Step 6. return success with data encoded string.
         Ok(WebDriverResponse::Generic(ValueResponse(
             serde_json::to_value(encoded)?,
         )))
@@ -2529,13 +2552,12 @@ impl Handler {
         parameters: &GetPrefsParameters,
     ) -> WebDriverResult<WebDriverResponse> {
         let (new_preferences, map) = if parameters.prefs.is_empty() {
-            (Preferences::default(), BTreeMap::new())
+            (self.default_preferences.clone(), BTreeMap::new())
         } else {
             // If we only want to reset some of the preferences.
             let mut new_preferences = prefs::get().clone();
-            let default_preferences = Preferences::default();
             for key in parameters.prefs.iter() {
-                new_preferences.set_value(key, default_preferences.get_value(key))
+                new_preferences.set_value(key, self.default_preferences.get_value(key))
             }
 
             let map = parameters
@@ -2780,14 +2802,11 @@ where
 
 fn wait_for_script_ipc_response_with_timeout<T>(
     receiver: GenericReceiver<T>,
-    timeout: Option<Duration>,
+    timeout: Duration,
 ) -> Result<T, WebDriverError>
 where
     T: for<'de> Deserialize<'de> + Serialize,
 {
-    let Some(timeout) = timeout else {
-        return wait_for_ipc_response(receiver);
-    };
     receiver
         .try_recv_timeout(timeout)
         .map_err(|error| match error {

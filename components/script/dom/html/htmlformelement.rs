@@ -12,6 +12,7 @@ use encoding_rs::{Encoding, UTF_8};
 use headers::{ContentType, HeaderMapExt};
 use html5ever::{LocalName, Prefix, local_name, ns};
 use http::Method;
+use js::context::JSContext;
 use js::rust::HandleObject;
 use mime::{self, Mime};
 use net_traits::http_percent_encode;
@@ -83,7 +84,7 @@ use crate::dom::submitevent::SubmitEvent;
 use crate::dom::types::HTMLIFrameElement;
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::dom::window::Window;
-use crate::links::{LinkRelations, get_element_target};
+use crate::links::{LinkRelations, get_element_target, valid_navigable_target_name_or_keyword};
 use crate::script_runtime::CanGc;
 use crate::script_thread::ScriptThread;
 
@@ -140,7 +141,6 @@ impl HTMLFormElement {
         }
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
@@ -304,7 +304,7 @@ impl HTMLFormElementMethods<crate::DomTypeHolder> for HTMLFormElement {
             Some(submitter_element) => {
                 // Step 1.1
                 let error_not_a_submit_button =
-                    Err(Error::Type("submitter must be a submit button".to_string()));
+                    Err(Error::Type(c"submitter must be a submit button".to_owned()));
 
                 let element = match submitter_element.upcast::<Node>().type_id() {
                     NodeTypeId::Element(ElementTypeId::HTMLElement(element)) => element,
@@ -650,13 +650,13 @@ impl HTMLFormElementMethods<crate::DomTypeHolder> for HTMLFormElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-form-checkvalidity>
-    fn CheckValidity(&self, can_gc: CanGc) -> bool {
-        self.static_validation(can_gc).is_ok()
+    fn CheckValidity(&self, cx: &mut JSContext) -> bool {
+        self.static_validation(CanGc::from_cx(cx)).is_ok()
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-form-reportvalidity>
-    fn ReportValidity(&self, can_gc: CanGc) -> bool {
-        self.interactive_validation(can_gc).is_ok()
+    fn ReportValidity(&self, cx: &mut JSContext) -> bool {
+        self.interactive_validation(CanGc::from_cx(cx)).is_ok()
     }
 }
 
@@ -818,63 +818,78 @@ impl HTMLFormElement {
             None => return,
         };
 
-        // Step 9
+        // Step 9. If form cannot navigate, then return.
         if self.upcast::<Element>().cannot_navigate() {
             return;
         }
 
-        // Step 10
+        // Step 10. Let method be the submitter element's method.
+        let method = submitter.method();
+        // Step 11. If method is dialog, then:
+        // TODO
+
+        // Step 12. Let action be the submitter element's action.
         let mut action = submitter.action();
 
-        // Step 11
+        // Step 13. If action is the empty string, let action be the URL of the form document.
         if action.is_empty() {
             action = DOMString::from(base.as_str());
         }
-        // Step 12-13
+        // Step 14. Let parsed action be the result of encoding-parsing a URL given action, relative to submitter's node document.
         let action_components = match base.join(&action.str()) {
             Ok(url) => url,
+            // Step 15. If parsed action is failure, then return.
             Err(_) => return,
         };
-        // Step 14-16
+        // Step 16. Let scheme be the scheme of parsed action.
         let scheme = action_components.scheme().to_owned();
+        // Step 17. Let enctype be the submitter element's enctype.
         let enctype = submitter.enctype();
-        let method = submitter.method();
 
-        // Step 17
-        let target_attribute_value =
-            if submitter.is_submit_button() && submitter.target() != DOMString::new() {
-                Some(submitter.target())
-            } else {
-                let form_owner = submitter.form_owner();
-                let form = form_owner.as_deref().unwrap_or(self);
-                get_element_target(form.upcast::<Element>())
-            };
-
-        // Step 18
-        let noopener = self
-            .relations
-            .get()
-            .get_element_noopener(target_attribute_value.as_ref());
-
-        // Step 19
-        let source = doc.browsing_context().unwrap();
-        let (maybe_chosen, _new) = source
-            .choose_browsing_context(target_attribute_value.unwrap_or(DOMString::new()), noopener);
-
-        // Step 20
-        let chosen = match maybe_chosen {
-            Some(proxy) => proxy,
-            None => return,
+        // Step 19. If the submitter element is a submit button and it has a formtarget attribute,
+        // then set formTarget to the formtarget attribute value.
+        let form_target_attribute = submitter.target();
+        let form_target = if submitter.is_submit_button() &&
+            valid_navigable_target_name_or_keyword(&form_target_attribute)
+        {
+            Some(form_target_attribute)
+        } else {
+            // Step 18. Let formTarget be null.
+            None
         };
+        // Step 20. Let target be the result of getting an element's target given submitter's form owner and formTarget.
+        let form_owner = submitter.form_owner();
+        let form = form_owner.as_deref().unwrap_or(self);
+        let target = get_element_target(form.upcast::<Element>(), form_target);
+
+        // Step 21. Let noopener be the result of getting an element's noopener with form, parsed action, and target.
+        let noopener = self.relations.get().get_element_noopener(target.as_ref());
+
+        // Step 22. Let targetNavigable be the first return value of applying the rules for choosing a navigable given target,
+        // form's node navigable, and noopener.
+        let source = doc.browsing_context().unwrap();
+        let (maybe_chosen, _new) =
+            source.choose_browsing_context(target.unwrap_or_default(), noopener);
+
+        let Some(chosen) = maybe_chosen else {
+            // Step 23. If targetNavigable is null, then return.
+            return;
+        };
+        // Step 24. Let historyHandling be "auto".
+        // TODO
+        // Step 25. If form document equals targetNavigable's active document, and form document has not yet completely loaded,
+        // then set historyHandling to "replace".
+        // TODO
+
         let target_document = match chosen.document() {
             Some(doc) => doc,
             None => return,
         };
-        // Step 21
         let target_window = target_document.window();
         let mut load_data = LoadData::new(
-            LoadOrigin::Script(doc.origin().immutable().clone()),
+            LoadOrigin::Script(doc.origin().snapshot()),
             action_components,
+            target_document.about_base_url(),
             None,
             target_window.as_global_scope().get_referrer(),
             target_document.get_referrer_policy(),
@@ -884,7 +899,9 @@ impl HTMLFormElement {
             target_document.creation_sandboxing_flag_set_considering_parent_iframe(),
         );
 
-        // Step 22
+        // Step 26. Select the appropriate row in the table below based on scheme as given by the first cell of each row.
+        // Then, select the appropriate cell on that row based on method as given in the first cell of each column.
+        // Then, jump to the steps named in that cell and defined below the table.
         match (&*scheme, method) {
             (_, FormMethod::Dialog) => {
                 // TODO: Submit dialog
@@ -1356,41 +1373,7 @@ impl HTMLFormElement {
             .collect();
 
         for child in controls {
-            let child = child.upcast::<Node>();
-
-            match child.type_id() {
-                NodeTypeId::Element(ElementTypeId::HTMLElement(
-                    HTMLElementTypeId::HTMLInputElement,
-                )) => {
-                    child.downcast::<HTMLInputElement>().unwrap().reset(can_gc);
-                },
-                NodeTypeId::Element(ElementTypeId::HTMLElement(
-                    HTMLElementTypeId::HTMLSelectElement,
-                )) => {
-                    child.downcast::<HTMLSelectElement>().unwrap().reset();
-                },
-                NodeTypeId::Element(ElementTypeId::HTMLElement(
-                    HTMLElementTypeId::HTMLTextAreaElement,
-                )) => {
-                    child.downcast::<HTMLTextAreaElement>().unwrap().reset();
-                },
-                NodeTypeId::Element(ElementTypeId::HTMLElement(
-                    HTMLElementTypeId::HTMLOutputElement,
-                )) => {
-                    child.downcast::<HTMLOutputElement>().unwrap().reset(can_gc);
-                },
-                NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLElement)) => {
-                    let html_element = child.downcast::<HTMLElement>().unwrap();
-                    if html_element.is_form_associated_custom_element() {
-                        ScriptThread::enqueue_callback_reaction(
-                            html_element.upcast::<Element>(),
-                            CallbackReaction::FormReset,
-                            None,
-                        )
-                    }
-                },
-                _ => {},
-            }
+            child.reset(can_gc);
         }
         self.marked_for_reset.set(false);
     }
@@ -1422,6 +1405,48 @@ impl HTMLFormElement {
             past_names_map.0.retain(|_k, v| v.0 != control);
         }
         self.update_validity(can_gc);
+    }
+}
+
+impl Element {
+    pub(crate) fn is_resettable(&self) -> bool {
+        let NodeTypeId::Element(ElementTypeId::HTMLElement(element_type)) =
+            self.upcast::<Node>().type_id()
+        else {
+            return false;
+        };
+        matches!(
+            element_type,
+            HTMLElementTypeId::HTMLInputElement |
+                HTMLElementTypeId::HTMLSelectElement |
+                HTMLElementTypeId::HTMLTextAreaElement |
+                HTMLElementTypeId::HTMLOutputElement |
+                HTMLElementTypeId::HTMLElement
+        )
+    }
+
+    pub(crate) fn reset(&self, can_gc: CanGc) {
+        if !self.is_resettable() {
+            return;
+        }
+
+        if let Some(input_element) = self.downcast::<HTMLInputElement>() {
+            input_element.reset(can_gc);
+        } else if let Some(select_element) = self.downcast::<HTMLSelectElement>() {
+            select_element.reset();
+        } else if let Some(textarea_element) = self.downcast::<HTMLTextAreaElement>() {
+            textarea_element.reset(can_gc);
+        } else if let Some(output_element) = self.downcast::<HTMLOutputElement>() {
+            output_element.reset(can_gc);
+        } else if let Some(html_element) = self.downcast::<HTMLElement>() {
+            if html_element.is_form_associated_custom_element() {
+                ScriptThread::enqueue_callback_reaction(
+                    html_element.upcast::<Element>(),
+                    CallbackReaction::FormReset,
+                    None,
+                )
+            }
+        }
     }
 }
 
@@ -1591,7 +1616,7 @@ impl FormSubmitterElement<'_> {
     }
 }
 
-pub(crate) trait FormControl: DomObject {
+pub(crate) trait FormControl: DomObject<ReflectorType = ()> {
     fn form_owner(&self) -> Option<DomRoot<HTMLFormElement>>;
 
     fn set_form_owner(&self, form: Option<&HTMLFormElement>);

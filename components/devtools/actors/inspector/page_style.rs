@@ -12,7 +12,8 @@ use std::iter::once;
 use base::generic_channel::{self, GenericSender};
 use base::id::PipelineId;
 use devtools_traits::DevtoolScriptControlMsg::{GetLayout, GetSelectors};
-use devtools_traits::{ComputedNodeLayout, DevtoolScriptControlMsg};
+use devtools_traits::{AutoMargins, ComputedNodeLayout, DevtoolScriptControlMsg};
+use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 use serde_json::{self, Map, Value};
 
@@ -46,50 +47,52 @@ struct AppliedEntry {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "kebab-case")]
+struct DevtoolsAutoMargins {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    right: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bottom: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    left: Option<String>,
+}
+
+impl From<AutoMargins> for DevtoolsAutoMargins {
+    fn from(auto_margins: AutoMargins) -> Self {
+        const AUTO: &str = "auto";
+        Self {
+            top: auto_margins.top.then_some(AUTO.into()),
+            right: auto_margins.right.then_some(AUTO.into()),
+            bottom: auto_margins.bottom.then_some(AUTO.into()),
+            left: auto_margins.left.then_some(AUTO.into()),
+        }
+    }
+}
+
+#[derive(Serialize)]
 struct GetLayoutReply {
     from: String,
-
-    display: String,
-    position: String,
-    z_index: String,
-    box_sizing: String,
-
-    // Would be nice to use a proper struct, blocked by
-    // https://github.com/serde-rs/serde/issues/43
-    auto_margins: serde_json::value::Value,
-    margin_top: String,
-    margin_right: String,
-    margin_bottom: String,
-    margin_left: String,
-
-    border_top_width: String,
-    border_right_width: String,
-    border_bottom_width: String,
-    border_left_width: String,
-
-    padding_top: String,
-    padding_right: String,
-    padding_bottom: String,
-    padding_left: String,
-
-    width: f32,
-    height: f32,
+    #[serde(flatten)]
+    layout: ComputedNodeLayout,
+    #[serde(rename = "autoMargins")]
+    auto_margins: DevtoolsAutoMargins,
 }
 
 #[derive(Serialize)]
-pub struct IsPositionEditableReply {
-    pub from: String,
-    pub value: bool,
+pub(crate) struct IsPositionEditableReply {
+    from: String,
+    value: bool,
 }
 
 #[derive(Serialize)]
-pub struct PageStyleMsg {
+pub(crate) struct PageStyleMsg {
     pub actor: String,
     pub traits: HashMap<String, bool>,
 }
 
-pub struct PageStyleActor {
+#[derive(MallocSizeOf)]
+pub(crate) struct PageStyleActor {
     pub name: String,
     pub script_chan: GenericSender<DevtoolScriptControlMsg>,
     pub pipeline: PipelineId,
@@ -181,7 +184,7 @@ impl PageStyleActor {
                 .filter_map(move |selector| {
                     let rule = match node_actor.style_rules.borrow_mut().entry(selector) {
                         Entry::Vacant(e) => {
-                            let name = registry.new_name("style-rule");
+                            let name = registry.new_name::<StyleRuleActor>();
                             let actor = StyleRuleActor::new(
                                 name.clone(),
                                 node_actor.name(),
@@ -189,7 +192,7 @@ impl PageStyleActor {
                             );
                             let rule = actor.applied(registry)?;
 
-                            registry.register_later(actor);
+                            registry.register(actor);
                             e.insert(name);
                             rule
                         },
@@ -237,10 +240,10 @@ impl PageStyleActor {
             .entry(("".into(), usize::MAX))
         {
             Entry::Vacant(e) => {
-                let name = registry.new_name("style-rule");
+                let name = registry.new_name::<StyleRuleActor>();
                 let actor = StyleRuleActor::new(name.clone(), target.into(), None);
                 let computed = actor.computed(registry)?;
-                registry.register_later(actor);
+                registry.register(actor);
                 e.insert(name);
                 Some(computed)
             },
@@ -268,88 +271,23 @@ impl PageStyleActor {
             .ok_or(ActorError::MissingParameter)?
             .as_str()
             .ok_or(ActorError::BadParameterType)?;
-        let Some((computed_node_sender, computed_node_receiver)) = generic_channel::channel()
-        else {
-            return Err(ActorError::Internal);
-        };
+        let (tx, rx) = generic_channel::channel().ok_or(ActorError::Internal)?;
         self.script_chan
             .send(GetLayout(
                 self.pipeline,
                 registry.actor_to_script(target.to_owned()),
-                computed_node_sender,
+                tx,
             ))
-            .unwrap();
-        let ComputedNodeLayout {
-            display,
-            position,
-            z_index,
-            box_sizing,
-            auto_margins,
-            margin_top,
-            margin_right,
-            margin_bottom,
-            margin_left,
-            border_top_width,
-            border_right_width,
-            border_bottom_width,
-            border_left_width,
-            padding_top,
-            padding_right,
-            padding_bottom,
-            padding_left,
-            width,
-            height,
-        } = computed_node_receiver
+            .map_err(|_| ActorError::Internal)?;
+        let (layout, auto_margins) = rx
             .recv()
             .map_err(|_| ActorError::Internal)?
             .ok_or(ActorError::Internal)?;
-        let msg_auto_margins = msg
-            .get("autoMargins")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let msg = GetLayoutReply {
+        request.reply_final(&GetLayoutReply {
             from: self.name(),
-            display,
-            position,
-            z_index,
-            box_sizing,
-            auto_margins: if msg_auto_margins {
-                let mut m = Map::new();
-                let auto = serde_json::value::Value::String("auto".to_owned());
-                if auto_margins.top {
-                    m.insert("top".to_owned(), auto.clone());
-                }
-                if auto_margins.right {
-                    m.insert("right".to_owned(), auto.clone());
-                }
-                if auto_margins.bottom {
-                    m.insert("bottom".to_owned(), auto.clone());
-                }
-                if auto_margins.left {
-                    m.insert("left".to_owned(), auto);
-                }
-                serde_json::value::Value::Object(m)
-            } else {
-                serde_json::value::Value::Null
-            },
-            margin_top,
-            margin_right,
-            margin_bottom,
-            margin_left,
-            border_top_width,
-            border_right_width,
-            border_bottom_width,
-            border_left_width,
-            padding_top,
-            padding_right,
-            padding_bottom,
-            padding_left,
-            width,
-            height,
-        };
-        let msg = serde_json::to_string(&msg).map_err(|_| ActorError::Internal)?;
-        let msg = serde_json::from_str::<Value>(&msg).map_err(|_| ActorError::Internal)?;
-        request.reply_final(&msg)
+            layout,
+            auto_margins: auto_margins.into(),
+        })
     }
 
     fn is_position_editable(&self, request: ClientRequest) -> Result<(), ActorError> {

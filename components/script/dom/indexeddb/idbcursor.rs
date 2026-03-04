@@ -5,9 +5,11 @@
 use std::cell::Cell;
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use js::jsapi::Heap;
 use js::jsval::{JSVal, UndefinedValue};
 use js::rust::MutableHandleValue;
+use script_bindings::script_runtime::CanGc;
 use storage_traits::indexeddb::{IndexedDBKeyRange, IndexedDBKeyType, IndexedDBRecord};
 
 use crate::dom::bindings::cell::DomRefCell;
@@ -26,7 +28,6 @@ use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
 use crate::dom::indexeddb::idbrequest::IDBRequest;
 use crate::dom::indexeddb::idbtransaction::IDBTransaction;
 use crate::indexeddb::key_type_to_jsval;
-use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 
 #[derive(JSTraceable, MallocSizeOf)]
 #[expect(unused)]
@@ -40,30 +41,30 @@ pub(crate) enum ObjectStoreOrIndex {
 pub(crate) struct IDBCursor {
     reflector_: Reflector,
 
-    /// <https://www.w3.org/TR/IndexedDB-2/#cursor-transaction>
+    /// <https://www.w3.org/TR/IndexedDB-3/#cursor-transaction>
     transaction: Dom<IDBTransaction>,
-    /// <https://www.w3.org/TR/IndexedDB-2/#cursor-range>
+    /// <https://www.w3.org/TR/IndexedDB-3/#cursor-range>
     #[no_trace]
     range: IndexedDBKeyRange,
-    /// <https://www.w3.org/TR/IndexedDB-2/#cursor-source>
+    /// <https://www.w3.org/TR/IndexedDB-3/#cursor-source>
     source: ObjectStoreOrIndex,
-    /// <https://www.w3.org/TR/IndexedDB-2/#cursor-direction>
+    /// <https://www.w3.org/TR/IndexedDB-3/#cursor-direction>
     direction: IDBCursorDirection,
-    /// <https://www.w3.org/TR/IndexedDB-2/#cursor-position>
+    /// <https://www.w3.org/TR/IndexedDB-3/#cursor-position>
     #[no_trace]
     position: DomRefCell<Option<IndexedDBKeyType>>,
-    /// <https://www.w3.org/TR/IndexedDB-2/#cursor-key>
+    /// <https://www.w3.org/TR/IndexedDB-3/#cursor-key>
     #[no_trace]
     key: DomRefCell<Option<IndexedDBKeyType>>,
-    /// <https://www.w3.org/TR/IndexedDB-2/#cursor-value>
+    /// <https://www.w3.org/TR/IndexedDB-3/#cursor-value>
     #[ignore_malloc_size_of = "mozjs"]
     value: Heap<JSVal>,
-    /// <https://www.w3.org/TR/IndexedDB-2/#cursor-got-value-flag>
+    /// <https://www.w3.org/TR/IndexedDB-3/#cursor-got-value-flag>
     got_value: Cell<bool>,
-    /// <https://www.w3.org/TR/IndexedDB-2/#cursor-object-store-position>
+    /// <https://www.w3.org/TR/IndexedDB-3/#cursor-object-store-position>
     #[no_trace]
     object_store_position: DomRefCell<Option<IndexedDBKeyType>>,
-    /// <https://www.w3.org/TR/IndexedDB-2/#cursor-key-only-flag>
+    /// <https://www.w3.org/TR/IndexedDB-3/#cursor-key-only-flag>
     key_only: bool,
 
     /// <https://w3c.github.io/IndexedDB/#cursor-request>
@@ -71,7 +72,7 @@ pub(crate) struct IDBCursor {
 }
 
 impl IDBCursor {
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     pub(crate) fn new_inherited(
         transaction: &IDBTransaction,
         direction: IDBCursorDirection,
@@ -96,7 +97,7 @@ impl IDBCursor {
         }
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         global: &GlobalScope,
@@ -142,7 +143,7 @@ impl IDBCursor {
         out.set(self.value.get());
     }
 
-    /// <https://www.w3.org/TR/IndexedDB-2/#cursor-effective-key>
+    /// <https://www.w3.org/TR/IndexedDB-3/#cursor-effective-key>
     pub(crate) fn effective_key(&self) -> Option<IndexedDBKeyType> {
         match &self.source {
             ObjectStoreOrIndex::ObjectStore(_) => self.position.borrow().clone(),
@@ -152,7 +153,7 @@ impl IDBCursor {
 }
 
 impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
-    /// <https://www.w3.org/TR/IndexedDB-2/#dom-idbcursor-source>
+    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbcursor-source>
     fn Source(&self) -> IDBObjectStoreOrIDBIndex {
         match &self.source {
             ObjectStoreOrIndex::ObjectStore(source) => {
@@ -164,23 +165,23 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
         }
     }
 
-    /// <https://www.w3.org/TR/IndexedDB-2/#dom-idbcursor-direction>
+    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbcursor-direction>
     fn Direction(&self) -> IDBCursorDirection {
         self.direction
     }
 
-    /// <https://www.w3.org/TR/IndexedDB-2/#dom-idbcursor-key>
-    fn Key(&self, cx: SafeJSContext, can_gc: CanGc, mut value: MutableHandleValue) {
+    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbcursor-key>
+    fn Key(&self, cx: &mut JSContext, mut value: MutableHandleValue) {
         match self.key.borrow().as_ref() {
-            Some(key) => key_type_to_jsval(cx, key, value, can_gc),
+            Some(key) => key_type_to_jsval(cx, key, value),
             None => value.set(UndefinedValue()),
         }
     }
 
-    /// <https://www.w3.org/TR/IndexedDB-2/#dom-idbcursor-primarykey>
-    fn PrimaryKey(&self, cx: SafeJSContext, can_gc: CanGc, mut value: MutableHandleValue) {
+    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbcursor-primarykey>
+    fn PrimaryKey(&self, cx: &mut JSContext, mut value: MutableHandleValue) {
         match self.effective_key() {
-            Some(effective_key) => key_type_to_jsval(cx, &effective_key, value, can_gc),
+            Some(effective_key) => key_type_to_jsval(cx, &effective_key, value),
             None => value.set(UndefinedValue()),
         }
     }
@@ -194,7 +195,7 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
 }
 
 /// A struct containing parameters for
-/// <https://www.w3.org/TR/IndexedDB-2/#iterate-a-cursor>
+/// <https://www.w3.org/TR/IndexedDB-3/#iterate-a-cursor>
 #[derive(Clone)]
 pub(crate) struct IterationParam {
     pub(crate) cursor: Trusted<IDBCursor>,
@@ -203,7 +204,7 @@ pub(crate) struct IterationParam {
     pub(crate) count: Option<u32>,
 }
 
-/// <https://www.w3.org/TR/IndexedDB-2/#iterate-a-cursor>
+/// <https://www.w3.org/TR/IndexedDB-3/#iterate-a-cursor>
 ///
 /// NOTE: Be cautious: this part of the specification seems to assume the cursor’s source is an
 /// index. Therefore,
@@ -212,10 +213,9 @@ pub(crate) struct IterationParam {
 ///   "record’s referenced value" means the value of the record.
 pub(crate) fn iterate_cursor(
     global: &GlobalScope,
-    cx: SafeJSContext,
+    cx: &mut JSContext,
     param: &IterationParam,
     records: Vec<IndexedDBRecord>,
-    can_gc: CanGc,
 ) -> Result<Option<DomRoot<IDBCursor>>, Error> {
     // Unpack IterationParam
     let cursor = param.cursor.root();
@@ -483,11 +483,16 @@ pub(crate) fn iterate_cursor(
     if !cursor.key_only {
         // Step 13.1. Let serialized be found record’s referenced value.
         // Step 13.2. Set cursor’s value to ! StructuredDeserialize(serialized, targetRealm)
-        rooted!(in(*cx) let mut new_cursor_value = UndefinedValue());
-        bincode::deserialize(&found_record.value)
+        rooted!(&in(cx) let mut new_cursor_value = UndefinedValue());
+        postcard::from_bytes(&found_record.value)
             .map_err(|_| Error::Data(None))
             .and_then(|data| {
-                structuredclone::read(global, data, new_cursor_value.handle_mut(), can_gc)
+                structuredclone::read(
+                    global,
+                    data,
+                    new_cursor_value.handle_mut(),
+                    CanGc::from_cx(cx),
+                )
             })?;
         cursor.value.set(new_cursor_value.get());
     }

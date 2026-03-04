@@ -11,6 +11,9 @@ use devtools_traits::{TimelineMarker, TimelineMarkerType};
 use dom_struct::dom_struct;
 use embedder_traits::InputEventResult;
 use js::rust::HandleObject;
+use keyboard_types::{Key, NamedKey};
+use script_bindings::codegen::GenericBindings::PointerEventBinding::PointerEventMethods;
+use script_bindings::match_domstring_ascii;
 use stylo_atoms::Atom;
 
 use crate::dom::bindings::callback::ExceptionHandling;
@@ -38,6 +41,7 @@ use crate::dom::html::htmlslotelement::HTMLSlotElement;
 use crate::dom::mouseevent::MouseEvent;
 use crate::dom::node::{Node, NodeTraits};
 use crate::dom::shadowroot::ShadowRoot;
+use crate::dom::types::{KeyboardEvent, PointerEvent, UserActivation};
 use crate::dom::virtualmethods::vtable_for;
 use crate::dom::window::Window;
 use crate::script_runtime::CanGc;
@@ -233,7 +237,7 @@ impl Event {
     }
 
     /// <https://dom.spec.whatwg.org/#concept-event-path-append>
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     pub(crate) fn append_to_path(
         &self,
         invocation_target: &EventTarget,
@@ -285,8 +289,42 @@ impl Event {
         target: &EventTarget,
         legacy_target_override: bool,
         can_gc: CanGc,
-        // TODO legacy_did_output_listeners_throw_flag for indexeddb
     ) -> bool {
+        self.dispatch_inner(target, legacy_target_override, None, can_gc)
+    }
+
+    pub(crate) fn dispatch_with_legacy_output_did_listeners_throw(
+        &self,
+        target: &EventTarget,
+        legacy_target_override: bool,
+        legacy_output_did_listeners_throw: &Cell<bool>,
+        can_gc: CanGc,
+    ) -> bool {
+        self.dispatch_inner(
+            target,
+            legacy_target_override,
+            Some(legacy_output_did_listeners_throw),
+            can_gc,
+        )
+    }
+
+    fn dispatch_inner(
+        &self,
+        target: &EventTarget,
+        legacy_target_override: bool,
+        legacy_output_did_listeners_throw: Option<&Cell<bool>>,
+        can_gc: CanGc,
+    ) -> bool {
+        // > When a user interaction causes firing of an activation triggering input event in a Document document, the user agent
+        // > must perform the following activation notification steps before dispatching the event:
+        // <https://html.spec.whatwg.org/multipage/#user-activation-processing-model>
+        if self.is_an_activation_triggering_input_event() {
+            // TODO: it is not quite clear what does the spec mean by in a `Document`. https://github.com/whatwg/html/issues/12126
+            if let Some(document) = target.downcast::<Node>().map(|node| node.owner_doc()) {
+                UserActivation::handle_user_activation_notification(&document);
+            }
+        }
+
         let mut target = DomRoot::from_ref(target);
 
         // Step 1. Set event’s dispatch flag.
@@ -548,6 +586,7 @@ impl Event {
                     self,
                     ListenerPhase::Capturing,
                     timeline_window.as_deref(),
+                    legacy_output_did_listeners_throw,
                     can_gc,
                 )
             }
@@ -577,6 +616,7 @@ impl Event {
                     self,
                     ListenerPhase::Bubbling,
                     timeline_window.as_deref(),
+                    legacy_output_did_listeners_throw,
                     can_gc,
                 );
             }
@@ -686,10 +726,50 @@ impl Event {
         }
     }
 
+    /// <https://html.spec.whatwg.org/multipage/#activation-triggering-input-event>
+    fn is_an_activation_triggering_input_event(&self) -> bool {
+        // > An activation triggering input event is any event whose isTrusted attribute is true ..
+        if !self.is_trusted.get() {
+            return false;
+        }
+
+        // > and whose type is one of:
+        let event_type = self.Type();
+        match_domstring_ascii!(event_type,
+            // > - "keydown", provided the key is neither the Esc key nor a shortcut key reserved by the user agent;
+            "keydown" => self.downcast::<KeyboardEvent>().expect("`Event` with type `keydown` should be a `KeyboardEvent` interface").key() != Key::Named(NamedKey::Escape),
+            // > - "mousedown";
+            "mousedown" => true,
+            // > - "pointerdown", provided the event's pointerType is "mouse";
+            "pointerdown" => self.downcast::<PointerEvent>().expect("`Event` with type `pointerdown` should be a `PointerEvent` interface").PointerType().eq("mouse"),
+            // > - "pointerup", provided the event's pointerType is not "mouse"; or
+            "pointerup" => !self.downcast::<PointerEvent>().expect("`Event` with type `pointerup` should be a `PointerEvent` interface").PointerType().eq("mouse"),
+            // > - "touchend".
+            "touchend" => true,
+            _ => false,
+        )
+    }
+
     /// <https://dom.spec.whatwg.org/#firing-events>
     pub(crate) fn fire(&self, target: &EventTarget, can_gc: CanGc) -> bool {
         self.set_trusted(true);
+
         target.dispatch_event(self, can_gc)
+    }
+
+    pub(crate) fn fire_with_legacy_output_did_listeners_throw(
+        &self,
+        target: &EventTarget,
+        legacy_output_did_listeners_throw: &Cell<bool>,
+        can_gc: CanGc,
+    ) -> bool {
+        self.set_trusted(true);
+        self.dispatch_with_legacy_output_did_listeners_throw(
+            target,
+            false,
+            legacy_output_did_listeners_throw,
+            can_gc,
+        )
     }
 
     /// <https://dom.spec.whatwg.org/#inner-event-creation-steps>
@@ -1177,8 +1257,8 @@ fn invoke(
     event: &Event,
     phase: ListenerPhase,
     timeline_window: Option<&Window>,
+    legacy_output_did_listeners_throw: Option<&Cell<bool>>,
     can_gc: CanGc,
-    // TODO legacy_output_did_listeners_throw for indexeddb
 ) {
     // Step 1. Set event’s target to the shadow-adjusted target of the last struct in event’s path,
     // that is either struct or preceding struct, whose shadow-adjusted target is non-null.
@@ -1218,6 +1298,7 @@ fn invoke(
         phase,
         invocation_target_in_shadow_tree,
         timeline_window,
+        legacy_output_did_listeners_throw,
         can_gc,
     );
 
@@ -1247,6 +1328,7 @@ fn invoke(
             phase,
             invocation_target_in_shadow_tree,
             timeline_window,
+            legacy_output_did_listeners_throw,
             can_gc,
         );
 
@@ -1262,6 +1344,7 @@ fn inner_invoke(
     phase: ListenerPhase,
     invocation_target_in_shadow_tree: bool,
     timeline_window: Option<&Window>,
+    legacy_output_did_listeners_throw: Option<&Cell<bool>>,
     can_gc: CanGc,
 ) -> bool {
     // Step 1. Let found be false.
@@ -1327,14 +1410,16 @@ fn inner_invoke(
         // and event’s currentTarget attribute value. If this throws an exception exception:
         //     Step 2.10.1 Report exception for listener’s callback’s corresponding JavaScript object’s
         //     associated realm’s global object.
-        //     TODO Step 2.10.2 Set legacyOutputDidListenersThrowFlag if given.
+        //     Step 2.10.2 Set legacyOutputDidListenersThrowFlag if given.
         let marker = TimelineMarker::start("DOMEvent".to_owned());
-        compiled_listener.call_or_handle_event(
-            &event_target,
-            event,
-            ExceptionHandling::Report,
-            can_gc,
-        );
+        if compiled_listener
+            .call_or_handle_event(&event_target, event, ExceptionHandling::Report, can_gc)
+            .is_err()
+        {
+            if let Some(flag) = legacy_output_did_listeners_throw {
+                flag.set(true);
+            }
+        }
         if let Some(window) = timeline_window {
             window.emit_timeline_marker(marker.end());
         }

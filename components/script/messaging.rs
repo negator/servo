@@ -104,6 +104,10 @@ impl MixedMessage {
                 ScriptThreadMessage::EmbedderControlResponse(id, _) => Some(id.pipeline_id),
                 ScriptThreadMessage::SetUserContents(..) => None,
                 ScriptThreadMessage::DestroyUserContentManager(..) => None,
+                ScriptThreadMessage::AccessibilityTreeUpdate(..) => None,
+                ScriptThreadMessage::UpdatePinchZoomInfos(id, _) => Some(*id),
+                ScriptThreadMessage::SetAccessibilityActive(..) => None,
+                ScriptThreadMessage::TriggerGarbageCollection => None,
             },
             MixedMessage::FromScript(inner_msg) => match inner_msg {
                 MainThreadScriptMsg::Common(CommonScriptMsg::Task(_, _, pipeline_id, _)) => {
@@ -300,18 +304,28 @@ impl QueuedTaskConversion for MainThreadScriptMsg {
             MainThreadScriptMsg::Common(script_msg) => script_msg,
             _ => return None,
         };
-        let (category, boxed, pipeline_id, task_source) = match script_msg {
+        let (event_category, task, pipeline_id, task_source) = match script_msg {
             CommonScriptMsg::Task(category, boxed, pipeline_id, task_source) => {
                 (category, boxed, pipeline_id, task_source)
             },
             _ => return None,
         };
-        Some((None, category, boxed, pipeline_id, task_source))
+        Some(QueuedTask {
+            worker: None,
+            event_category,
+            task,
+            pipeline_id,
+            task_source,
+        })
     }
 
     fn from_queued_task(queued_task: QueuedTask) -> Self {
-        let (_worker, category, boxed, pipeline_id, task_source) = queued_task;
-        let script_msg = CommonScriptMsg::Task(category, boxed, pipeline_id, task_source);
+        let script_msg = CommonScriptMsg::Task(
+            queued_task.event_category,
+            queued_task.task,
+            queued_task.pipeline_id,
+            queued_task.task_source,
+        );
         MainThreadScriptMsg::Common(script_msg)
     }
 
@@ -345,7 +359,7 @@ pub(crate) struct ScriptThreadSenders {
     #[cfg(feature = "bluetooth")]
     pub(crate) bluetooth_sender: GenericSender<BluetoothRequest>,
 
-    /// A [`Sender`] that sends messages to the `Constellation`.
+    /// A [`Sender`] that sends messages to the `ScriptThread`.
     #[no_trace]
     pub(crate) constellation_sender: GenericSender<ScriptThreadMessage>,
 
@@ -399,7 +413,7 @@ pub(crate) struct ScriptThreadReceivers {
     /// WebGPU context, this will be [`crossbeam_channel::never()`].
     #[no_trace]
     #[cfg(feature = "webgpu")]
-    pub(crate) webgpu_receiver: RefCell<Receiver<WebGPUMsg>>,
+    pub(crate) webgpu_receiver: RefCell<RoutedReceiver<WebGPUMsg>>,
 }
 
 impl ScriptThreadReceivers {
@@ -435,7 +449,7 @@ impl ScriptThreadReceivers {
             }) -> msg => {
                 #[cfg(feature = "webgpu")]
                 {
-                    MixedMessage::FromWebGPUServer(msg.unwrap())
+                    MixedMessage::FromWebGPUServer(msg.unwrap().unwrap())
                 }
                 #[cfg(not(feature = "webgpu"))]
                 {
@@ -474,7 +488,7 @@ impl ScriptThreadReceivers {
         }
         #[cfg(feature = "webgpu")]
         if let Ok(message) = self.webgpu_receiver.borrow().try_recv() {
-            return MixedMessage::FromWebGPUServer(message).into();
+            return MixedMessage::FromWebGPUServer(message.unwrap()).into();
         }
         None
     }

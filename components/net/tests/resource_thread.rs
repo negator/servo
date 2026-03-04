@@ -5,7 +5,6 @@
 use std::net::IpAddr;
 
 use base::generic_channel;
-use ipc_channel::ipc;
 use net::connector::CACertificates;
 use net::protocols::ProtocolRegistry;
 use net::resource_thread::new_core_resource_thread;
@@ -14,7 +13,7 @@ use net_traits::CoreResourceMsg;
 use profile_traits::mem::ProfilerChan as MemProfilerChan;
 use profile_traits::time::ProfilerChan;
 
-use crate::create_embedder_proxy;
+use crate::create_generic_embedder_proxy;
 
 fn ip(s: &str) -> IpAddr {
     s.parse().unwrap()
@@ -24,12 +23,12 @@ fn ip(s: &str) -> IpAddr {
 fn test_exit() {
     let (tx, _rx) = generic_channel::channel().unwrap();
     let (mtx, _mrx) = generic_channel::channel().unwrap();
-    let (sender, receiver) = ipc::channel().unwrap();
+    let (sender, receiver) = generic_channel::oneshot().unwrap();
     let (resource_thread, _private_resource_thread) = new_core_resource_thread(
         None,
         ProfilerChan(Some(tx)),
         MemProfilerChan(mtx),
-        create_embedder_proxy(),
+        create_generic_embedder_proxy(),
         None,
         CACertificates::Default,
         false, /* ignore_certificate_errors */

@@ -62,7 +62,6 @@ impl TrustedTypePolicyFactory {
         }
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub(crate) fn new(global: &GlobalScope, can_gc: CanGc) -> DomRoot<Self> {
         reflect_dom_object(Box::new(Self::new_inherited()), global, can_gc)
     }
@@ -87,7 +86,7 @@ impl TrustedTypePolicyFactory {
 
             // Step 2: If allowedByCSP is "Blocked", throw a TypeError and abort further steps.
             if !allowed_by_csp {
-                return Err(Error::Type("Not allowed by CSP".to_string()));
+                return Err(Error::Type(c"Not allowed by CSP".to_owned()));
             }
         }
 
@@ -95,7 +94,7 @@ impl TrustedTypePolicyFactory {
         // and abort further steps.
         if policy_name == "default" && self.default_policy.get().is_some() {
             return Err(Error::Type(
-                "Already set default policy for factory".to_string(),
+                c"Already set default policy for factory".to_owned(),
             ));
         }
 
@@ -333,7 +332,7 @@ impl TrustedTypePolicyFactory {
                 } else {
                     // Step 6.3: Throw a TypeError and abort further steps.
                     Err(Error::Type(
-                        "Cannot set value, expected trusted type".to_owned(),
+                        c"Cannot set value, expected trusted type".to_owned(),
                     ))
                 }
             },

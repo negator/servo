@@ -2,13 +2,14 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 
 use crate::actor::{Actor, ActorRegistry};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TimelineMemoryReply {
+pub(crate) struct TimelineMemoryReply {
     js_object_size: u64,
     js_string_size: u64,
     js_other_size: u64,
@@ -21,8 +22,9 @@ pub struct TimelineMemoryReply {
     non_js_milliseconds: f64,
 }
 
-pub struct MemoryActor {
-    pub name: String,
+#[derive(MallocSizeOf)]
+pub(crate) struct MemoryActor {
+    name: String,
 }
 
 impl Actor for MemoryActor {
@@ -34,12 +36,12 @@ impl Actor for MemoryActor {
 impl MemoryActor {
     /// return name of actor
     pub fn create(registry: &ActorRegistry) -> String {
-        let actor_name = registry.new_name("memory");
+        let actor_name = registry.new_name::<Self>();
         let actor = MemoryActor {
             name: actor_name.clone(),
         };
 
-        registry.register_later(actor);
+        registry.register(actor);
         actor_name
     }
 

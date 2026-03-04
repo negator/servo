@@ -7,13 +7,15 @@
 
 use std::collections::HashMap;
 
+use malloc_size_of_derive::MallocSizeOf;
 use serde_json::{Map, Value};
 
 use crate::actor::{Actor, ActorEncode, ActorError, ActorRegistry};
 use crate::protocol::ClientRequest;
 use crate::{ActorMsg, EmptyReplyMsg, StreamId};
 
-pub struct ThreadConfigurationActor {
+#[derive(MallocSizeOf)]
+pub(crate) struct ThreadConfigurationActor {
     name: String,
     _configuration: HashMap<&'static str, bool>,
 }

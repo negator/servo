@@ -35,7 +35,7 @@ pub(crate) struct BluetoothPermissionResult {
 }
 
 impl BluetoothPermissionResult {
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     fn new_inherited(status: &PermissionStatus) -> BluetoothPermissionResult {
         let result = BluetoothPermissionResult {
             status: PermissionStatus::new_inherited(status.get_query()),
@@ -46,14 +46,14 @@ impl BluetoothPermissionResult {
     }
 
     pub(crate) fn new(
+        cx: &mut js::context::JSContext,
         global: &GlobalScope,
         status: &PermissionStatus,
-        can_gc: CanGc,
     ) -> DomRoot<BluetoothPermissionResult> {
         reflect_dom_object(
             Box::new(BluetoothPermissionResult::new_inherited(status)),
             global,
-            can_gc,
+            CanGc::from_cx(cx),
         )
     }
 
@@ -77,7 +77,7 @@ impl BluetoothPermissionResult {
         self.status.State()
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     pub(crate) fn set_devices(&self, devices: Vec<Dom<BluetoothDevice>>) {
         *self.devices.borrow_mut() = devices;
     }
@@ -97,7 +97,12 @@ impl BluetoothPermissionResultMethods<crate::DomTypeHolder> for BluetoothPermiss
 }
 
 impl AsyncBluetoothListener for BluetoothPermissionResult {
-    fn handle_response(&self, response: BluetoothResponse, promise: &Rc<Promise>, can_gc: CanGc) {
+    fn handle_response(
+        &self,
+        cx: &mut js::context::JSContext,
+        response: BluetoothResponse,
+        promise: &Rc<Promise>,
+    ) {
         match response {
             // https://webbluetoothcg.github.io/web-bluetooth/#request-bluetooth-devices
             // Step 3, 11, 13 - 14.
@@ -112,14 +117,14 @@ impl AsyncBluetoothListener for BluetoothPermissionResult {
 
                     // https://w3c.github.io/permissions/#dom-permissions-request
                     // Step 8.
-                    return promise.resolve_native(self, can_gc);
+                    return promise.resolve_native(self, CanGc::from_cx(cx));
                 }
                 let bt_device = BluetoothDevice::new(
+                    cx,
                     &self.global(),
                     DOMString::from(device.id.clone()),
                     device.name.map(DOMString::from),
                     &bluetooth,
-                    can_gc,
                 );
                 device_instance_map.insert(device.id.clone(), Dom::from_ref(&bt_device));
                 self.global()
@@ -135,9 +140,12 @@ impl AsyncBluetoothListener for BluetoothPermissionResult {
 
                 // https://w3c.github.io/permissions/#dom-permissions-request
                 // Step 8.
-                promise.resolve_native(self, can_gc);
+                promise.resolve_native(self, CanGc::from_cx(cx));
             },
-            _ => promise.reject_error(Error::Type("Something went wrong...".to_owned()), can_gc),
+            _ => promise.reject_error(
+                Error::Type(c"Something went wrong...".to_owned()),
+                CanGc::from_cx(cx),
+            ),
         }
     }
 }

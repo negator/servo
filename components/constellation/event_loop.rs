@@ -11,12 +11,11 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 
 use background_hang_monitor_api::{BackgroundHangMonitorControlMsg, HangMonitorAlert};
-use base::generic_channel::{self, GenericReceiver, GenericSender};
+use base::generic_channel::{self, GenericReceiver, GenericSender, SendError};
 use base::id::ScriptEventLoopId;
 use constellation_traits::ServiceWorkerManagerFactory;
 use embedder_traits::ScriptToEmbedderChan;
-use ipc_channel::ipc::IpcSender;
-use ipc_channel::{Error, ipc};
+use ipc_channel::IpcError;
 use layout_api::ScriptThreadFactory;
 use log::error;
 use media::WindowGLContext;
@@ -25,7 +24,6 @@ use serde::{Deserialize, Serialize};
 use servo_config::opts::{self, Opts};
 use servo_config::prefs::{self, Preferences};
 
-use crate::constellation::route_ipc_receiver_to_new_crossbeam_receiver_preserving_errors;
 use crate::sandboxing::spawn_multiprocess;
 use crate::{Constellation, UnprivilegedContent};
 
@@ -68,7 +66,7 @@ impl EventLoop {
     pub(crate) fn spawn<STF: ScriptThreadFactory, SWF: ServiceWorkerManagerFactory>(
         constellation: &mut Constellation<STF, SWF>,
         is_private: bool,
-    ) -> Result<Rc<Self>, Error> {
+    ) -> Result<Rc<Self>, IpcError> {
         let (script_chan, script_port) =
             base::generic_channel::channel().expect("Pipeline script chan");
 
@@ -113,6 +111,7 @@ impl EventLoop {
             player_context: WindowGLContext::get(),
             privileged_urls: constellation.privileged_urls.clone(),
             user_contents_for_manager_id: constellation.user_contents_for_manager_id.clone(),
+            accessibility_active: constellation.accessibility_active,
         };
 
         let event_loop = if opts::get().multiprocess {
@@ -155,14 +154,14 @@ impl EventLoop {
     fn spawn_in_process<STF: ScriptThreadFactory, SWF: ServiceWorkerManagerFactory>(
         constellation: &mut Constellation<STF, SWF>,
         initial_script_state: InitialScriptState,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, IpcError> {
         let script_chan = initial_script_state.constellation_to_script_sender.clone();
         let id = initial_script_state.id;
 
         let (background_hand_monitor_sender, backgrond_hand_monitor_receiver) =
             generic_channel::channel().expect("Sampler chan");
         let (lifeline_sender, lifeline_receiver) =
-            ipc::channel().expect("Failed to create lifeline channel");
+            generic_channel::channel().expect("Failed to create lifeline channel");
 
         let process = spawn_multiprocess(UnprivilegedContent::ScriptEventLoop(
             NewScriptEventLoopProcessInfo {
@@ -176,8 +175,7 @@ impl EventLoop {
             },
         ))?;
 
-        let crossbeam_receiver =
-            route_ipc_receiver_to_new_crossbeam_receiver_preserving_errors(lifeline_receiver);
+        let crossbeam_receiver = lifeline_receiver.route_preserving_errors();
         constellation
             .process_manager
             .add(crossbeam_receiver, process);
@@ -195,10 +193,8 @@ impl EventLoop {
     }
 
     /// Send a message to the event loop.
-    pub fn send(&self, msg: ScriptThreadMessage) -> Result<(), Error> {
-        self.script_chan
-            .send(msg)
-            .map_err(|_err| Box::new(ipc_channel::ErrorKind::Custom("SendError".into())))
+    pub fn send(&self, msg: ScriptThreadMessage) -> Result<(), SendError> {
+        self.script_chan.send(msg)
     }
 
     /// If this is [`EventLoop`] is in another process, send a message to its `BackgroundHangMonitor`,
@@ -221,7 +217,7 @@ pub struct NewScriptEventLoopProcessInfo {
     pub initial_script_state: InitialScriptState,
     pub constellation_to_bhm_receiver: GenericReceiver<BackgroundHangMonitorControlMsg>,
     pub bhm_to_constellation_sender: GenericSender<HangMonitorAlert>,
-    pub lifeline_sender: IpcSender<()>,
+    pub lifeline_sender: GenericSender<()>,
     pub opts: Opts,
     pub prefs: Box<Preferences>,
     /// The broken image icon data that is used to create an image to show in place of broken images.

@@ -21,6 +21,7 @@ use openxr::{
     ReferenceSpaceType, SecondaryEndInfo, Session, Space, Swapchain, SwapchainCreateFlags,
     SwapchainCreateInfo, SwapchainUsageFlags, SystemId, Vector3f, Version, ViewConfigurationType,
 };
+use profile_traits::generic_callback::GenericCallback as ProfileGenericCallback;
 use surfman::{
     Context as SurfmanContext, Device as SurfmanDevice, Error as SurfmanError, SurfaceTexture,
 };
@@ -31,7 +32,7 @@ use webxr_api::{
     Floor, Frame, GLContexts, InputId, InputSource, LayerGrandManager, LayerId, LayerInit,
     LayerManager, LayerManagerAPI, LeftEye, Native, Quitter, RightEye, SelectKind,
     Session as WebXrSession, SessionBuilder, SessionInit, SessionMode, SubImage, SubImages, View,
-    ViewerPose, Viewport, Viewports, Views, Visibility, WebXrSender,
+    ViewerPose, Viewport, Viewports, Views, Visibility,
 };
 
 use crate::SurfmanGL;
@@ -1417,7 +1418,7 @@ impl DeviceAPI for OpenXrDevice {
         ]
     }
 
-    fn set_event_dest(&mut self, dest: WebXrSender<Event>) {
+    fn set_event_dest(&mut self, dest: ProfileGenericCallback<Event>) {
         self.events.upgrade(dest)
     }
 

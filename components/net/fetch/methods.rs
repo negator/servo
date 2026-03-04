@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{io, mem, str};
 
+use base::generic_channel::CallbackSetter;
 use base::id::PipelineId;
 use base64::Engine as _;
 use base64::engine::general_purpose;
@@ -16,11 +17,11 @@ use embedder_traits::resources::{self, Resource};
 use headers::{AccessControlExposeHeaders, ContentType, HeaderMapExt};
 use http::header::{self, HeaderMap, HeaderName, RANGE};
 use http::{HeaderValue, Method, StatusCode};
-use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
+use ipc_channel::ipc::{self, IpcSender};
 use log::{debug, trace, warn};
 use malloc_size_of_derive::MallocSizeOf;
 use mime::{self, Mime};
-use net_traits::fetch::headers::extract_mime_type_as_mime;
+use net_traits::fetch::headers::{determine_nosniff, extract_mime_type_as_mime};
 use net_traits::filemanager_thread::{FileTokenCheck, RelativePos};
 use net_traits::http_status::HttpStatus;
 use net_traits::policy_container::{PolicyContainer, RequestPolicyContainer};
@@ -29,7 +30,7 @@ use net_traits::request::{
     InsecureRequestsPolicy, Origin, ParserMetadata, RedirectMode, Referrer, Request, RequestId,
     RequestMode, ResponseTainting, is_cors_safelisted_method, is_cors_safelisted_request_header,
 };
-use net_traits::response::{Response, ResponseBody, ResponseType};
+use net_traits::response::{Response, ResponseBody, ResponseType, TerminationReason};
 use net_traits::{
     FetchTaskTarget, NetworkError, ReferrerPolicy, ResourceAttribute, ResourceFetchTiming,
     ResourceTimeValue, ResourceTimingType, WebSocketDomAction, WebSocketNetworkEvent,
@@ -41,6 +42,7 @@ use rustls_pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
 use servo_arc::Arc as ServoArc;
 use servo_url::{Host, ImmutableOrigin, ServoUrl};
+use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc::{UnboundedReceiver as TokioReceiver, UnboundedSender as TokioSender};
 
 use crate::connector::CACertificates;
@@ -48,7 +50,6 @@ use crate::fetch::cors_cache::CorsCache;
 use crate::fetch::fetch_params::{
     ConsumePreloadedResources, FetchParams, SharedPreloadedResources,
 };
-use crate::fetch::headers::determine_nosniff;
 use crate::filemanager_thread::FileManager;
 use crate::http_loader::{
     HttpState, determine_requests_referrer, http_fetch, send_early_httprequest_to_devtools,
@@ -65,17 +66,18 @@ pub enum Data {
     Payload(Vec<u8>),
     Done,
     Cancelled,
+    Error(NetworkError),
 }
 
 pub struct WebSocketChannel {
     pub sender: IpcSender<WebSocketNetworkEvent>,
-    pub receiver: Option<IpcReceiver<WebSocketDomAction>>,
+    pub receiver: Option<CallbackSetter<WebSocketDomAction>>,
 }
 
 impl WebSocketChannel {
     pub fn new(
         sender: IpcSender<WebSocketNetworkEvent>,
-        receiver: Option<IpcReceiver<WebSocketDomAction>>,
+        receiver: Option<CallbackSetter<WebSocketDomAction>>,
     ) -> Self {
         Self { sender, receiver }
     }
@@ -96,10 +98,10 @@ pub type SharedInflightKeepAliveRecords =
 pub struct FetchContext {
     pub state: Arc<HttpState>,
     pub user_agent: String,
-    pub devtools_chan: Option<Arc<Mutex<Sender<DevtoolsControlMsg>>>>,
-    pub filemanager: Arc<Mutex<FileManager>>,
+    pub devtools_chan: Option<Sender<DevtoolsControlMsg>>,
+    pub filemanager: FileManager,
     pub file_token: FileTokenCheck,
-    pub request_interceptor: Arc<Mutex<RequestInterceptor>>,
+    pub request_interceptor: Arc<TokioMutex<RequestInterceptor>>,
     pub cancellation_listener: Arc<CancellationListener>,
     pub timing: ServoArc<Mutex<ResourceFetchTiming>>,
     pub protocols: Arc<ProtocolRegistry>,
@@ -483,7 +485,9 @@ pub async fn main_fetch(
     context
         .request_interceptor
         .lock()
-        .intercept_request(request, &mut response, context);
+        .await
+        .intercept_request(request, &mut response, context)
+        .await;
 
     let mut response = match response {
         Some(res) => res,
@@ -588,7 +592,7 @@ pub async fn main_fetch(
         },
     };
 
-    // Step 13.
+    // Step 13. If recursive is true, then return response.
     if recursive_flag {
         return response;
     }
@@ -596,7 +600,7 @@ pub async fn main_fetch(
     // reborrow request to avoid double mutable borrow
     let request = &mut fetch_params.request;
 
-    // Step 14.
+    // Step 14. If response is not a network error and response is not a filtered response, then:
     let mut response = if !response.is_network_error() && response.internal_response.is_none() {
         // Substep 1.
         if request.response_tainting == ResponseTainting::CorsTainting {
@@ -675,6 +679,9 @@ pub async fn main_fetch(
             internal_response.url_list.clone_from(&request.url_list)
         }
 
+        // Step 17. Set internalResponse’s redirect taint to request’s redirect-taint.
+        internal_response.redirect_taint = request.redirect_taint_for_request();
+
         // Step 19. If response is not a network error and any of the following returns blocked
         // * should internalResponse to request be blocked as mixed content
         // * should internalResponse to request be blocked by Content Security Policy
@@ -745,7 +752,7 @@ pub async fn main_fetch(
         response
     };
 
-    // Step 19.
+    // Step 19. If response is not a network error and any of the following returns blocked
     let mut response_loaded = false;
     let mut response = if !response.is_network_error() && !request.integrity_metadata.is_empty() {
         // Step 19.1.
@@ -833,6 +840,14 @@ async fn wait_for_response(
                         body.extend(&vec);
                     }
                     target.process_response_chunk(request, vec);
+                },
+                Some(Data::Error(network_error)) => {
+                    if network_error == NetworkError::DecompressionError {
+                        response.termination_reason = Some(TerminationReason::Fatal);
+                    }
+                    response.set_network_error(network_error);
+
+                    break;
                 },
                 Some(Data::Done) => {
                     send_response_to_devtools(request, context, response, devtools_body);
@@ -1128,7 +1143,7 @@ pub fn should_request_be_blocked_as_mixed_content(
     }
 
     // 1.2. request’s URL is a potentially trustworthy URL.
-    if is_url_potentially_trustworthy(protocol_registry, &request.url()) {
+    if is_url_potentially_trustworthy(protocol_registry, &request.current_url()) {
         return false;
     }
 
